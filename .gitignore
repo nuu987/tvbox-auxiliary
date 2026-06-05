@@ -1,0 +1,14 @@
+node_modules/
+dist/
+data/
+.env
+.DS_Store
+
+# Claude Code & GSD
+.claude/
+.planning/
+dev-log/
+.ace-tool/
+tests/
+CLAUDE.md
+tmp/

@@ -1,0 +1,11 @@
+node_modules
+.env
+dist
+data
+.git
+.gitignore
+.claude
+.planning
+.github
+*.md
+README.md

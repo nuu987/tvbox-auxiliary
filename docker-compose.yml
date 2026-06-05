@@ -1,0 +1,21 @@
+services:
+  tvbox:
+    build: .
+    ports:
+      - "${PORT:-5678}:5678"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-test123}
+      - BASE_URL=${BASE_URL:-}  # Docker 部署必填，如 http://192.168.1.100:5678
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-0 5 * * *}
+      # - REFRESH_TOKEN=${REFRESH_TOKEN:-}
+      # - SCRAPE_SOURCE_URL=${SCRAPE_SOURCE_URL:-}
+      # - SCRAPE_SOURCE_REFERER=${SCRAPE_SOURCE_REFERER:-}
+      # - MACCMS_API_URL=${MACCMS_API_URL:-}
+      # - MACCMS_AES_KEY=${MACCMS_AES_KEY:-}
+      # - MACCMS_AES_IV=${MACCMS_AES_IV:-}
+      # - ZBAPE_API_KEY=${ZBAPE_API_KEY:-}
+      # - SPEED_TIMEOUT_MS=${SPEED_TIMEOUT_MS:-5000}
+      # - FETCH_TIMEOUT_MS=${FETCH_TIMEOUT_MS:-5000}
+    restart: unless-stopped
