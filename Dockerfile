@@ -1,10 +1,10 @@
 # Typescript compile
-FROM docker.1ms.run/node:20-alpine AS builder
+FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm ci --ignore-scripts --registry https://registry.npmmirror.com && \
+RUN npm ci --ignore-scripts && \
     npm rebuild esbuild
 
 COPY . .
@@ -12,7 +12,7 @@ COPY . .
 RUN npm run build:node
 
 # Runtime copy
-FROM docker.1ms.run/node:20-alpine
+FROM node:20-alpine
 WORKDIR /app
 
 COPY --from=builder /app/dist ./dist
