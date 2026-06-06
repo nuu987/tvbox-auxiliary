@@ -16,7 +16,6 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY --from=builder /app/dist ./dist
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
 RUN apk add --no-cache tzdata
 RUN mkdir -p /app/data
 
