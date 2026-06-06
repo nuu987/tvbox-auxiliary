@@ -1,6 +1,7 @@
 services:
   tvbox:
-    build: .
+    image: ghcr.io/nuu987/tvbox-auxiliary:latest
+    container_name: tvbox_auxiliary
     ports:
       - "5678:5678"
     volumes:
