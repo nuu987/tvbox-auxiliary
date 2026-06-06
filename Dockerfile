@@ -4,8 +4,7 @@ WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm ci --ignore-scripts && \
-    npm rebuild esbuild
+RUN npm ci && npm rebuild esbuild
 
 COPY . .
 
