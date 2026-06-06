@@ -25,15 +25,17 @@
   
 
 ## 用法
-> wget https://raw.githubusercontent.com/nuu987/tvbox-auxiliary/refs/heads/main/docker-compose.yml
->
-> docker compose up -d
-
+```
+wget https://raw.githubusercontent.com/nuu987/tvbox-auxiliary/refs/heads/main/docker-compose.yml
+docker compose up -d
+```
 
 ## 或本地时运行
 暂未完成撰写说明……
 
-> node scripts/start.js
+```
+node scripts/start.js
+```
 
 ## LICENSE
 MIT LICENSE
