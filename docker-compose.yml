@@ -2,15 +2,18 @@ services:
   tvbox:
     build: .
     ports:
-      - "${PORT:-5678}:5678"
+      - "5678:5678"
     volumes:
       - ./data:/app/data
     environment:
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-test123}
-      - BASE_URL=${BASE_URL:-}  # Docker 部署必填，如 http://192.168.1.100:5678
-      - CRON_SCHEDULE=${CRON_SCHEDULE:-0 5 * * *}
-      # - REFRESH_TOKEN=${REFRESH_TOKEN:-}
-      # - SCRAPE_SOURCE_URL=${SCRAPE_SOURCE_URL:-}
+      - "ADMIN_TOKEN=test123" # 管理密码
+      - "BASE_URL="  # Docker 部署建议填写，如 http://192.168.1.100:5678，不填则需要开启设置中的智能响应
+      - "CRON_SCHEDULE=0 5 * * *" #预设自动聚合时间
+
+      # - REFRESH_TOKEN=${REFRESH_TOKEN:-} # 独立设置刷新接口访问令牌，一般不用
+      #
+      # 以下保留变量仅供开发调试，暂未测试相关功能，非专业用户勿随意取消注释
+      # - SCRAPE_SOURCE_URL=${SCRAPE_SOURCE_URL:-} # 
       # - SCRAPE_SOURCE_REFERER=${SCRAPE_SOURCE_REFERER:-}
       # - MACCMS_API_URL=${MACCMS_API_URL:-}
       # - MACCMS_AES_KEY=${MACCMS_AES_KEY:-}
@@ -18,4 +21,5 @@ services:
       # - ZBAPE_API_KEY=${ZBAPE_API_KEY:-}
       # - SPEED_TIMEOUT_MS=${SPEED_TIMEOUT_MS:-5000}
       # - FETCH_TIMEOUT_MS=${FETCH_TIMEOUT_MS:-5000}
+      # - SITE_TIMEOUT_MS=${SITE_TIMEOUT_MS:-3000}
     restart: unless-stopped
