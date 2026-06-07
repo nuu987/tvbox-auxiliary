@@ -1,17 +1,18 @@
 # Typescript compile
-FROM node:20-alpine AS builder
+FROM --platform=$TARGETPLATFORM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm ci && npm rebuild esbuild
+RUN npm ci --ignore-scripts && \
+    npm rebuild esbuild
 
 COPY . .
 
 RUN npm run build:node
 
 # Runtime copy
-FROM node:20-alpine
+FROM --platform=$TARGETPLATFORM node:20-alpine
 WORKDIR /app
 
 COPY --from=builder /app/dist ./dist
