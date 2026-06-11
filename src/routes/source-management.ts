@@ -114,14 +114,24 @@ export function createSourceMgmtRouter(deps: SourceMgmtRouteDeps): Hono {
       }
       sourceUrl = fetchUrl;
       try {
-        const resp = await fetch(fetchUrl, {
-          headers: { 'Accept': 'application/json, text/plain, */*', 'User-Agent': 'okhttp/3.12.0' },
-        });
-        if (!resp.ok) return c.json({ error: `Fetch failed: HTTP ${resp.status}` }, 502);
-        const buffer = await resp.arrayBuffer();
-        const decoded = await decodeConfigResponse(buffer, configKey);
-        jsonText = decoded || '';
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs);
+        try {
+          const resp = await fetch(fetchUrl, {
+            headers: { 'Accept': 'application/json, text/plain, */*', 'User-Agent': 'okhttp/3.12.0' },
+            signal: controller.signal,
+          });
+          if (!resp.ok) return c.json({ error: `Fetch failed: HTTP ${resp.status}` }, 502);
+          const buffer = await resp.arrayBuffer();
+          const decoded = await decodeConfigResponse(buffer, configKey);
+          jsonText = decoded || '';
+        } finally {
+          clearTimeout(timer);
+        }
       } catch (err: unknown) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return c.json({ error: 'Fetch failed: request timed out' }, 504);
+        }
         const msg = err instanceof Error ? err.message : String(err);
         return c.json({ error: `Fetch failed: ${msg}` }, 502);
       }
