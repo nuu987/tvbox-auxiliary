@@ -18,7 +18,7 @@ export function createSourceMgmtRouter(deps: SourceMgmtRouteDeps): Hono {
   const router = new Hono();
 
   // All endpoints require admin auth
-  router.use('*', adminAuthMiddleware(config));
+  router.use('/admin/*', adminAuthMiddleware(config));
 
   router.get('/admin/sources', async (c) => {
     const raw = await storage.get(MANUAL_SOURCES);

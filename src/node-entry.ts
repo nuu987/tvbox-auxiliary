@@ -25,6 +25,7 @@ import {
 import { JsonFileStorage } from './storage/json-file';
 import type { Storage } from './storage/interface';
 import type { AppConfig, SyncSchedule } from './core/types';
+import type { RuntimeState } from './routes/admin-auth';
 import { getDirtyMarker, clearDirtyMarker } from './core/dirty-marker';
 
 // 加载 .env
@@ -86,7 +87,14 @@ async function main() {
   }
 
   let refreshRunning = false;
+  let patchLock = false;
     const SYNC_TIMEOUT_MS = 300_000; // 同步整体超时 5 分钟
+
+  const runtime: RuntimeState = {
+    getPatchLock: () => patchLock,
+    setPatchLock: (locked: boolean) => { patchLock = locked; },
+    isSyncing: () => refreshRunning,
+  };
 
   const runWithGuard = async (opts?: { source?: 'cron' | 'manual' }): Promise<{ ran: boolean }> => {
     if (refreshRunning) {
@@ -180,9 +188,9 @@ async function main() {
   const app = createApp({
     storage,
     config,
+    runtime,
     triggerRefresh: runWithGuard,
     enableChannelProbe: true,
-    isSyncing: () => refreshRunning,
     onCronScheduleChange: (schedule: SyncSchedule) => {
       scheduleCron(schedule);
     },

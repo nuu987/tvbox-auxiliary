@@ -14,7 +14,8 @@ import {
   EDGE_PROXIES,
 } from '../core/config';
 import { patchMergedConfig } from '../core/blacklist';
-import { adminAuthMiddleware, type RuntimeState } from './admin-auth';
+import { adminAuthMiddleware } from './admin-auth';
+import type { RuntimeState } from './admin-auth';
 import { logger } from '../core/logger';
 
 export interface SettingsRouteDeps {
@@ -30,7 +31,7 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Hono {
   const router = new Hono();
 
   // All endpoints require admin auth
-  router.use('*', adminAuthMiddleware(config));
+  router.use('/admin/*', adminAuthMiddleware(config));
 
   // ─── 名称定制 API ──────────────────────────────────────
   router.get('/admin/name-transform', async (c) => {

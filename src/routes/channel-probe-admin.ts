@@ -1,6 +1,7 @@
 // 频道测速 admin 路由（方案 D+ 运维独立模块）
 
-import type { Hono } from 'hono';
+import { Hono } from 'hono';
+import { adminAuthMiddleware } from './admin-auth';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 import {
@@ -10,25 +11,21 @@ import {
   runChannelProbe,
   isRunning,
 } from '../core/channel-probe';
-
-function verifyAdmin(request: Request, config: AppConfig): boolean {
-  const token = config.adminToken;
-  if (!token) return false;
-  const auth = request.headers.get('Authorization');
-  return auth === `Bearer ${token}`;
-}
+import { logger } from '../core/logger';
 
 export interface ChannelProbeRouteDeps {
   storage: Storage;
   config: AppConfig;
 }
 
-export function mountChannelProbeRoutes(app: Hono, deps: ChannelProbeRouteDeps): void {
+export function createChannelProbeRouter(deps: ChannelProbeRouteDeps): Hono {
+  const router = new Hono();
   const { storage, config } = deps;
 
+  const auth = adminAuthMiddleware(config);
+
   // GET /admin/channel-probe/status — 查询状态 + 开关
-  app.get('/admin/channel-probe/status', async (c) => {
-    if (!verifyAdmin(c.req.raw, config)) return c.json({ error: 'Unauthorized' }, 401);
+  router.get('/admin/channel-probe/status', auth, async (c) => {
     const [enabled, status] = await Promise.all([
       isProbeEnabled(storage),
       loadStatus(storage),
@@ -41,8 +38,7 @@ export function mountChannelProbeRoutes(app: Hono, deps: ChannelProbeRouteDeps):
   });
 
   // PUT /admin/channel-probe/toggle — 开关
-  app.put('/admin/channel-probe/toggle', async (c) => {
-    if (!verifyAdmin(c.req.raw, config)) return c.json({ error: 'Unauthorized' }, 401);
+  router.put('/admin/channel-probe/toggle', auth, async (c) => {
     let body: { enabled?: boolean };
     try {
       body = await c.req.json();
@@ -57,8 +53,7 @@ export function mountChannelProbeRoutes(app: Hono, deps: ChannelProbeRouteDeps):
   });
 
   // POST /admin/channel-probe/trigger — 手动触发（异步启动，不阻塞响应）
-  app.post('/admin/channel-probe/trigger', async (c) => {
-    if (!verifyAdmin(c.req.raw, config)) return c.json({ error: 'Unauthorized' }, 401);
+  router.post('/admin/channel-probe/trigger', auth, async (c) => {
     if (isRunning()) {
       return c.json({ success: false, error: 'Already running' }, 409);
     }
@@ -67,8 +62,11 @@ export function mountChannelProbeRoutes(app: Hono, deps: ChannelProbeRouteDeps):
     }
     // 异步启动
     runChannelProbe(storage).catch((err) => {
-      console.error('[channel-probe-admin] Trigger error:', err);
+      logger.error('channel-probe-admin', 'Trigger error: ' + (err instanceof Error ? err.message : String(err)));
     });
     return c.json({ success: true, message: 'Probe started' });
   });
+
+  return router;
 }
+

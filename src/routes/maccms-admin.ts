@@ -17,7 +17,7 @@ export function createMaccmsAdminRouter(deps: MaccmsAdminRouteDeps): Hono {
   const { storage, config } = deps;
 
   // 所有路由需要 admin 鉴权
-  router.use('*', adminAuthMiddleware(config));
+  router.use('/admin/*', adminAuthMiddleware(config));
 
   // 列表
   router.get('/admin/maccms', async (c) => {

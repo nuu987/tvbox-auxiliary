@@ -16,7 +16,7 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
   const router = new Hono();
 
   // All endpoints require admin auth
-  router.use('*', adminAuthMiddleware(config));
+  router.use('/admin/*', adminAuthMiddleware(config));
 
   router.get('/admin/lives', async (c) => {
     const raw = await storage.get(LIVE_SOURCES);
