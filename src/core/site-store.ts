@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import { logger } from './logger';
 import type { Storage } from '../storage/interface';
 import { MANUAL_SOURCES, MACCMS_SOURCES } from './config';
-import type { SourceEntry, MacCMSSourceEntry } from './types';
+import type { SourceEntry, MacCMSSourceEntry, TVBoxSite } from './types';
 
 const DATA_DIR_ENV = 'DATA_DIR';
 
@@ -63,13 +63,59 @@ export function ensureSiteDir(index: number, type: string): string {
 }
 
 /**
+ * 扫描 TVBoxSite 列表，推断实际引用的资源类型集合
+ * 检查 site.jar (->'jar')、site.api (-> 按 URL 后缀识别 .js/.py)、site.ext (字符串或对象 -> 扫描 URL 后缀)
+ */
+export function inferResourceTypesFromSites(sites: TVBoxSite[]): Set<string> {
+  const types = new Set<string>();
+
+  for (const site of sites) {
+    // site.jar -> 'jar'
+    if (site.jar) {
+      types.add('jar');
+    }
+
+    // site.api: 检查 URL 后缀识别 js/py
+    if (site.api) {
+      const apiLower = site.api.toLowerCase();
+      if (apiLower.endsWith('.js')) {
+        types.add('js');
+      } else if (apiLower.endsWith('.py')) {
+        types.add('py');
+      }
+    }
+
+    // site.ext: 扫描 JS/PY/JAR URL
+    if (site.ext) {
+      if (typeof site.ext === 'string') {
+        const extLower = site.ext.toLowerCase();
+        if (extLower.endsWith('.js') || extLower.includes('.js?')) types.add('js');
+        if (extLower.endsWith('.py') || extLower.includes('.py?')) types.add('py');
+        if (extLower.endsWith('.jar') || extLower.includes('.jar?')) types.add('jar');
+      } else if (typeof site.ext === 'object' && site.ext !== null) {
+        for (const val of Object.values(site.ext)) {
+          if (typeof val === 'string') {
+            const vLower = val.toLowerCase();
+            if (vLower.endsWith('.js') || vLower.includes('.js?')) types.add('js');
+            if (vLower.endsWith('.py') || vLower.includes('.py?')) types.add('py');
+            if (vLower.endsWith('.jar') || vLower.includes('.jar?')) types.add('jar');
+          }
+        }
+      }
+    }
+  }
+
+  return types;
+}
+
+/**
  * 同步时整理站点目录结构
  *
  * 1. 计算当前源列表中应存在的目录索引
- * 2. 为每个源创建 jar/js/py 子目录
+ * 2. 为每个源按需创建资源子目录（传入 mergedSites 时仅创建实际引用的类型）
  * 3. 删除 data/sites/ 中不存在的旧目录
  */
-export async function organizeSiteDirectories(storage: Storage): Promise<void> {
+export async function organizeSiteDirectories(storage: Storage, mergedSites?: TVBoxSite[]): Promise<void> {
   try {
     const sitesDir = path.join(getDataDir(), 'sites');
 
@@ -94,12 +140,23 @@ export async function organizeSiteDirectories(storage: Storage): Promise<void> {
     const totalSources = manualSources.length + (maccmsSources.length > 0 ? 1 : 0);
     const activeDirs = new Set<string>();
 
+    // 确定资源类型：传入 mergedSites 时按需推断，否则回退硬编码
+    let resourceTypes: string[];
+    if (mergedSites && mergedSites.length > 0) {
+      const inferredTypes = inferResourceTypesFromSites(mergedSites);
+      resourceTypes = inferredTypes.size > 0
+        ? Array.from(inferredTypes)
+        : ['jar', 'js', 'py'];
+    } else {
+      resourceTypes = ['jar', 'js', 'py'];
+    }
+
     // 为每个源创建目录
     for (let i = 0; i < totalSources; i++) {
       const dirName = siteIndexToDirName(i);
       activeDirs.add(dirName);
 
-      for (const type of ['jar', 'js', 'py']) {
+      for (const type of resourceTypes) {
         ensureSiteDir(i, type);
       }
     }
