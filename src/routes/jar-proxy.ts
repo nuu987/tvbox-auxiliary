@@ -38,7 +38,7 @@ async function getJarSourceDir(key: string, storage: Storage): Promise<string | 
 function findCacheFile(dir: string, key: string, isMd5: boolean): string | null {
   try {
     const files = fs.readdirSync(dir);
-    const prefix = isMd5 ? key.substring(0, 8) + '-' : key + '-';
+    const prefix = key + '-';
     const match = files.find(f => f.startsWith(prefix));
     return match ? path.join(dir, match) : null;
   } catch {

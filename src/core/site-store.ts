@@ -49,7 +49,8 @@ export function safeFileName(url: string): string {
  * 生成资源文件名：{hash}-{originalName}
  */
 export function getResourceFileName(hash: string, originalName: string): string {
-  return `${hash}-${originalName}`;
+  const safe = originalName.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return `${hash}-${safe}`;
 }
 
 /**

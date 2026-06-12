@@ -3,6 +3,7 @@
 import type { TVBoxConfig } from './types';
 import type { Storage } from '../storage/interface';
 import { safeFileName } from './site-store';
+import { logger } from './logger';
 
 const JAR_PREFIX = 'jar:';
 
@@ -111,7 +112,7 @@ export async function rewriteJarUrls(
   }
 
   if (uniqueJars.size === 0) {
-    console.log('[jar-proxy] No JAR URLs to rewrite');
+    logger.info('jar-proxy', 'No JAR URLs to rewrite');
     return config;
   }
 
@@ -127,10 +128,10 @@ export async function rewriteJarUrls(
       const name = safeFileName(url);
       await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name }));
     }
-    console.log(`[jar-proxy] Mapped ${key} → ${url.substring(0, 60)}...`);
+    logger.info('jar-proxy', `Mapped ${key} → ${url.substring(0, 60)}...`);
   }
 
-  console.log(`[jar-proxy] Wrote ${urlKeyMap.size} KV mappings`);
+  logger.info('jar-proxy', `Wrote ${urlKeyMap.size} KV mappings`);
 
   // Step 3: 纯内存改写
   const result = { ...config };
@@ -149,7 +150,7 @@ export async function rewriteJarUrls(
     });
   }
 
-  console.log(`[jar-proxy] Rewrote ${urlKeyMap.size} unique JAR URLs across config`);
+  logger.info('jar-proxy', `Rewrote ${urlKeyMap.size} unique JAR URLs across config`);
   return result;
 }
 
