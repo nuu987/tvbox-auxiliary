@@ -9,6 +9,5 @@ data/
 .planning/
 dev-log/
 .ace-tool/
-tests/
 CLAUDE.md
 tmp/
