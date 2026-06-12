@@ -6,7 +6,7 @@ import { fetchConfigs } from './core/fetcher';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
-import { rewriteJarUrls, parseSpiderString } from './core/jar-proxy';
+import { rewriteJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
 import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
@@ -20,6 +20,8 @@ import { loadCredentialPolicy } from './core/credential-store';
 import { injectCredentials } from './core/credential-injector';
 import { logger } from './core/logger';
 import { organizeSiteDirectories } from './core/site-store';
+import { getSiteResourceDir } from './core/site-store';
+import * as fs from 'fs';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
 
 export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
@@ -534,6 +536,72 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     placeholder: BASE_URL_PLACEHOLDER,
     spider: merged.spider ? 'present' : 'none',
   });
+
+  // Step 7.1: 预下载静态资源（JAR/JS/PY）
+  logger.info('sync', 'Step 7.1: Downloading static resources...');
+  if (merged.sites && merged.sites.length > 0) {
+    const resources = collectAllSiteResources(merged.sites);
+    if (resources.length > 0) {
+      logger.infoFields('sync', 'static-resources-found', { count: resources.length });
+      const downloadTimeout = config.fetchTimeoutMs || 10000;
+      let downloaded = 0;
+      let failed = 0;
+
+      for (const { url, type } of resources) {
+        let key: string | null = null;
+
+        if (type === 'jar') {
+          const parsed = parseSpiderString(url);
+          key = parsed.md5 || (await urlToKey(url));
+        } else {
+          key = await urlToKey(url);
+        }
+
+        if (!key) {
+          failed++;
+          continue;
+        }
+
+        const data = await downloadResource(url, downloadTimeout);
+        if (!data) {
+          failed++;
+          logger.warn('sync', `Failed to download ${type}: ${url.substring(0, 60)}...`);
+          continue;
+        }
+
+        let resourceIndex = 0;
+        const jarSourceRaw = await storage.get(`jar-source:${key}`);
+        if (jarSourceRaw) {
+          try { resourceIndex = JSON.parse(jarSourceRaw).index; } catch { /* ignore */ }
+        } else {
+          const siteIdx = merged.sites.findIndex(s =>
+            (type === 'jar' && s.jar && parseSpiderString(s.jar).url === url) ||
+            s.api === url ||
+            (typeof s.ext === 'string' && s.ext.includes(url))
+          );
+          resourceIndex = siteIdx >= 0 ? siteIdx : 0;
+        }
+
+        const sourceDir = getSiteResourceDir(resourceIndex, type);
+        fs.mkdirSync(sourceDir, { recursive: true });
+        await writeResourceCache(key, data, sourceDir, url, storage, resourceIndex, type);
+        downloaded++;
+
+        logger.infoFields('sync', 'resource-downloaded', {
+          type,
+          key,
+          sizeKB: (data.length / 1024).toFixed(1),
+          site: resourceIndex + 1,
+        });
+      }
+
+      logger.infoFields('sync', 'static-resource-download-complete', { downloaded, failed, total: resources.length });
+    } else {
+      logger.info('sync', 'Step 7.1: No static resources found');
+    }
+  } else {
+    logger.info('sync', 'Step 7.1: No sites to scan');
+  }
 
   // Step 7.5: 注入图片代理前缀（本地模式用边缘代理）
   const edgeRaw2 = await storage.get(EDGE_PROXIES);

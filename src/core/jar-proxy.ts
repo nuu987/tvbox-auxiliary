@@ -1,9 +1,10 @@
 // JAR 代理：将 spider/jar URL 改写为代理路由
 
-import type { TVBoxConfig } from './types';
+import type { TVBoxConfig, TVBoxSite } from './types';
 import type { Storage } from '../storage/interface';
 import { safeFileName } from './site-store';
 import { logger } from './logger';
+import * as fs from 'fs';
 
 const JAR_PREFIX = 'jar:';
 
@@ -184,4 +185,128 @@ export function base64ToUint8Array(b64: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+/**
+ * Bestimmt den Ressourcentyp einer URL anhand der Dateiendung.
+ * Entfernt Query-Strings (# und ?) vor der Endungspruefung.
+ * @returns 'jar', 'js', 'py' oder null falls nicht erkannt.
+ */
+export function getResourceUrlType(url: string): string | null {
+  try {
+    const cleaned = url.split('?')[0].split('#')[0];
+    if (cleaned.endsWith('.jar')) return 'jar';
+    if (cleaned.endsWith('.js')) return 'js';
+    if (cleaned.endsWith('.py')) return 'py';
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sammelt alle statischen Ressourcen-URLs (JAR, JS, PY) aus TVBoxSite[].
+ * Prueft site.jar (via parseSpiderString), site.api (type 3 oder HTTP-URL mit Endung),
+ * site.ext (String oder Object). Dedupliziert via URL-Set.
+ */
+export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string; type: string }> {
+  const seen = new Set<string>();
+  const resources: Array<{ url: string; type: string }> = [];
+
+  for (const site of sites) {
+    // site.jar via parseSpiderString
+    if (site.jar) {
+      const parsed = parseSpiderString(site.jar);
+      if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
+        if (!seen.has(parsed.url)) {
+          seen.add(parsed.url);
+          resources.push({ url: parsed.url, type: 'jar' });
+        }
+      }
+    }
+
+    // site.api: Typ-Erkennung via Endung
+    if (site.api) {
+      if (!seen.has(site.api)) {
+        const type = getResourceUrlType(site.api);
+        if (type) {
+          seen.add(site.api);
+          resources.push({ url: site.api, type });
+        }
+      }
+    }
+
+    // site.ext: String oder Object
+    if (site.ext) {
+      if (typeof site.ext === 'string') {
+        // String ext kann Trennzeichen enthalten ($ | ; etc.)
+        const extParts = site.ext.split(/[\s$;|]+/);
+        for (const part of extParts) {
+          if (!part.startsWith('http://') && !part.startsWith('https://')) continue;
+          if (seen.has(part)) continue;
+          const type = getResourceUrlType(part);
+          if (type) {
+            seen.add(part);
+            resources.push({ url: part, type });
+          }
+        }
+      } else if (typeof site.ext === 'object' && site.ext !== null) {
+        for (const val of Object.values(site.ext)) {
+          if (typeof val !== 'string') continue;
+          if (!val.startsWith('http://') && !val.startsWith('https://')) continue;
+          if (seen.has(val)) continue;
+          const type = getResourceUrlType(val);
+          if (type) {
+            seen.add(val);
+            resources.push({ url: val, type });
+          }
+        }
+      }
+    }
+  }
+
+  return resources;
+}
+
+/**
+ * Laedt eine Resource von einer URL herunter und gibt Buffer zurueck.
+ * Timeout via AbortController. Bei Fehler null zurueck.
+ */
+export async function downloadResource(url: string, timeoutMs: number): Promise<Buffer | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'okhttp/3.12.0' },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    return Buffer.from(await resp.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Schreibt gecachte Resource-Daten in das Site-Verzeichnis und erstellt static-source KV Mapping.
+ * Dateiname-Format: {key}-{safeFileName(url)}
+ */
+export async function writeResourceCache(
+  key: string,
+  data: Buffer,
+  sourceDir: string,
+  url: string,
+  storage: Storage,
+  index: number,
+  type: string,
+): Promise<void> {
+  const safeName = safeFileName(url);
+  const fileName = `${key}-${safeName}`;
+  const filePath = sourceDir.endsWith('/') || sourceDir.endsWith('\\')
+    ? sourceDir + fileName
+    : sourceDir + '/' + fileName;
+  fs.writeFileSync(filePath, data);
+  await storage.put(`static-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name: safeName, type }));
+  logger.info('jar-proxy', `Cached ${type} ${key} in site ${index + 1}: ${fileName}`);
 }
