@@ -35,8 +35,13 @@ dotenv.config();
 
 function createStorage(): { storage: Storage; jsonPath: string } {
   const dataDir = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
-  const jsonPath = path.join(dataDir, 'tvbox-data.json');
-  return { storage: new JsonFileStorage(jsonPath), jsonPath };
+  const newJsonPath = path.join(dataDir, 'config.json');
+  const oldJsonPath = path.join(dataDir, 'tvbox-data.json');
+  if (!fs.existsSync(newJsonPath) && fs.existsSync(oldJsonPath)) {
+    fs.renameSync(oldJsonPath, newJsonPath);
+    logger.info('storage', 'Migrated tvbox-data.json to config.json');
+  }
+  return { storage: new JsonFileStorage(newJsonPath), jsonPath: newJsonPath };
 }
 
 // ─── 配置 ────────────────────────────────────────────────
