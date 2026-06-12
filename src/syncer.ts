@@ -434,7 +434,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   {
     // 检查直播功能禁用开关
     const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    const liveDisabled = liveDisabledRaw !== 'false';
+    const liveDisabled = liveDisabledRaw === 'true';
     if (liveDisabled) {
       logger.info('sync', 'Step 6.5: live_disabled=true, skipping live merge and clearing lives');
       merged.lives = [];
@@ -625,7 +625,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   // Step 9: 整理站点目录结构
   logger.info('sync', 'Step 9: Organizing site directories...');
-  await organizeSiteDirectories(storage);
+  await organizeSiteDirectories(storage, merged.sites);
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   logger.infoFields('sync', 'run-complete', {

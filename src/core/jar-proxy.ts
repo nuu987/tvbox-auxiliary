@@ -273,18 +273,19 @@ export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string
  * Timeout via AbortController. Bei Fehler null zurueck.
  */
 export async function downloadResource(url: string, timeoutMs: number): Promise<Buffer | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'okhttp/3.12.0' },
       signal: controller.signal,
     });
-    clearTimeout(timer);
     if (!resp.ok) return null;
     return Buffer.from(await resp.arrayBuffer());
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -301,12 +302,13 @@ export async function writeResourceCache(
   index: number,
   type: string,
 ): Promise<void> {
+  const safeIndex = Number.isFinite(index) && index >= 0 ? index : 0;
   const safeName = safeFileName(url);
   const fileName = `${key}-${safeName}`;
   const filePath = sourceDir.endsWith('/') || sourceDir.endsWith('\\')
     ? sourceDir + fileName
     : sourceDir + '/' + fileName;
   fs.writeFileSync(filePath, data);
-  await storage.put(`static-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name: safeName, type }));
-  logger.info('jar-proxy', `Cached ${type} ${key} in site ${index + 1}: ${fileName}`);
+  await storage.put(`static-source:${key}`, JSON.stringify({ index: safeIndex, hash: key.substring(0, 8), name: safeName, type }));
+  logger.info('jar-proxy', `Cached ${type} ${key} in site ${safeIndex + 1}: ${fileName}`);
 }
