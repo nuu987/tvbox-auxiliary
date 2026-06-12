@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
-import { lookupJarUrl, isMd5Key } from '../core/jar-proxy';
+import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource } from '../core/jar-proxy';
 import { getSiteResourceDir, safeFileName, ensureSiteDir } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
@@ -127,6 +127,60 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     }
 
     return c.json({ error: 'JAR unavailable from origin' }, 502);
+  });
+
+  // GET /static/:key/:type — 静态资源代理（非 JAR：JS/PY 等）
+  router.get('/static/:key/:type', async (c) => {
+    const key = c.req.param('key');
+    const type = c.req.param('type');
+
+    // 1. 查 KV mapping
+    const mappingRaw = await storage.get(`static-source:${key}`);
+    if (!mappingRaw) {
+      return c.json({ error: 'Unknown static resource key' }, 404);
+    }
+
+    let mapping: { index: number; hash: string; name: string; type?: string };
+    try {
+      mapping = JSON.parse(mappingRaw);
+    } catch {
+      return c.json({ error: 'Invalid mapping data' }, 500);
+    }
+
+    const sourceDir = getSiteResourceDir(mapping.index, type);
+    const filePath = path.join(sourceDir, `${key}-${mapping.name}`);
+
+    // 2. Try cache read
+    if (fs.existsSync(filePath)) {
+      const buf = fs.readFileSync(filePath);
+      const contentType = type === 'js' ? 'application/javascript'
+        : type === 'py' ? 'text/x-python'
+        : type === 'jar' ? 'application/octet-stream'
+        : 'application/octet-stream';
+      return new Response(buf, {
+        headers: {
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=86400',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+
+    // 3. Cache miss — lazy download fallback for resources that weren't pre-cached
+    const contentTypes: Record<string, string> = {
+      js: 'application/javascript',
+      py: 'text/x-python',
+      jar: 'application/octet-stream',
+    };
+    const contentType = contentTypes[type] || 'application/octet-stream';
+
+    // We need the original URL. Try to reconstruct: we only have the KV mapping.
+    // If the resource was pre-cached, it should already exist. This is a fallback
+    // for edge cases where the sync download failed but client still requests it.
+    // Since we don't store the original URL in static-source mapping, we cannot
+    // reliably re-download here. Log and return 404.
+    logger.warn('jar-proxy', `Static resource ${key} not found on disk (cache miss): ${filePath}`);
+    return c.json({ error: 'Resource not cached locally. Run sync to pre-cache resources.' }, 404);
   });
 
   return router;
