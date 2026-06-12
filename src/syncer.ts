@@ -6,7 +6,7 @@ import { fetchConfigs } from './core/fetcher';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
-import { rewriteJarUrls } from './core/jar-proxy';
+import { rewriteJarUrls, parseSpiderString } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
 import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
@@ -19,6 +19,7 @@ import { loadCredentials } from './core/credential-store';
 import { loadCredentialPolicy } from './core/credential-store';
 import { injectCredentials } from './core/credential-injector';
 import { logger } from './core/logger';
+import { organizeSiteDirectories } from './core/site-store';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
 
 export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
@@ -509,10 +510,25 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     } // end of else (liveDisabled=false)
   }
 
+  // Step 6.8: Build JAR URL → source index map
+  const jarSourceIndexMap = new Map<string, number>();
+  if (merged.sites) {
+    for (const site of merged.sites) {
+      if (site.jar) {
+        const parsed = parseSpiderString(site.jar);
+        if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
+          if (!jarSourceIndexMap.has(parsed.url)) {
+            jarSourceIndexMap.set(parsed.url, jarSourceIndexMap.size);
+          }
+        }
+      }
+    }
+  }
+
   // Step 7: JAR URL 改写
   logger.info('sync', 'Step 7: Rewriting JAR URLs for proxy (placeholder)...');
   const beforeJar = configCounts(merged);
-  merged = await rewriteJarUrls(merged, BASE_URL_PLACEHOLDER, storage);
+  merged = await rewriteJarUrls(merged, BASE_URL_PLACEHOLDER, storage, jarSourceIndexMap);
   logger.infoFields('sync', 'jar-rewrite-complete', {
     ...beforeJar,
     placeholder: BASE_URL_PLACEHOLDER,
@@ -538,6 +554,10 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     bytes: Buffer.byteLength(mergedJson, 'utf8'),
     ...configCounts(merged),
   });
+
+  // Step 9: 整理站点目录结构
+  logger.info('sync', 'Step 9: Organizing site directories...');
+  await organizeSiteDirectories(storage);
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   logger.infoFields('sync', 'run-complete', {

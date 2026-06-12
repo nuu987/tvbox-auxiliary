@@ -2,6 +2,7 @@
 
 import type { TVBoxConfig } from './types';
 import type { Storage } from '../storage/interface';
+import { safeFileName } from './site-store';
 
 const JAR_PREFIX = 'jar:';
 
@@ -86,6 +87,7 @@ export async function rewriteJarUrls(
   config: TVBoxConfig,
   baseUrl: string,
   storage: Storage,
+  sourceIndexMap?: Map<string, number>,
 ): Promise<TVBoxConfig> {
   // Step 1: 收集所有唯一 JAR URL
   const uniqueJars = new Map<string, { md5: string | null }>(); // url → {md5}
@@ -113,13 +115,18 @@ export async function rewriteJarUrls(
     return config;
   }
 
-  // Step 2: 为每个唯一 URL 生成 key + 批量写 KV
+  // Step 2: 为每个唯一 URL 生成 key + 批量写 KV + jar-source 映射
   const urlKeyMap = new Map<string, string>(); // url → key
 
   for (const [url, { md5 }] of uniqueJars) {
     const key = md5 || (await urlToKey(url));
     urlKeyMap.set(url, key);
     await storage.put(`${JAR_PREFIX}${key}`, url);
+    if (sourceIndexMap?.has(url)) {
+      const index = sourceIndexMap.get(url)!;
+      const name = safeFileName(url);
+      await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name }));
+    }
     console.log(`[jar-proxy] Mapped ${key} → ${url.substring(0, 60)}...`);
   }
 

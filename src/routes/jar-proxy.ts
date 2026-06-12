@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 import { lookupJarUrl, isMd5Key } from '../core/jar-proxy';
+import { getSiteResourceDir, safeFileName, ensureSiteDir } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -16,12 +17,38 @@ export interface JarProxyRouteDeps {
   config: AppConfig;
 }
 
+/**
+ * 查询 JAR key 对应的站点资源目录
+ */
+async function getJarSourceDir(key: string, storage: Storage): Promise<string | null> {
+  try {
+    const mapping = await storage.get(`jar-source:${key}`);
+    if (!mapping) return null;
+    const { index } = JSON.parse(mapping) as { index: number; hash: string; name: string };
+    return ensureSiteDir(index, 'jar');
+  } catch (e) {
+    logger.warn('jar-proxy', `getJarSourceDir failed for ${key}: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+/**
+ * 在站点目录中查找匹配 key 前缀的缓存文件
+ */
+function findCacheFile(dir: string, key: string, isMd5: boolean): string | null {
+  try {
+    const files = fs.readdirSync(dir);
+    const prefix = isMd5 ? key.substring(0, 8) + '-' : key + '-';
+    const match = files.find(f => f.startsWith(prefix));
+    return match ? path.join(dir, match) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
   const router = new Hono();
   const { storage, config } = deps;
-
-  const jarCacheDir = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'jars');
-  if (!fs.existsSync(jarCacheDir)) fs.mkdirSync(jarCacheDir, { recursive: true });
 
   async function fetchAndCacheJar(key: string, originalUrl: string): Promise<Buffer | null> {
     try {
@@ -33,8 +60,17 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
         return null;
       }
       const buf = Buffer.from(await resp.arrayBuffer());
-      fs.writeFileSync(path.join(jarCacheDir, `${key}.jar`), buf);
-      logger.debug('jar-proxy', `Cached ${key}.jar (${(buf.length / 1024).toFixed(1)} KB)`);
+      // 尝试写入站点目录缓存
+      try {
+        const sourceDir = await getJarSourceDir(key, storage);
+        if (sourceDir) {
+          const name = safeFileName(originalUrl);
+          fs.writeFileSync(path.join(sourceDir, `${key}-${name}`), buf);
+          logger.debug('jar-proxy', `Cached ${key}-${name} in ${sourceDir} (${(buf.length / 1024).toFixed(1)} KB)`);
+        }
+      } catch (writeErr) {
+        logger.warn('jar-proxy', `Failed to write cache for ${key}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+      }
       return buf;
     } catch (error: unknown) {
       logger.warn('jar-proxy', `Fetch error for ${key}: ${error instanceof Error ? error.message : error}`);
@@ -51,20 +87,24 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
       return c.json({ error: 'Unknown JAR key' }, 404);
     }
 
-    // 2. 查文件缓存
-    const cachePath = path.join(jarCacheDir, `${key}.jar`);
-    if (fs.existsSync(cachePath)) {
-      const stat = fs.statSync(cachePath);
-      const ttl = isMd5Key(key) ? 86400_000 : 21600_000;
-      if (Date.now() - stat.mtimeMs < ttl) {
-        const buf = fs.readFileSync(cachePath);
-        return new Response(buf, {
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'Cache-Control': `public, max-age=${ttl / 1000}`,
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
+    // 2. 查文件缓存（站点目录）
+    const sourceDir = await getJarSourceDir(key, storage);
+    if (sourceDir) {
+      const md5Key = isMd5Key(key);
+      const cacheFile = findCacheFile(sourceDir, key, md5Key);
+      if (cacheFile && fs.existsSync(cacheFile)) {
+        const stat = fs.statSync(cacheFile);
+        const ttl = md5Key ? 86400_000 : 21600_000;
+        if (Date.now() - stat.mtimeMs < ttl) {
+          const buf = fs.readFileSync(cacheFile);
+          return new Response(buf, {
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Cache-Control': `public, max-age=${ttl / 1000}`,
+              'Access-Control-Allow-Origin': '*',
+            },
+          });
+        }
       }
     }
 
