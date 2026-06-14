@@ -659,9 +659,10 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     logger.info('sync', 'Step 7.1: No sites to scan');
   }
 
-  // Step 7.2: 原子交换临时目录到正式目录（D-05）
-  // 注意：delete-then-rename 之间存在 ~1ms gap，期间 data/sites/ 不存在
-  // 路由层有远程下载兜底（D-11）覆盖此窗口
+  // Step 7.2: 原子交换临时目录到正式目录（D-05, CR-01/CR-05）
+  // 新实现使用 rename-to-backup 模式：sites/ 在任一时刻都以旧名或新名存在，
+  // 消除了之前 delete-then-rename 之间的 ~1ms 窗口（路由 mkdirSync 可能竞争重建 sites/）。
+  // 若 tmp->sites rename 失败，会自动从 backup 恢复后再抛出。
   logger.info('sync', 'Step 7.2: Atomic swap temp directory to live...');
   swapSiteDirectories();
 

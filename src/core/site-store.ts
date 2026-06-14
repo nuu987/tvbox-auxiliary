@@ -83,19 +83,71 @@ export function cleanStaleTempDir(): void {
 }
 
 /**
- * Atomically swaps temp directory into place.
- * Deletes old data/sites/ directory, then renames data/.tmp-sites/ to data/sites/.
- * Per D-05, both directories live under data/ (same filesystem) so renameSync works.
- * Note: there is a ~1ms gap between delete and rename where data/sites/ does not exist;
- * route handlers fall back to remote download during this window (D-11, Plan 03-02).
+ * Atomically swaps temp directory into place using rename-to-backup pattern.
+ *
+ * Per CR-01/CR-05: 旧的 delete-then-rename 实现存在两个问题：
+ * 1. 若 renameSync 在 rmSync 成功后失败，整个 sites/ 缓存永久丢失，无恢复路径
+ * 2. 删除与重命名之间的窗口内，路由层 mkdirSync({recursive:true}) 可能重建 sites/，
+ *    导致后续 renameSync 抛 EEXIST，破坏一致性
+ *
+ * 新方案（rename-over-backup）保证 sites/ 在任一时刻都以旧名或新名存在：
+ *   - 先将当前 sites/ 重命名为 .sites-backup/（原子操作）
+ *   - 再将 .tmp-sites/ 重命名为 sites/
+ *   - 成功后异步清理 backup；失败时从 backup 恢复后再抛出
  */
 export function swapSiteDirectories(): void {
   const sitesDir = path.join(getDataDir(), 'sites');
   const tmpDir = getTmpSitesDir();
-  if (fs.existsSync(sitesDir)) {
-    fs.rmSync(sitesDir, { recursive: true, force: true });
+  const backupDir = path.join(getDataDir(), '.sites-backup');
+
+  // Remove stale backup from a previous crashed swap
+  if (fs.existsSync(backupDir)) {
+    try {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    } catch (e) {
+      logger.warn('site-store', `Failed to remove stale .sites-backup: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
-  fs.renameSync(tmpDir, sitesDir);
+
+  if (fs.existsSync(sitesDir)) {
+    // Move current sites/ aside (rename is atomic on same FS — sites/ disappears instantly)
+    try {
+      fs.renameSync(sitesDir, backupDir);
+    } catch (e) {
+      // If rename fails, fall back to rmSync (data loss risk, but better than sync failure)
+      logger.warn('site-store', `Rename to backup failed, falling back to rmSync: ${e instanceof Error ? e.message : String(e)}`);
+      fs.rmSync(sitesDir, { recursive: true, force: true });
+    }
+
+    // Now rename tmp into the just-vacated sites/ slot
+    try {
+      fs.renameSync(tmpDir, sitesDir);
+      // Success — clean up backup asynchronously (don't block sync)
+      setImmediate(() => {
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true });
+        } catch (e) {
+          logger.warn('site-store', `Background cleanup of .sites-backup failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      });
+    } catch (e) {
+      // CRITICAL: tmp->sites rename failed. Attempt restore from backup so sites/ exists again.
+      logger.error('site-store', `CRITICAL: tmp->sites rename failed; attempting restore from backup: ${e instanceof Error ? e.message : String(e)}`);
+      try {
+        if (fs.existsSync(backupDir)) {
+          fs.renameSync(backupDir, sitesDir);
+          logger.warn('site-store', 'Restored sites/ from backup after swap failure');
+        }
+      } catch (restoreErr) {
+        logger.error('site-store', `FATAL: restore from backup also failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
+      }
+      throw e; // surface to caller — sync will fail and SYNC_STATUS will record failure
+    }
+  } else {
+    // No existing sites/ — direct rename
+    fs.renameSync(tmpDir, sitesDir);
+  }
+
   logger.info('site-store', 'Swapped temp directory to sites');
 }
 
