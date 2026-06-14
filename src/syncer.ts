@@ -6,10 +6,10 @@ import { fetchConfigs } from './core/fetcher';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
-import { rewriteJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey } from './core/jar-proxy';
+import { rewriteJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
+import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, SYNC_STATUS } from './core/config';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
@@ -19,9 +19,9 @@ import { loadCredentials } from './core/credential-store';
 import { loadCredentialPolicy } from './core/credential-store';
 import { injectCredentials } from './core/credential-injector';
 import { logger } from './core/logger';
-import { organizeSiteDirectories } from './core/site-store';
-import { getSiteResourceDir } from './core/site-store';
+import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempDir, swapSiteDirectories, cleanupZombieFiles } from './core/site-store';
 import * as fs from 'fs';
+import * as path from 'path';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
 
 export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
@@ -41,6 +41,22 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
     logger.error('sync', `Stack: ${stack}`);
     // 写入错误信息方便调试
     await storage.put(LAST_UPDATE, `ERROR @ ${new Date().toISOString()}: ${msg}`);
+    // D-12: 记录同步失败状态，不清空缓存
+    try {
+      await storage.put(SYNC_STATUS, JSON.stringify({
+        success: false,
+        timestamp: new Date().toISOString(),
+        error: msg,
+      }));
+    } catch (statusErr) {
+      logger.warn('sync', `Failed to record SYNC_STATUS failure: ${statusErr instanceof Error ? statusErr.message : String(statusErr)}`);
+    }
+    // D-06: 同步失败删除临时目录，确保现有缓存不受影响
+    try {
+      cleanStaleTempDir();
+    } catch (cleanupErr) {
+      logger.warn('sync', `Failed to clean temp directory after sync failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
+    }
   }
 }
 
@@ -537,17 +553,26 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     spider: merged.spider ? 'present' : 'none',
   });
 
-  // Step 7.1: 预下载静态资源（JAR/JS/PY）
+  // Step 7.1: 预下载静态资源（JAR/JS/PY/JSON/TXT）到临时目录，按 spider 优先级排序
+  // 流程：清理旧临时目录 → 创建新临时目录 → 排序 → 逐项 TTL 检查（命中则从 live 目录复制）或下载
   logger.info('sync', 'Step 7.1: Downloading static resources...');
   if (merged.sites && merged.sites.length > 0) {
+    // D-05/D-06: 清理上次崩溃可能残留的临时目录，避免 EEXIST 或部分状态污染
+    cleanStaleTempDir();
+    fs.mkdirSync(getTmpSitesDir(), { recursive: true });
+
     const resources = collectAllSiteResources(merged.sites);
-    if (resources.length > 0) {
-      logger.infoFields('sync', 'static-resources-found', { count: resources.length });
+    // D-01/D-02: spider JAR 优先下载
+    const sorted = sortResourcesByPriority(resources, merged.spider);
+
+    if (sorted.length > 0) {
+      logger.infoFields('sync', 'static-resources-found', { count: sorted.length });
       const downloadTimeout = config.fetchTimeoutMs || 10000;
       let downloaded = 0;
       let failed = 0;
+      let copiedFromLive = 0;
 
-      for (const { url, type } of resources) {
+      for (const { url, type } of sorted) {
         let key: string | null = null;
 
         if (type === 'jar') {
@@ -559,13 +584,6 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
         if (!key) {
           failed++;
-          continue;
-        }
-
-        const data = await downloadResource(url, downloadTimeout);
-        if (!data) {
-          failed++;
-          logger.warn('sync', `Failed to download ${type}: ${url.substring(0, 60)}...`);
           continue;
         }
 
@@ -582,9 +600,47 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
           resourceIndex = siteIdx >= 0 ? siteIdx : 0;
         }
 
-        const sourceDir = getSiteResourceDir(resourceIndex, type);
-        fs.mkdirSync(sourceDir, { recursive: true });
-        await writeResourceCache(key, data, sourceDir, url, storage, resourceIndex, type);
+        // 计算临时目录下的目标路径：data/.tmp-sites/{index}/{type}/
+        const tmpDir = path.join(getTmpSitesDir(), siteIndexToDirName(resourceIndex), type);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        // D-07: TTL 检查 live 目录中是否已有有效缓存文件
+        // MD5 key → 24h，URL hash key → 6h
+        const liveDir = getSiteResourceDir(resourceIndex, type);
+        const liveFilePath = findCacheFile(liveDir, key);
+        const md5Key = isMd5Key(key);
+        const ttlMs = md5Key ? 86_400_000 : 21_600_000;
+
+        if (liveFilePath && isCacheFileValid(liveFilePath, ttlMs)) {
+          // 命中且未过期：从 live 目录复制到临时目录，避免重复下载
+          try {
+            const fileName = path.basename(liveFilePath);
+            fs.copyFileSync(liveFilePath, path.join(tmpDir, fileName));
+            copiedFromLive++;
+            logger.infoFields('sync', 'resource-copied-from-live', {
+              type,
+              key,
+              site: resourceIndex + 1,
+              fileName,
+            });
+            // 静态资源 KV 映射在首次写入时已落库，复制场景无需重写
+            continue;
+          } catch (copyErr) {
+            // 复制失败 → 回退到下载路径
+            logger.warn('sync', `Failed to copy valid cache ${key}: ${copyErr instanceof Error ? copyErr.message : String(copyErr)}, falling back to download`);
+          }
+        }
+
+        // 缓存未命中或 TTL 过期：从远程下载
+        const data = await downloadResource(url, downloadTimeout);
+        if (!data) {
+          failed++;
+          logger.warn('sync', `Failed to download ${type}: ${url.substring(0, 60)}...`);
+          continue;
+        }
+
+        // 写入临时目录 + 写 KV 映射（KV 中包含原始 URL，供 /static/:key/:type 兜底）
+        await writeResourceCache(key, data, tmpDir, url, storage, resourceIndex, type);
         downloaded++;
 
         logger.infoFields('sync', 'resource-downloaded', {
@@ -595,13 +651,24 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
         });
       }
 
-      logger.infoFields('sync', 'static-resource-download-complete', { downloaded, failed, total: resources.length });
+      logger.infoFields('sync', 'static-resource-download-complete', { downloaded, copiedFromLive, failed, total: sorted.length });
     } else {
       logger.info('sync', 'Step 7.1: No static resources found');
     }
   } else {
     logger.info('sync', 'Step 7.1: No sites to scan');
   }
+
+  // Step 7.2: 原子交换临时目录到正式目录（D-05）
+  // 注意：delete-then-rename 之间存在 ~1ms gap，期间 data/sites/ 不存在
+  // 路由层有远程下载兜底（D-11）覆盖此窗口
+  logger.info('sync', 'Step 7.2: Atomic swap temp directory to live...');
+  swapSiteDirectories();
+
+  // Step 7.3: 清理僵尸文件（D-10）
+  // 以 jar-source:* 和 static-source:* KV 键集合为白名单，删除不在白名单的文件
+  logger.info('sync', 'Step 7.3: Cleaning zombie files...');
+  await cleanupZombieFiles(storage);
 
   // Step 7.5: 注入图片代理前缀（本地模式用边缘代理）
   const edgeRaw2 = await storage.get(EDGE_PROXIES);
@@ -623,9 +690,14 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     ...configCounts(merged),
   });
 
-  // Step 9: 整理站点目录结构
-  logger.info('sync', 'Step 9: Organizing site directories...');
-  await organizeSiteDirectories(storage, merged.sites);
+  // Step 9: 记录同步成功状态（D-12）
+  // 旧的 organizeSiteDirectories 步骤已被原子交换取代：临时目录在下载阶段已建好正确的结构
+  logger.info('sync', 'Step 9: Recording sync success status...');
+  await storage.put(SYNC_STATUS, JSON.stringify({
+    success: true,
+    timestamp: new Date().toISOString(),
+    lastSyncMs: Date.now() - startTime,
+  }));
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   logger.infoFields('sync', 'run-complete', {
@@ -760,6 +832,34 @@ function configCounts(config: { sites?: unknown[]; parses?: unknown[]; lives?: u
     parses: config.parses?.length || 0,
     lives: config.lives?.length || 0,
   };
+}
+
+/**
+ * 在目录中查找以 `{key}-` 开头的缓存文件（用于 TTL 检查）。
+ * 找不到时返回 null，扫描错误也返回 null（非致命）。
+ */
+function findCacheFile(dir: string, key: string): string | null {
+  try {
+    const files = fs.readdirSync(dir);
+    const prefix = key + '-';
+    const match = files.find(f => f.startsWith(prefix));
+    return match ? path.join(dir, match) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 检查缓存文件是否仍在 TTL 窗口内（D-07）。
+ * MD5 key → 24h，URL hash key → 6h，由调用方传入 ttlMs。
+ */
+function isCacheFileValid(filePath: string, ttlMs: number): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    return Date.now() - stat.mtimeMs < ttlMs;
+  } catch {
+    return false;
+  }
 }
 
 function beforeAfterCounts(
