@@ -632,23 +632,37 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
         }
 
         // 缓存未命中或 TTL 过期：从远程下载
-        const data = await downloadResource(url, downloadTimeout);
-        if (!data) {
+        try {
+          const data = await downloadResource(url, downloadTimeout);
+          if (!data) {
+            failed++;
+            logger.warn('sync', `Failed to download ${type}: ${url.substring(0, 60)}...`);
+            continue;
+          }
+
+          // 写入临时目录 + 写 KV 映射（KV 中包含原始 URL，供 /static/:key/:type 兜底）
+          // CR-03: 单项写入失败不应中断整个 sync —— 包在 try/catch 内隔离错误
+          try {
+            await writeResourceCache(key, data, tmpDir, url, storage, resourceIndex, type);
+            downloaded++;
+          } catch (writeErr) {
+            failed++;
+            logger.warn('sync', `Failed to write resource ${type} ${key}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+            continue;
+          }
+
+          logger.infoFields('sync', 'resource-downloaded', {
+            type,
+            key,
+            sizeKB: (data.length / 1024).toFixed(1),
+            site: resourceIndex + 1,
+          });
+        } catch (downloadErr) {
+          // 防御性：downloadResource 已经内部 catch 返回 null，但 fetch 抛出未预期异常时仍兜底
           failed++;
-          logger.warn('sync', `Failed to download ${type}: ${url.substring(0, 60)}...`);
+          logger.warn('sync', `Unexpected error downloading ${type} ${key}: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`);
           continue;
         }
-
-        // 写入临时目录 + 写 KV 映射（KV 中包含原始 URL，供 /static/:key/:type 兜底）
-        await writeResourceCache(key, data, tmpDir, url, storage, resourceIndex, type);
-        downloaded++;
-
-        logger.infoFields('sync', 'resource-downloaded', {
-          type,
-          key,
-          sizeKB: (data.length / 1024).toFixed(1),
-          site: resourceIndex + 1,
-        });
       }
 
       logger.infoFields('sync', 'static-resource-download-complete', { downloaded, copiedFromLive, failed, total: sorted.length });
