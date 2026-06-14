@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import { logger } from './logger';
 import type { Storage } from '../storage/interface';
 import { MANUAL_SOURCES, MACCMS_SOURCES } from './config';
-import type { SourceEntry, MacCMSSourceEntry, TVBoxSite } from './types';
+import type { SourceEntry, MacCMSSourceEntry, TVBoxConfig, TVBoxSite } from './types';
 
 const DATA_DIR_ENV = 'DATA_DIR';
 
@@ -347,5 +347,41 @@ export async function organizeSiteDirectories(storage: Storage, mergedSites?: TV
     }
   } catch (e) {
     logger.error('site-store', `organizeSiteDirectories failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * 清理不再存在的站点的 static-source KV 条目。
+ * 在僵尸文件清理之前调用，确保白名单不包含已删除站点的文件。
+ */
+export async function cleanupOrphanedStaticSources(storage: Storage, merged: TVBoxConfig): Promise<void> {
+  try {
+    const activeIndexes = new Set<number>();
+    if (merged.sites) {
+      for (let i = 0; i < merged.sites.length; i++) {
+        activeIndexes.add(i);
+      }
+    }
+
+    const staticKeys = await storage.list('static-source:');
+    let removed = 0;
+    for (const key of staticKeys) {
+      const raw = await storage.get(key);
+      if (!raw) continue;
+      try {
+        const entry = JSON.parse(raw) as { index?: number };
+        if (entry.index !== undefined && !activeIndexes.has(entry.index)) {
+          // 这个 KV 条目对应的站点已被删除（黑名单或其他原因），清理它
+          await storage.put(key, '');
+          removed++;
+        }
+      } catch { /* skip unparseable */ }
+    }
+
+    if (removed > 0) {
+      logger.info('site-store', `Cleaned ${removed} orphaned static-source KV entries`);
+    }
+  } catch (e) {
+    logger.warn('site-store', `cleanupOrphanedStaticSources failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

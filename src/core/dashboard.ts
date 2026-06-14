@@ -514,6 +514,13 @@ async function loadStatus() {
     } else {
       banner.innerHTML = '';
     }
+
+    // 同步失败或部分失败时弹 toast 通知
+    if (d.syncSuccess === false) {
+      toast("上次同步失败，请检查日志", 'error');
+    } else if (d.syncFailedDownloads > 0) {
+      toast(d.syncFailedDownloads + " 个资源下载失败", 'warn');
+    }
   } catch (e) {
     $('updateTime').textContent = "获取状态失败";
     $('updateTime').className = 'update-time never';

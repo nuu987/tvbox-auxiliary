@@ -1,7 +1,7 @@
 // 监控面板数据路由
 
 import { Hono } from 'hono';
-import { LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, MERGED_CONFIG, SOURCE_HEALTH } from '../core/config';
+import { LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, MERGED_CONFIG, SOURCE_HEALTH, SYNC_STATUS } from '../core/config';
 import { getDirtyMarker } from '../core/dirty-marker';
 import type { RuntimeState } from './admin-auth';
 import type { Storage } from '../storage/interface';
@@ -39,6 +39,18 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
       }
     }
 
+    // 读取同步状态
+    let syncSuccess: boolean | null = null;
+    let syncFailedDownloads = 0;
+    const syncStatusRaw = await storage.get(SYNC_STATUS);
+    if (syncStatusRaw) {
+      try {
+        const syncStatus = JSON.parse(syncStatusRaw);
+        syncSuccess = syncStatus.success ?? null;
+        syncFailedDownloads = syncStatus.downloadFailed || 0;
+      } catch { /* ignore */ }
+    }
+
     const warnings: string[] = [];
     if (config.dockerMissingBaseUrl) {
       warnings.push('docker_no_base_url');
@@ -50,6 +62,12 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
     if (isAdmin) {
       adminFields.syncRunning = runtime.isSyncing();
       adminFields.dirtyMarker = await getDirtyMarker(storage);
+      // 管理员可见完整同步状态
+      if (syncStatusRaw) {
+        try {
+          adminFields.syncStatus = JSON.parse(syncStatusRaw);
+        } catch { /* ignore */ }
+      }
     }
 
     return c.json({
@@ -60,6 +78,8 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
       sites: siteCount,
       parses: parseCount,
       lives: liveCount,
+      syncSuccess,
+      syncFailedDownloads,
       ...adminFields,
       warnings,
     });

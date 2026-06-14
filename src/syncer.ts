@@ -19,7 +19,7 @@ import { loadCredentials } from './core/credential-store';
 import { loadCredentialPolicy } from './core/credential-store';
 import { injectCredentials } from './core/credential-injector';
 import { logger } from './core/logger';
-import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempDir, swapSiteDirectories, cleanupZombieFiles } from './core/site-store';
+import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempDir, swapSiteDirectories, cleanupZombieFiles, cleanupOrphanedStaticSources } from './core/site-store';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
@@ -61,6 +61,7 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
 }
 
 async function _runSync(storage: Storage, config: AppConfig, startTime: number): Promise<void> {
+  let step71FailedCount = 0;
 
   // Step 0: 自动抓取源（需配置 SCRAPE_SOURCE_URL 环境变量）
   if (config.scrapeSourceUrl && config.scrapeSourceReferer) {
@@ -680,6 +681,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
       }
 
       logger.infoFields('sync', 'static-resource-download-complete', { downloaded, copiedFromLive, failed, total: sorted.length });
+      step71FailedCount = failed;
     } else {
       logger.info('sync', 'Step 7.1: No static resources found');
     }
@@ -692,6 +694,9 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   // 改写为 {baseUrl}/static/{key}/{type}，并写入 static-source KV 映射
   logger.info('sync', 'Step 7.1.5: Rewriting non-JAR resource URLs...');
   merged = await rewriteNonJarUrls(merged, BASE_URL_PLACEHOLDER, storage);
+
+  // 清理已删除站点的 static-source KV 条目，确保僵尸文件清理正确
+  await cleanupOrphanedStaticSources(storage, merged);
 
   // Step 7.2: 原子交换临时目录到正式目录（D-05, CR-01/CR-05）
   // 新实现使用 rename-to-backup 模式：sites/ 在任一时刻都以旧名或新名存在，
@@ -732,6 +737,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     success: true,
     timestamp: new Date().toISOString(),
     lastSyncMs: Date.now() - startTime,
+    downloadFailed: step71FailedCount,
   }));
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
