@@ -42,4 +42,8 @@ export class JsonFileStorage implements Storage {
       throw error;
     }
   }
+
+  async list(prefix: string): Promise<string[]> {
+    return Object.keys(this.data).filter((key) => key.startsWith(prefix));
+  }
 }

@@ -188,9 +188,9 @@ export function base64ToUint8Array(b64: string): Uint8Array {
 }
 
 /**
- * Bestimmt den Ressourcentyp einer URL anhand der Dateiendung.
- * Entfernt Query-Strings (# und ?) vor der Endungspruefung.
- * @returns 'jar', 'js', 'py' oder null falls nicht erkannt.
+ * Determines the resource type of a URL based on its file extension.
+ * Strips query strings (# and ?) before extension check.
+ * @returns 'jar', 'js', 'py', 'json', 'txt' or null if not recognized.
  */
 export function getResourceUrlType(url: string): string | null {
   try {
@@ -198,6 +198,8 @@ export function getResourceUrlType(url: string): string | null {
     if (cleaned.endsWith('.jar')) return 'jar';
     if (cleaned.endsWith('.js')) return 'js';
     if (cleaned.endsWith('.py')) return 'py';
+    if (cleaned.endsWith('.json')) return 'json';
+    if (cleaned.endsWith('.txt')) return 'txt';
     return null;
   } catch {
     return null;
@@ -205,9 +207,9 @@ export function getResourceUrlType(url: string): string | null {
 }
 
 /**
- * Sammelt alle statischen Ressourcen-URLs (JAR, JS, PY) aus TVBoxSite[].
- * Prueft site.jar (via parseSpiderString), site.api (type 3 oder HTTP-URL mit Endung),
- * site.ext (String oder Object). Dedupliziert via URL-Set.
+ * Collects all static resource URLs (JAR, JS, PY, JSON, TXT) from TVBoxSite[].
+ * Inspects site.jar (via parseSpiderString), site.api (type detection via extension
+ * or HTTP URL), site.ext (string or object). Deduplicates via URL set.
  */
 export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string; type: string }> {
   const seen = new Set<string>();
@@ -269,8 +271,35 @@ export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string
 }
 
 /**
- * Laedt eine Resource von einer URL herunter und gibt Buffer zurueck.
- * Timeout via AbortController. Bei Fehler null zurueck.
+ * Sorts resources so that config.spider JAR is downloaded first.
+ * Per D-01/D-02: priority is given to the JAR matching the parsed spider URL,
+ * then all other resources in their original order. This ensures the
+ * spider JAR is available before any site that depends on it loads.
+ */
+export function sortResourcesByPriority(
+  resources: Array<{ url: string; type: string }>,
+  spiderUrl: string | undefined,
+): Array<{ url: string; type: string }> {
+  if (!spiderUrl) return resources;
+
+  const parsed = parseSpiderString(spiderUrl);
+  const priority: Array<{ url: string; type: string }> = [];
+  const rest: Array<{ url: string; type: string }> = [];
+
+  for (const r of resources) {
+    if (r.type === 'jar' && r.url === parsed.url) {
+      priority.push(r);
+    } else {
+      rest.push(r);
+    }
+  }
+
+  return [...priority, ...rest];
+}
+
+/**
+ * Downloads a resource from a URL and returns a Buffer.
+ * Uses AbortController for timeout. Returns null on failure.
  */
 export async function downloadResource(url: string, timeoutMs: number): Promise<Buffer | null> {
   const controller = new AbortController();
@@ -290,8 +319,10 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
 }
 
 /**
- * Schreibt gecachte Resource-Daten in das Site-Verzeichnis und erstellt static-source KV Mapping.
- * Dateiname-Format: {key}-{safeFileName(url)}
+ * Writes cached resource data to the site directory and creates static-source KV mapping.
+ * File name format: {key}-{safeFileName(url)}.
+ * Per D-11, the original URL is stored in the KV mapping so that /static/:key/:type
+ * can re-download from origin on cache miss.
  */
 export async function writeResourceCache(
   key: string,
@@ -309,6 +340,6 @@ export async function writeResourceCache(
     ? sourceDir + fileName
     : sourceDir + '/' + fileName;
   fs.writeFileSync(filePath, data);
-  await storage.put(`static-source:${key}`, JSON.stringify({ index: safeIndex, hash: key.substring(0, 8), name: safeName, type }));
+  await storage.put(`static-source:${key}`, JSON.stringify({ index: safeIndex, hash: key.substring(0, 8), name: safeName, type, url }));
   logger.info('jar-proxy', `Cached ${type} ${key} in site ${safeIndex + 1}: ${fileName}`);
 }
