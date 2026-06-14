@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
-import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource } from '../core/jar-proxy';
+import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource, isUrlSafe } from '../core/jar-proxy';
 import { getSiteResourceDir, safeFileName, ensureSiteDir } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
@@ -55,6 +55,11 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
   const { storage, config } = deps;
 
   async function fetchAndCacheJar(key: string, originalUrl: string): Promise<Buffer | null> {
+    // CR-04: SSRF guard — same as downloadResource in core/jar-proxy.ts
+    if (!isUrlSafe(originalUrl)) {
+      logger.security(`fetchAndCacheJar blocked unsafe URL: ${originalUrl.length > 60 ? originalUrl.substring(0, 60) + '...' : originalUrl}`);
+      return null;
+    }
     try {
       const resp = await fetch(originalUrl, {
         headers: { 'User-Agent': 'okhttp/3.12.0' },

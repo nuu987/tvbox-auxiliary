@@ -298,10 +298,54 @@ export function sortResourcesByPriority(
 }
 
 /**
+ * Validates that a URL is safe to fetch.
+ *
+ * Per CR-04 (SSRF protection):
+ * - Rejects non-http/https protocols (file://, ftp://, data:, etc.)
+ * - When DMZ != '0' (LAN-only mode), blocks private/internal hosts:
+ *   - localhost, 127.0.0.1, ::1, 0.0.0.0
+ *   - .local / .internal TLDs (mDNS / internal DNS)
+ *   - RFC1918 private ranges (10.x, 192.168.x, 172.16-31.x)
+ *   - Link-local / AWS metadata (169.254.x)
+ *   - IPv6 link-local (fe80::) and unique-local (fc00::/7)
+ *
+ * Returns false on parse failure or any unsafe condition.
+ */
+export function isUrlSafe(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+
+  // DMZ='0' explicitly opts out of LAN-only validation — operator accepts SSRF risk
+  if (process.env.DMZ !== '0') {
+    // Strip surrounding [] from IPv6 hostname (Node's URL keeps brackets for IPv6 literals)
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') return false;
+    if (host.endsWith('.local') || host.endsWith('.internal')) return false;
+    // Block RFC1918 + link-local (AWS metadata 169.254.x)
+    if (/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)/.test(host)) return false;
+    // IPv6 link-local (fe80::/10) and unique-local (fc00::/7)
+    if (host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return false;
+  }
+  return true;
+}
+
+/**
  * Downloads a resource from a URL and returns a Buffer.
  * Uses AbortController for timeout. Returns null on failure.
+ *
+ * Per CR-04: SSRF guard via isUrlSafe runs before fetch — unsafe URLs
+ * (private hosts, non-http protocols) return null and log a security event.
  */
 export async function downloadResource(url: string, timeoutMs: number): Promise<Buffer | null> {
+  if (!isUrlSafe(url)) {
+    logger.security(`downloadResource blocked unsafe URL: ${url.length > 60 ? url.substring(0, 60) + '...' : url}`);
+    return null;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
