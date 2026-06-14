@@ -129,7 +129,8 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     return c.json({ error: 'JAR unavailable from origin' }, 502);
   });
 
-  // GET /static/:key/:type — 静态资源代理（非 JAR：JS/PY 等）
+  // GET /static/:key/:type — 静态资源代理（非 JAR：JS/PY/JSON/TXT 等）
+  // 缓存命中直接返回；缓存未命中时通过 KV 中的 url 字段从远程下载兜底（D-11）
   router.get('/static/:key/:type', async (c) => {
     const key = c.req.param('key');
     const type = c.req.param('type');
@@ -140,23 +141,22 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
       return c.json({ error: 'Unknown static resource key' }, 404);
     }
 
-    let mapping: { index: number; hash: string; name: string; type?: string };
+    let mapping: { index: number; hash: string; name: string; type?: string; url?: string };
     try {
       mapping = JSON.parse(mappingRaw);
     } catch {
       return c.json({ error: 'Invalid mapping data' }, 500);
     }
 
+    // Content-Type 解析（js/py/jar/json/txt + 默认 octet-stream）
+    const contentType = getStaticContentType(type);
+
     const sourceDir = getSiteResourceDir(mapping.index, type);
     const filePath = path.join(sourceDir, `${key}-${mapping.name}`);
 
-    // 2. Try cache read
+    // 2. 缓存命中：直接读取并返回
     if (fs.existsSync(filePath)) {
       const buf = fs.readFileSync(filePath);
-      const contentType = type === 'js' ? 'application/javascript'
-        : type === 'py' ? 'text/x-python'
-        : type === 'jar' ? 'application/octet-stream'
-        : 'application/octet-stream';
       return new Response(buf, {
         headers: {
           'Content-Type': contentType,
@@ -166,22 +166,54 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
       });
     }
 
-    // 3. Cache miss — lazy download fallback for resources that weren't pre-cached
-    const contentTypes: Record<string, string> = {
-      js: 'application/javascript',
-      py: 'text/x-python',
-      jar: 'application/octet-stream',
-    };
-    const contentType = contentTypes[type] || 'application/octet-stream';
+    // 3. 缓存未命中：D-11 远程下载兜底
+    //    静态资源 sync 可能因网络问题下载失败或原子交换窗口内文件暂时缺失，
+    //    此时通过 KV mapping.url 字段从源重新下载
+    const originalUrl = mapping.url;
+    if (!originalUrl) {
+      logger.warn('jar-proxy', `Static resource ${key} not cached and no original URL in KV mapping`);
+      return c.json({ error: 'Resource not cached and original URL unknown' }, 404);
+    }
 
-    // We need the original URL. Try to reconstruct: we only have the KV mapping.
-    // If the resource was pre-cached, it should already exist. This is a fallback
-    // for edge cases where the sync download failed but client still requests it.
-    // Since we don't store the original URL in static-source mapping, we cannot
-    // reliably re-download here. Log and return 404.
-    logger.warn('jar-proxy', `Static resource ${key} not found on disk (cache miss): ${filePath}`);
-    return c.json({ error: 'Resource not cached locally. Run sync to pre-cache resources.' }, 404);
+    const downloadTimeout = config.fetchTimeoutMs || 10000;
+    const data = await downloadResource(originalUrl, downloadTimeout);
+    if (!data) {
+      logger.warn('jar-proxy', `On-demand download failed for ${type} ${key} from ${originalUrl.substring(0, 60)}...`);
+      return c.json({ error: 'Failed to download from origin' }, 502);
+    }
+
+    // 写回缓存供后续请求复用（mkdir 容错：目录可能在原子交换窗口中暂时缺失）
+    try {
+      fs.mkdirSync(sourceDir, { recursive: true });
+      fs.writeFileSync(filePath, data);
+      logger.info('jar-proxy', `On-demand cached ${type} ${key} (${(data.length / 1024).toFixed(1)} KB)`);
+    } catch (writeErr) {
+      logger.warn('jar-proxy', `Failed to cache ${key} on demand: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+    }
+
+    return new Response(data, {
+      headers: {
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=21600',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   });
 
   return router;
+}
+
+/**
+ * 静态资源 Content-Type 映射
+ * 用于 /static/:key/:type 路由的缓存命中和未命中分支
+ */
+function getStaticContentType(type: string): string {
+  switch (type) {
+    case 'js': return 'application/javascript';
+    case 'py': return 'text/x-python';
+    case 'jar': return 'application/octet-stream';
+    case 'json': return 'application/json';
+    case 'txt': return 'text/plain';
+    default: return 'application/octet-stream';
+  }
 }
