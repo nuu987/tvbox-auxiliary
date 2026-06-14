@@ -12,6 +12,10 @@ import * as path from 'path';
 // 并发下载锁：防止同一 JAR 被多个请求同时下载（模块级作用域，不在 deps 中共享）
 const downloadLocks = new Map<string, Promise<Buffer | null>>();
 
+// CR-02: /static/:key/:type 路由允许的资源类型白名单
+// 阻止通过 :type 参数（例如 ".."）进行路径遍历攻击
+const ALLOWED_STATIC_TYPES = new Set(['jar', 'js', 'py', 'json', 'txt']);
+
 export interface JarProxyRouteDeps {
   storage: Storage;
   config: AppConfig;
@@ -134,6 +138,11 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
   router.get('/static/:key/:type', async (c) => {
     const key = c.req.param('key');
     const type = c.req.param('type');
+
+    // CR-02: validate :type against whitelist before any path operation to prevent traversal
+    if (!ALLOWED_STATIC_TYPES.has(type)) {
+      return c.json({ error: 'Invalid resource type' }, 400);
+    }
 
     // 1. 查 KV mapping
     const mappingRaw = await storage.get(`static-source:${key}`);
