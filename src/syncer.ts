@@ -6,7 +6,7 @@ import { fetchConfigs } from './core/fetcher';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
-import { rewriteJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
+import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
 import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, SYNC_STATUS } from './core/config';
@@ -561,7 +561,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     cleanStaleTempDir();
     fs.mkdirSync(getTmpSitesDir(), { recursive: true });
 
-    const resources = collectAllSiteResources(merged.sites);
+    const resources = collectAllSiteResources(merged.sites, merged.parses);
     // D-01/D-02: spider JAR 优先下载
     const sorted = sortResourcesByPriority(resources, merged.spider);
 
@@ -672,6 +672,12 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   } else {
     logger.info('sync', 'Step 7.1: No sites to scan');
   }
+
+  // Step 7.1.5: 改写非 JAR 静态资源 URL 为本地代理地址
+  // 对 site.api/site.ext/parse.url/parse.ext 中的 JS/PY/JSON/TXT URL
+  // 改写为 {baseUrl}/static/{key}/{type}，并写入 static-source KV 映射
+  logger.info('sync', 'Step 7.1.5: Rewriting non-JAR resource URLs...');
+  merged = await rewriteNonJarUrls(merged, BASE_URL_PLACEHOLDER, storage);
 
   // Step 7.2: 原子交换临时目录到正式目录（D-05, CR-01/CR-05）
   // 新实现使用 rename-to-backup 模式：sites/ 在任一时刻都以旧名或新名存在，
