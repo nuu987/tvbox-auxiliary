@@ -1,6 +1,6 @@
 // JAR 代理：将 spider/jar URL 改写为代理路由
 
-import type { TVBoxConfig, TVBoxSite } from './types';
+import type { TVBoxConfig, TVBoxSite, TVBoxParse } from './types';
 import type { Storage } from '../storage/interface';
 import { safeFileName } from './site-store';
 import { logger } from './logger';
@@ -152,7 +152,13 @@ export async function rewriteJarUrls(
   }
 
   logger.info('jar-proxy', `Rewrote ${urlKeyMap.size} unique JAR URLs across config`);
-  return result;
+
+  // 确保 spider 在 JSON 输出中排在首位（对象字面量属性顺序）
+  const { spider, ...rest } = result;
+  const finalResult: TVBoxConfig = spider
+    ? { spider, ...rest }
+    : rest;
+  return finalResult;
 }
 
 /**
@@ -207,11 +213,12 @@ export function getResourceUrlType(url: string): string | null {
 }
 
 /**
- * Collects all static resource URLs (JAR, JS, PY, JSON, TXT) from TVBoxSite[].
+ * Collects all static resource URLs (JAR, JS, PY, JSON, TXT) from TVBoxSite[] + TVBoxParse[].
  * Inspects site.jar (via parseSpiderString), site.api (type detection via extension
- * or HTTP URL), site.ext (string or object). Deduplicates via URL set.
+ * or HTTP URL), site.ext (string or object), parse.url, parse.ext.
+ * Deduplicates via URL set.
  */
-export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string; type: string }> {
+export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[]): Array<{ url: string; type: string }> {
   const seen = new Set<string>();
   const resources: Array<{ url: string; type: string }> = [];
 
@@ -227,7 +234,7 @@ export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string
       }
     }
 
-    // site.api: Typ-Erkennung via Endung
+    // site.api: type detection via extension
     if (site.api) {
       if (!seen.has(site.api)) {
         const type = getResourceUrlType(site.api);
@@ -238,36 +245,225 @@ export function collectAllSiteResources(sites: TVBoxSite[]): Array<{ url: string
       }
     }
 
-    // site.ext: String oder Object
+    // site.ext: String or Object
     if (site.ext) {
-      if (typeof site.ext === 'string') {
-        // String ext kann Trennzeichen enthalten ($ | ; etc.)
-        const extParts = site.ext.split(/[\s$;|]+/);
-        for (const part of extParts) {
-          if (!part.startsWith('http://') && !part.startsWith('https://')) continue;
-          if (seen.has(part)) continue;
-          const type = getResourceUrlType(part);
-          if (type) {
-            seen.add(part);
-            resources.push({ url: part, type });
-          }
+      extractExtUrls(site.ext, seen, resources);
+    }
+  }
+
+  // parse.url / parse.ext
+  if (parses) {
+    for (const parse of parses) {
+      if (parse.url && !seen.has(parse.url)) {
+        const type = getResourceUrlType(parse.url);
+        if (type) {
+          seen.add(parse.url);
+          resources.push({ url: parse.url, type });
         }
-      } else if (typeof site.ext === 'object' && site.ext !== null) {
-        for (const val of Object.values(site.ext)) {
-          if (typeof val !== 'string') continue;
-          if (!val.startsWith('http://') && !val.startsWith('https://')) continue;
-          if (seen.has(val)) continue;
-          const type = getResourceUrlType(val);
-          if (type) {
-            seen.add(val);
-            resources.push({ url: val, type });
-          }
-        }
+      }
+      if (parse.ext) {
+        extractExtUrls(parse.ext, seen, resources);
       }
     }
   }
 
   return resources;
+}
+
+/**
+ * Helper: extract HTTP(S) URLs from ext field (string or object) into resources array.
+ */
+function extractExtUrls(
+  ext: string | Record<string, unknown>,
+  seen: Set<string>,
+  resources: Array<{ url: string; type: string }>,
+): void {
+  if (typeof ext === 'string') {
+    const extParts = ext.split(/[\s$;|]+/);
+    for (const part of extParts) {
+      if (!part.startsWith('http://') && !part.startsWith('https://')) continue;
+      if (seen.has(part)) continue;
+      const type = getResourceUrlType(part);
+      if (type) {
+        seen.add(part);
+        resources.push({ url: part, type });
+      }
+    }
+  } else if (typeof ext === 'object' && ext !== null) {
+    for (const val of Object.values(ext)) {
+      if (typeof val !== 'string') continue;
+      if (!val.startsWith('http://') && !val.startsWith('https://')) continue;
+      if (seen.has(val)) continue;
+      const type = getResourceUrlType(val);
+      if (type) {
+        seen.add(val);
+        resources.push({ url: val, type });
+      }
+    }
+  }
+}
+
+/**
+ * 改写非 JAR 静态资源 URL 为本地代理地址
+ *
+ * 遍历 config.sites 中的 site.api/site.ext 以及 config.parses 中的 parse.url/parse.ext，
+ * 将 JS/PY/JSON/TXT URL 改写为 {baseUrl}/static/{key}/{type} 格式，
+ * 同时写入 static-source:{key} KV 映射。
+ *
+ * JAR URL 不在此函数中处理（已在 rewriteJarUrls 处理）。
+ */
+export async function rewriteNonJarUrls(
+  config: TVBoxConfig,
+  baseUrl: string,
+  storage: Storage,
+): Promise<TVBoxConfig> {
+  const result = { ...config };
+  const cleanBaseUrl = baseUrl.replace(/\/$/, '');
+  let rewriteCount = 0;
+
+  // 改写 site.api / site.ext
+  if (result.sites) {
+    for (let i = 0; i < result.sites.length; i++) {
+      const site = result.sites[i];
+
+      // site.api: if it's a non-JAR static resource URL
+      if (site.api) {
+        const apiType = getResourceUrlType(site.api);
+        if (apiType && apiType !== 'jar' && (site.api.startsWith('http://') || site.api.startsWith('https://'))) {
+          const key = await urlToKey(site.api);
+          const name = safeFileName(site.api);
+          await storage.put(`static-source:${key}`, JSON.stringify({
+            index: i,
+            hash: key.substring(0, 8),
+            name,
+            type: apiType,
+            url: site.api,
+          }));
+          result.sites[i] = { ...site, api: `${cleanBaseUrl}/static/${key}/${apiType}` };
+          rewriteCount++;
+          logger.info('jar-proxy', `Rewrote site.api ${key} → ${apiType} (site ${i + 1})`);
+        }
+      }
+
+      // site.ext: string or object containing non-JAR URLs
+      const currentSite = result.sites[i];
+      if (currentSite.ext) {
+        const rewrittenExt = await rewriteExtFieldAsync(currentSite.ext, cleanBaseUrl, i, storage);
+        if (rewrittenExt !== null) {
+          result.sites[i] = { ...currentSite, ext: rewrittenExt };
+          rewriteCount++;
+        }
+      }
+    }
+  }
+
+  // 改写 parse.url / parse.ext
+  if (result.parses) {
+    for (let i = 0; i < result.parses.length; i++) {
+      const parse = result.parses[i];
+
+      // parse.url
+      if (parse.url) {
+        const urlType = getResourceUrlType(parse.url);
+        if (urlType && urlType !== 'jar' && (parse.url.startsWith('http://') || parse.url.startsWith('https://'))) {
+          const key = await urlToKey(parse.url);
+          const name = safeFileName(parse.url);
+          await storage.put(`static-source:${key}`, JSON.stringify({
+            index: i,
+            hash: key.substring(0, 8),
+            name,
+            type: urlType,
+            url: parse.url,
+          }));
+          result.parses[i] = { ...parse, url: `${cleanBaseUrl}/static/${key}/${urlType}` };
+          rewriteCount++;
+          logger.info('jar-proxy', `Rewrote parse.url ${key} → ${urlType} (parse ${i + 1})`);
+        }
+      }
+
+      // parse.ext
+      const currentParse = result.parses[i];
+      if (currentParse.ext) {
+        const rewrittenExt = await rewriteExtFieldAsync(currentParse.ext, cleanBaseUrl, i, storage);
+        if (rewrittenExt !== null) {
+          result.parses[i] = { ...currentParse, ext: rewrittenExt };
+          rewriteCount++;
+        }
+      }
+    }
+  }
+
+  logger.info('jar-proxy', `Rewrote ${rewriteCount} non-JAR URLs across config`);
+  return result;
+}
+
+/**
+ * Helper: rewrite non-JAR URLs in an ext field (string or object).
+ * Returns the rewritten ext if any URL was rewritten, or null if no changes needed.
+ * KV writes are performed for each rewritten URL.
+ */
+async function rewriteExtFieldAsync(
+  ext: string | Record<string, unknown>,
+  baseUrl: string,
+  index: number,
+  storage: Storage,
+): Promise<string | Record<string, unknown> | null> {
+  if (typeof ext === 'string') {
+    // Split while preserving delimiters so we can reassemble
+    const parts = ext.split(/([\s$;|]+)/);
+    let didRewrite = false;
+
+    for (let j = 0; j < parts.length; j++) {
+      const part = parts[j];
+      if (!part.startsWith('http://') && !part.startsWith('https://')) continue;
+      const type = getResourceUrlType(part);
+      if (!type || type === 'jar') continue;
+
+      const key = await urlToKey(part);
+      const name = safeFileName(part);
+      await storage.put(`static-source:${key}`, JSON.stringify({
+        index,
+        hash: key.substring(0, 8),
+        name,
+        type,
+        url: part,
+      }));
+      parts[j] = `${baseUrl}/static/${key}/${type}`;
+      didRewrite = true;
+    }
+
+    return didRewrite ? parts.join('') : null;
+  }
+
+  if (typeof ext === 'object' && ext !== null) {
+    const newObj: Record<string, unknown> = {};
+    let didRewrite = false;
+
+    for (const [k, val] of Object.entries(ext)) {
+      if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))) {
+        const type = getResourceUrlType(val);
+        if (type && type !== 'jar') {
+          const key = await urlToKey(val);
+          const name = safeFileName(val);
+          await storage.put(`static-source:${key}`, JSON.stringify({
+            index,
+            hash: key.substring(0, 8),
+            name,
+            type,
+            url: val,
+          }));
+          newObj[k] = `${baseUrl}/static/${key}/${type}`;
+          didRewrite = true;
+          continue;
+        }
+      }
+      newObj[k] = val;
+    }
+
+    return didRewrite ? newObj : null;
+  }
+
+  return null;
 }
 
 /**
