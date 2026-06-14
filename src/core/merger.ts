@@ -72,7 +72,9 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
   // Step 4: 去重
   const dedupedSites = deduplicateSites(allSites);
 
+  const spider = globalSpiderFull || globalSpider;
   const merged: TVBoxConfig = {
+    ...(spider ? { spider } : {}),
     sites: dedupedSites,
     parses: deduplicateParses(allParses || []),
     lives: deduplicateLives(allLives || []),
@@ -82,11 +84,6 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
     ads: deduplicateStrings(allAds),
     flags: deduplicateStrings(allFlags),
   };
-
-  // 设置全局 spider
-  if (globalSpider) {
-    merged.spider = globalSpiderFull || globalSpider;
-  }
 
   console.log(
     `[merger] Merged: ${merged.sites?.length} sites, ` +
