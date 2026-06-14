@@ -51,7 +51,20 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
         return c.text('Forbidden', 403);
       }
     }
-    const body = applyBaseUrlPlaceholder(cached, actualBase, fallback);
+
+    // LIVE_DISABLED 防御性检查：同步管道中若已禁用直播，lives 字段已被清空；
+    // 但为防御性保险，在主输出路由再次检查
+    const liveDisabledRaw = await storage.get(LIVE_DISABLED);
+    let outputData = cached;
+    if (liveDisabledRaw !== 'false') {
+      try {
+        const parsed = JSON.parse(cached);
+        parsed.lives = [];
+        outputData = JSON.stringify(parsed);
+      } catch { /* 解析失败就继续用原始 cached */ }
+    }
+
+    const body = applyBaseUrlPlaceholder(outputData, actualBase, fallback);
 
     return c.body(body, 200, {
       'Content-Type': 'application/json; charset=utf-8',

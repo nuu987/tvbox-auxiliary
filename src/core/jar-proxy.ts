@@ -542,20 +542,38 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
     logger.security(`downloadResource blocked unsafe URL: ${url.length > 60 ? url.substring(0, 60) + '...' : url}`);
     return null;
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'okhttp/3.12.0' },
-      signal: controller.signal,
-    });
-    if (!resp.ok) return null;
-    return Buffer.from(await resp.arrayBuffer());
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'okhttp/3.12.0' },
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = Math.pow(2, attempt - 1) * 1000;
+          logger.warn('jar-proxy', `Download attempt ${attempt}/${MAX_ATTEMPTS} failed (HTTP ${resp.status}), retrying in ${delay}ms: ${url.substring(0, 60)}...`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        return null;
+      }
+      return Buffer.from(await resp.arrayBuffer());
+    } catch {
+      if (attempt < MAX_ATTEMPTS) {
+        const delay = Math.pow(2, attempt - 1) * 1000;
+        logger.warn('jar-proxy', `Download attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay}ms: ${url.substring(0, 60)}...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return null;
 }
 
 /**

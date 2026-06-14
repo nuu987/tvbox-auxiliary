@@ -450,7 +450,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   {
     // 检查直播功能禁用开关
     const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    const liveDisabled = liveDisabledRaw === 'true';
+    const liveDisabled = liveDisabledRaw !== 'false';
     if (liveDisabled) {
       logger.info('sync', 'Step 6.5: live_disabled=true, skipping live merge and clearing lives');
       merged.lives = [];
@@ -588,16 +588,30 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
         }
 
         let resourceIndex = 0;
-        const jarSourceRaw = await storage.get(`jar-source:${key}`);
-        if (jarSourceRaw) {
-          try { resourceIndex = JSON.parse(jarSourceRaw).index; } catch { /* ignore */ }
+        if (type === 'jar') {
+          const jarSourceRaw = await storage.get(`jar-source:${key}`);
+          if (jarSourceRaw) {
+            try { resourceIndex = JSON.parse(jarSourceRaw).index; } catch { /* ignore */ }
+          } else {
+            const siteIdx = merged.sites.findIndex(s =>
+              s.jar && parseSpiderString(s.jar).url === url
+            );
+            resourceIndex = siteIdx >= 0 ? siteIdx : 0;
+          }
         } else {
-          const siteIdx = merged.sites.findIndex(s =>
-            (type === 'jar' && s.jar && parseSpiderString(s.jar).url === url) ||
-            s.api === url ||
-            (typeof s.ext === 'string' && s.ext.includes(url))
-          );
-          resourceIndex = siteIdx >= 0 ? siteIdx : 0;
+          // 非 JAR 资源：优先从 static-source KV 获取 index
+          const staticSourceRaw = await storage.get(`static-source:${key}`);
+          if (staticSourceRaw) {
+            try { resourceIndex = JSON.parse(staticSourceRaw).index; } catch { /* ignore */ }
+          }
+          // KV 中也没有时，从 resources 数组的原始位置确定 index
+          if (!staticSourceRaw) {
+            const originalIdx = resources.findIndex(r => r.url === url);
+            if (originalIdx >= 0 && originalIdx < merged.sites.length) {
+              resourceIndex = originalIdx;
+            }
+            // 如果还没找到，保持 resourceIndex = 0 作为最后兜底（但不应发生）
+          }
         }
 
         // 计算临时目录下的目标路径：data/.tmp-sites/{index}/{type}/
