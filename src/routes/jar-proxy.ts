@@ -101,18 +101,31 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     if (sourceDir) {
       const md5Key = isMd5Key(key);
       const cacheFile = findCacheFile(sourceDir, key, md5Key);
-      if (cacheFile && fs.existsSync(cacheFile)) {
-        const stat = fs.statSync(cacheFile);
-        const ttl = md5Key ? 86400_000 : 21600_000;
-        if (Date.now() - stat.mtimeMs < ttl) {
-          const buf = fs.readFileSync(cacheFile);
-          return new Response(buf, {
-            headers: {
-              'Content-Type': 'application/octet-stream',
-              'Cache-Control': `public, max-age=${ttl / 1000}`,
-              'Access-Control-Allow-Origin': '*',
-            },
-          });
+      // CR-02: TOCTOU race — existsSync/statSync/readFileSync span the atomic-swap window.
+      // swapSiteDirectories() renames sites/ aside and tmp/ into place; a sync firing mid-read
+      // causes ENOENT/EACCES that would otherwise propagate as a 500 with stack trace.
+      // Wrap in try/catch and fall through to the download path on race-induced errors.
+      if (cacheFile) {
+        try {
+          if (!fs.existsSync(cacheFile)) {
+            // fall through to download path
+          } else {
+            const stat = fs.statSync(cacheFile);
+            const ttl = md5Key ? 86400_000 : 21600_000;
+            if (Date.now() - stat.mtimeMs < ttl) {
+              const buf = fs.readFileSync(cacheFile);
+              return new Response(buf, {
+                headers: {
+                  'Content-Type': 'application/octet-stream',
+                  'Cache-Control': `public, max-age=${ttl / 1000}`,
+                  'Access-Control-Allow-Origin': '*',
+                },
+              });
+            }
+          }
+        } catch (e) {
+          // File vanished mid-read during atomic swap — fall through to download
+          logger.warn('jar-proxy', `Cache file vanished during read for ${key}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
@@ -169,15 +182,23 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     const filePath = path.join(sourceDir, `${key}-${mapping.name}`);
 
     // 2. 缓存命中：直接读取并返回
-    if (fs.existsSync(filePath)) {
-      const buf = fs.readFileSync(filePath);
-      return new Response(buf, {
-        headers: {
-          'Content-Type': contentType,
-          'Cache-Control': 'public, max-age=86400',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
+    // CR-02: TOCTOU race — existsSync/readFileSync span the atomic-swap window.
+    // Wrap in try/catch and fall through to the on-demand download path on
+    // ENOENT/EACCES induced by swapSiteDirectories mid-read.
+    try {
+      if (fs.existsSync(filePath)) {
+        const buf = fs.readFileSync(filePath);
+        return new Response(buf, {
+          headers: {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+    } catch (e) {
+      logger.warn('jar-proxy', `Cache file vanished during read for static ${key}/${type}: ${e instanceof Error ? e.message : String(e)}`);
+      // fall through to on-demand download path
     }
 
     // 3. 缓存未命中：D-11 远程下载兜底
