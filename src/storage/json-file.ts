@@ -43,6 +43,18 @@ export class JsonFileStorage implements Storage {
     }
   }
 
+  async delete(key: string): Promise<void> {
+    if (!(key in this.data)) return;
+    delete this.data[key];
+    try {
+      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error('storage', `Failed to write JSON file ${this.filePath}: ${msg}`);
+      throw error;
+    }
+  }
+
   async list(prefix: string): Promise<string[]> {
     return Object.keys(this.data).filter((key) => key.startsWith(prefix));
   }

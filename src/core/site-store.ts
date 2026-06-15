@@ -372,7 +372,10 @@ export async function cleanupOrphanedStaticSources(storage: Storage, merged: TVB
         const entry = JSON.parse(raw) as { index?: number };
         if (entry.index !== undefined && !activeIndexes.has(entry.index)) {
           // 这个 KV 条目对应的站点已被删除（黑名单或其他原因），清理它
-          await storage.put(key, '');
+          // Per CR-01: 使用 storage.delete() 而非 put(key, '')
+          // 旧实现 put(key, '') 会留下空字符串值，导致后续 JSON.parse('') 抛错
+          // 被 cleanupZombieFiles 静默吞掉，且 /static/{key}/{type} 路由会 500
+          await storage.delete(key);
           removed++;
         }
       } catch { /* skip unparseable */ }
