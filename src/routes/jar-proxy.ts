@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
-import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource, isUrlSafe } from '../core/jar-proxy';
+import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource } from '../core/jar-proxy';
 import { getSiteResourceDir, safeFileName, ensureSiteDir } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
@@ -55,36 +55,25 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
   const { storage, config } = deps;
 
   async function fetchAndCacheJar(key: string, originalUrl: string): Promise<Buffer | null> {
-    // CR-04: SSRF guard — same as downloadResource in core/jar-proxy.ts
-    if (!isUrlSafe(originalUrl)) {
-      logger.security(`fetchAndCacheJar blocked unsafe URL: ${originalUrl.length > 60 ? originalUrl.substring(0, 60) + '...' : originalUrl}`);
-      return null;
-    }
+    // CR-04 / WR-02: SSRF guard — delegate to downloadResource which already enforces
+    // isUrlSafe() + AbortController timeout + bounded retry. Previously this helper
+    // used a raw fetch() with no signal — a hanging origin would hold the connection
+    // open indefinitely and wedge every concurrent client waiting on the same JAR key
+    // via the downloadLocks map.
+    const buf = await downloadResource(originalUrl, 30_000);
+    if (!buf) return null;
+    // 尝试写入站点目录缓存
     try {
-      const resp = await fetch(originalUrl, {
-        headers: { 'User-Agent': 'okhttp/3.12.0' },
-      });
-      if (!resp.ok) {
-        logger.warn('jar-proxy', `Origin returned ${resp.status} for ${key}`);
-        return null;
+      const sourceDir = await getJarSourceDir(key, storage);
+      if (sourceDir) {
+        const name = safeFileName(originalUrl);
+        fs.writeFileSync(path.join(sourceDir, `${key}-${name}`), buf);
+        logger.debug('jar-proxy', `Cached ${key}-${name} in ${sourceDir} (${(buf.length / 1024).toFixed(1)} KB)`);
       }
-      const buf = Buffer.from(await resp.arrayBuffer());
-      // 尝试写入站点目录缓存
-      try {
-        const sourceDir = await getJarSourceDir(key, storage);
-        if (sourceDir) {
-          const name = safeFileName(originalUrl);
-          fs.writeFileSync(path.join(sourceDir, `${key}-${name}`), buf);
-          logger.debug('jar-proxy', `Cached ${key}-${name} in ${sourceDir} (${(buf.length / 1024).toFixed(1)} KB)`);
-        }
-      } catch (writeErr) {
-        logger.warn('jar-proxy', `Failed to write cache for ${key}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
-      }
-      return buf;
-    } catch (error: unknown) {
-      logger.warn('jar-proxy', `Fetch error for ${key}: ${error instanceof Error ? error.message : error}`);
-      return null;
+    } catch (writeErr) {
+      logger.warn('jar-proxy', `Failed to write cache for ${key}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
     }
+    return buf;
   }
 
   router.get('/jar/:key', async (c) => {
