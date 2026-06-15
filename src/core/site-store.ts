@@ -122,14 +122,15 @@ export function swapSiteDirectories(): void {
     // Now rename tmp into the just-vacated sites/ slot
     try {
       fs.renameSync(tmpDir, sitesDir);
-      // Success — clean up backup asynchronously (don't block sync)
-      setImmediate(() => {
-        try {
-          fs.rmSync(backupDir, { recursive: true, force: true });
-        } catch (e) {
-          logger.warn('site-store', `Background cleanup of .sites-backup failed: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      });
+      // WR-07: 同步清理 backup。swap 已完成，sites/ 已是新内容；backup 是旧 sites/
+      // 的副本。同步清理避免进程在 setImmediate 触发前崩溃留下 .sites-backup/。
+      // 旧实现使用 setImmediate 异步清理，崩溃窗口内会残留 backup 目录（虽然下次
+      // sync 启动时会清理 stale backup，但同步处理更简单且无一致性窗口）。
+      try {
+        fs.rmSync(backupDir, { recursive: true, force: true });
+      } catch (e) {
+        logger.warn('site-store', `Synchronous cleanup of .sites-backup failed (next sync will retry): ${e instanceof Error ? e.message : String(e)}`);
+      }
     } catch (e) {
       // CRITICAL: tmp->sites rename failed. Attempt restore from backup so sites/ exists again.
       logger.error('site-store', `CRITICAL: tmp->sites rename failed; attempting restore from backup: ${e instanceof Error ? e.message : String(e)}`);
