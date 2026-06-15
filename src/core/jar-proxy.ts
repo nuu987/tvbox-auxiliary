@@ -524,8 +524,11 @@ export function isUrlSafe(url: string): boolean {
     if (host.endsWith('.local') || host.endsWith('.internal')) return false;
     // Block RFC1918 + link-local (AWS metadata 169.254.x)
     if (/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)/.test(host)) return false;
-    // IPv6 link-local (fe80::/10) and unique-local (fc00::/7)
-    if (host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return false;
+    // IPv6 link-local (fe80::/10) — WR-05: covers fe80::–febf:: not just fe80::
+    // Per RFC 4291, link-local is the full /10 range; old startsWith('fe80:') missed fe90::–febf::
+    if (/^fe[89ab][0-9a-f]?:/i.test(host)) return false;
+    // IPv6 unique-local (fc00::/7) — covers fc* and fd* prefixes
+    if (host.startsWith('fc') || host.startsWith('fd')) return false;
   }
   return true;
 }
