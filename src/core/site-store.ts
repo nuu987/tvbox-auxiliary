@@ -152,6 +152,25 @@ export function swapSiteDirectories(): void {
 }
 
 /**
+ * 在目录中查找以 `{key}-` 开头的缓存文件（用于 TTL 检查）。
+ * 找不到时返回 null，扫描错误也返回 null（非致命）。
+ *
+ * WR-06: 此前同一份 findCacheFile 实现存在于 src/routes/jar-proxy.ts 和
+ * src/syncer.ts 中，重复定义导致 bug 修复（如 CR-02 的 TOCTOU try/catch）
+ * 必须同步两处。提取到 site-store.ts 作为单一实现，两处调用点共享。
+ */
+export function findCacheFile(dir: string, key: string): string | null {
+  try {
+    const files = fs.readdirSync(dir);
+    const prefix = key + '-';
+    const match = files.find(f => f.startsWith(prefix));
+    return match ? path.join(dir, match) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Cleans files in data/sites/ not referenced by any jar-source or static-source KV key.
  * Builds a whitelist of `{hash}-{name}` file names from KV, then walks site directories
  * and removes any file not in the whitelist. Empty subdirectories are left in place;

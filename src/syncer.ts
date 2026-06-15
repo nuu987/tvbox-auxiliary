@@ -19,7 +19,7 @@ import { loadCredentials } from './core/credential-store';
 import { loadCredentialPolicy } from './core/credential-store';
 import { injectCredentials } from './core/credential-injector';
 import { logger } from './core/logger';
-import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempDir, swapSiteDirectories, cleanupZombieFiles, cleanupOrphanedStaticSources } from './core/site-store';
+import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempDir, swapSiteDirectories, cleanupZombieFiles, cleanupOrphanedStaticSources, findCacheFile } from './core/site-store';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
@@ -879,21 +879,6 @@ function configCounts(config: { sites?: unknown[]; parses?: unknown[]; lives?: u
     parses: config.parses?.length || 0,
     lives: config.lives?.length || 0,
   };
-}
-
-/**
- * 在目录中查找以 `{key}-` 开头的缓存文件（用于 TTL 检查）。
- * 找不到时返回 null，扫描错误也返回 null（非致命）。
- */
-function findCacheFile(dir: string, key: string): string | null {
-  try {
-    const files = fs.readdirSync(dir);
-    const prefix = key + '-';
-    const match = files.find(f => f.startsWith(prefix));
-    return match ? path.join(dir, match) : null;
-  } catch {
-    return null;
-  }
 }
 
 /**

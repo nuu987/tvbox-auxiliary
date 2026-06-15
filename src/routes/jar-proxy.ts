@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource } from '../core/jar-proxy';
-import { getSiteResourceDir, safeFileName, ensureSiteDir } from '../core/site-store';
+import { getSiteResourceDir, safeFileName, ensureSiteDir, findCacheFile } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -36,19 +36,8 @@ async function getJarSourceDir(key: string, storage: Storage): Promise<string | 
   }
 }
 
-/**
- * 在站点目录中查找匹配 key 前缀的缓存文件
- */
-function findCacheFile(dir: string, key: string, isMd5: boolean): string | null {
-  try {
-    const files = fs.readdirSync(dir);
-    const prefix = key + '-';
-    const match = files.find(f => f.startsWith(prefix));
-    return match ? path.join(dir, match) : null;
-  } catch {
-    return null;
-  }
-}
+// WR-06: findCacheFile 已迁移至 src/core/site-store.ts，由 routes 和 syncer 共享。
+// 旧的本地定义带 isMd5 参数但未使用 — 已删除。
 
 export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
   const router = new Hono();
@@ -89,7 +78,7 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     const sourceDir = await getJarSourceDir(key, storage);
     if (sourceDir) {
       const md5Key = isMd5Key(key);
-      const cacheFile = findCacheFile(sourceDir, key, md5Key);
+      const cacheFile = findCacheFile(sourceDir, key);
       // CR-02: TOCTOU race — existsSync/statSync/readFileSync span the atomic-swap window.
       // swapSiteDirectories() renames sites/ aside and tmp/ into place; a sync firing mid-read
       // causes ENOENT/EACCES that would otherwise propagate as a 500 with stack trace.
