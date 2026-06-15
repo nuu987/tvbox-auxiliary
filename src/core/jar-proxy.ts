@@ -536,6 +536,11 @@ export function isUrlSafe(url: string): boolean {
  *
  * Per CR-04: SSRF guard via isUrlSafe runs before fetch — unsafe URLs
  * (private hosts, non-http protocols) return null and log a security event.
+ *
+ * Per CR-04 (timeout/retry): does NOT retry on AbortError (timeout) — slow
+ * origins don't speed up on retry, and the retry just adds wall time without
+ * improving success rate. Also enforces an overall deadline of ~30s so that
+ * many slow resources can't cumulatively stall sync for minutes.
  */
 export async function downloadResource(url: string, timeoutMs: number): Promise<Buffer | null> {
   if (!isUrlSafe(url)) {
@@ -543,9 +548,21 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
     return null;
   }
   const MAX_ATTEMPTS = 3;
+  // 总截止时间：每次下载尝试的 timeoutMs 上限，但累计不超过 30s，避免 50 个慢资源串联阻塞 ~27 分钟
+  const HARD_DEADLINE_MS = 30_000;
+  const deadlineStartedAt = Date.now();
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // 检查总截止时间：剩余预算不足单次 timeoutMs 的 1/2 时放弃后续重试
+    const elapsed = Date.now() - deadlineStartedAt;
+    const remainingBudget = HARD_DEADLINE_MS - elapsed;
+    if (remainingBudget <= Math.min(timeoutMs / 2, 5000) && attempt > 1) {
+      logger.warn('jar-proxy', `Download aborted — exceeded ${HARD_DEADLINE_MS}ms aggregate deadline after ${attempt - 1} attempts: ${url.substring(0, 60)}...`);
+      return null;
+    }
+    // 单次尝试的 timeout 取剩余预算与 timeoutMs 中的较小值，保证不超过总截止
+    const effectiveTimeout = Math.min(timeoutMs, Math.max(remainingBudget, 1000));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
     try {
       const resp = await fetch(url, {
         headers: { 'User-Agent': 'okhttp/3.12.0' },
@@ -561,13 +578,20 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
         return null;
       }
       return Buffer.from(await resp.arrayBuffer());
-    } catch {
+    } catch (e) {
+      // CR-04: 超时（AbortError）不重试 — 慢源在重试时不会变快，重试只会浪费墙时
+      const isAbort = e instanceof Error && (e.name === 'AbortError' || (e instanceof DOMException && e.name === 'AbortError'));
+      if (isAbort) {
+        logger.warn('jar-proxy', `Download timed out after ${effectiveTimeout}ms (no retry): ${url.substring(0, 60)}...`);
+        return null;
+      }
       if (attempt < MAX_ATTEMPTS) {
         const delay = Math.pow(2, attempt - 1) * 1000;
         logger.warn('jar-proxy', `Download attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay}ms: ${url.substring(0, 60)}...`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
+      logger.warn('jar-proxy', `Download failed after ${MAX_ATTEMPTS} attempts: ${url.substring(0, 60)}...`);
       return null;
     } finally {
       clearTimeout(timer);
