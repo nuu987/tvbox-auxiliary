@@ -470,6 +470,11 @@ const auth = initAuth('loginInput', 'loginError', 'loginOverlay', 'mainContent',
   setInterval(loadSourceHealth, 60000);
 });
 
+// CR-03: 60s loadStatus interval fired toast() every cycle on steady-state warnings
+// (syncSuccess===false or syncFailedDownloads>0). Track last-shown signature so
+// the toast only fires when the underlying state changes, not on every poll.
+let lastSyncWarnKey = null;
+
 async function loadStatus() {
   try {
     const res = await fetch('/status-data');
@@ -516,10 +521,21 @@ async function loadStatus() {
     }
 
     // 同步失败或部分失败时弹 toast 通知
+    // CR-03: 仅当告警签名（状态+计数+lastUpdate）变化时才弹 toast，避免每分钟重复
     if (d.syncSuccess === false) {
-      toast("上次同步失败，请检查日志", 'error');
+      const key = 'fail:' + d.lastUpdate;
+      if (key !== lastSyncWarnKey) {
+        toast("上次同步失败，请检查日志", 'error');
+        lastSyncWarnKey = key;
+      }
     } else if (d.syncFailedDownloads > 0) {
-      toast(d.syncFailedDownloads + " 个资源下载失败", 'warn');
+      const key = 'downloads:' + d.syncFailedDownloads + ':' + d.lastUpdate;
+      if (key !== lastSyncWarnKey) {
+        toast(d.syncFailedDownloads + " 个资源下载失败", 'warn');
+        lastSyncWarnKey = key;
+      }
+    } else {
+      lastSyncWarnKey = null;
     }
   } catch (e) {
     $('updateTime').textContent = "获取状态失败";
