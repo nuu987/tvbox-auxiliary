@@ -610,6 +610,12 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
             const originalIdx = resources.findIndex(r => r.url === url);
             if (originalIdx >= 0 && originalIdx < merged.sites.length) {
               resourceIndex = originalIdx;
+            } else if (originalIdx >= merged.sites.length) {
+              // WR-04: originalIdx 超过 sites 数量说明 URL 来自 parses（collectAllSiteResources
+              // 先收集 sites 再收集 parses，parse-sourced index 偏移到 sites.length 之后）。
+              // 旧实现静默写回 sites/01 目录，KV mapping.index=0 误导 cleanupZombieFiles 白名单。
+              // 至少记录 warn 便于运维诊断；写回仍兜底为 site 01 以保持原有行为。
+              logger.warn('sync', `Static resource ${url.substring(0, 60)}... is parse-sourced (originalIdx=${originalIdx}, sites=${merged.sites.length}); falling back to site 01 — disk layout may be misleading`);
             }
             // 如果还没找到，保持 resourceIndex = 0 作为最后兜底（但不应发生）
           }
