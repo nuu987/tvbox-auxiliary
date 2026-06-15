@@ -538,6 +538,10 @@ async function loadStatus() {
       lastSyncWarnKey = null;
     }
   } catch (e) {
+    // WR-09: loadStatus is called every 60s via setInterval — a silently swallowed
+    // error gives operators no signal beyond the displayed "获取状态失败" text.
+    // Log the actual error so the browser console has a diagnostic trail.
+    console.warn('loadStatus failed:', e instanceof Error ? e.message : String(e));
     $('updateTime').textContent = "获取状态失败";
     $('updateTime').className = 'update-time never';
   }
