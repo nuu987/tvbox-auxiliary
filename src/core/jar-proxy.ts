@@ -42,13 +42,17 @@ export function parseSpiderString(spider: string): {
 
 /**
  * 为 URL 生成短 key（无 MD5 时使用）
- * 用 Web Crypto 的 SHA-256 取前 16 位 hex
+ * 用 Web Crypto 的 SHA-256 取前 16 字节 hex（32 字符）
+ *
+ * WR-03: 旧实现截断到 8 字节（16 hex），生日悖论下 ~2^32 个 URL 即有 50% 碰撞概率，
+ * 碰撞会让 /static/{key}/{type} 静默返回错误内容（无 md5 兜底）。
+ * 改为 16 字节（与 md5 长度一致），碰撞概率远低于实际使用量。
  */
 export async function urlToKey(url: string): Promise<string> {
   const data = new TextEncoder().encode(url);
   const hash = await crypto.subtle.digest('SHA-256', data);
   const bytes = new Uint8Array(hash);
-  return Array.from(bytes.slice(0, 8))
+  return Array.from(bytes.slice(0, 16))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 }
