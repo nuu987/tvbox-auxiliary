@@ -91,35 +91,38 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
       });
     }
 
+    // WR-01: 先做 smart-jar/host 校验（与 / 路由顺序一致），避免无谓的 JSON.parse/
+    // stringify 工作。若校验失败返回 403，不会浪费 CPU 周期处理 JSON。
+    const smartRawEarly = await storage.get(SMART_JAR_URL_ENABLED);
+    const smartEnabledEarly = smartRawEarly === 'true';
+    const fallbackEarly = (config.localBaseUrl || '').replace(/\/$/, '');
+    const dmzEnabledEarly = process.env.DMZ === '0';
+    const actualBaseEarly = smartEnabledEarly
+      ? getRequestBaseUrl(c, fallbackEarly, dmzEnabledEarly)
+      : fallbackEarly;
+    if (smartEnabledEarly) {
+      if (!assertHostAllowed(actualBaseEarly, fallbackEarly, c, dmzEnabledEarly)) {
+        logger.securityFields('host-intercept', {
+          method: 'GET',
+          path: '/live-config',
+          result: 'blocked',
+          reason: 'non_lan_host',
+          actualBase: actualBaseEarly,
+          fallbackBase: fallbackEarly,
+          host: c.req.header('Host') || '-',
+          xForwardedHost: c.req.header('X-Forwarded-Host') || '-',
+          dmz: process.env.DMZ ?? '(unset)',
+          smartJarUrl: smartEnabledEarly,
+        });
+        return c.text('Forbidden', 403);
+      }
+    }
+
     try {
       const full = JSON.parse(cached);
       const liveConfig = { lives: full.lives || [] };
       const liveBody = JSON.stringify(liveConfig);
-      const smartRaw = await storage.get(SMART_JAR_URL_ENABLED);
-      const smartEnabled = smartRaw === 'true';
-      const fallback = (config.localBaseUrl || '').replace(/\/$/, '');
-      const dmzEnabled = process.env.DMZ === '0';
-      const actualBase = smartEnabled
-        ? getRequestBaseUrl(c, fallback, dmzEnabled)
-        : fallback;
-      if (smartEnabled) {
-        if (!assertHostAllowed(actualBase, fallback, c, dmzEnabled)) {
-          logger.securityFields('host-intercept', {
-            method: 'GET',
-            path: '/live-config',
-            result: 'blocked',
-            reason: 'non_lan_host',
-            actualBase,
-            fallbackBase: fallback,
-            host: c.req.header('Host') || '-',
-            xForwardedHost: c.req.header('X-Forwarded-Host') || '-',
-            dmz: process.env.DMZ ?? '(unset)',
-            smartJarUrl: smartEnabled,
-          });
-          return c.text('Forbidden', 403);
-        }
-      }
-      return c.body(applyBaseUrlPlaceholder(liveBody, actualBase, fallback), 200, {
+      return c.body(applyBaseUrlPlaceholder(liveBody, actualBaseEarly, fallbackEarly), 200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'public, max-age=1800',
         'Access-Control-Allow-Origin': '*',
