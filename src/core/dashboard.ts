@@ -586,6 +586,8 @@ const STATUS_LABELS = {
   parse_error:'PARSE ERR', timeout:'TIMEOUT', network_error:'NET ERR'
 };
 
+const FAIL_STATUSES = new Set(['parse_error', 'timeout', 'network_error', 'http_error', 'decode_error']);
+
 async function loadSearchQuotaSummary() {
   try {
     const res = await fetch('/search-quota/summary');
@@ -618,7 +620,7 @@ async function loadSourceHealth() {
 
     let ok = 0, warn = 0, err = 0;
     records.forEach(r => {
-      if (r.latestStatus === 'parse_error' || r.consecutiveFailures >= 5) err++;
+      if (FAIL_STATUSES.has(r.latestStatus) || r.consecutiveFailures >= 5) err++;
       else if (r.consecutiveFailures >= 3) warn++;
       else ok++;
     });
@@ -637,7 +639,8 @@ async function loadSourceHealth() {
       toggle.classList.add('open');
       body.classList.add('open');
     }
-  } catch {
+  } catch (e) {
+    console.warn('loadSourceHealth failed:', e instanceof Error ? e.message : String(e));
     $('healthTableBody').innerHTML =
       '<tr><td colspan="6" class="empty">' + "获取状态失败" + '</td></tr>';
   }
@@ -651,7 +654,7 @@ function renderHealthTable(records) {
   }
 
   $('healthTableBody').innerHTML = records.map(r => {
-    const level = r.latestStatus === 'parse_error' ? 'error'
+    const level = FAIL_STATUSES.has(r.latestStatus) ? 'error'
                : r.consecutiveFailures >= 5 ? 'error'
                : r.consecutiveFailures >= 3 ? 'warn' : 'ok';
     const statusLabel = STATUS_LABELS[r.latestStatus] || r.latestStatus;
