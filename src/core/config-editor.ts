@@ -1254,6 +1254,7 @@ applyTheme(getTheme());
 // D-15: dirty 状态仅内存，刷新后丢失
 let _dirty = false;
 let _syncing = true; // default true; cleared by first /status-data response. Prevents mutation window on page load.
+let _lastSyncRunning = false; // tracks state transitions for post-sync data refresh
 let _syncPollTimer = null;
 
 // 14-08: Custom in-page leave guard (replaces unstyled beforeunload dialog for in-app navigation)
@@ -1354,7 +1355,21 @@ async function pollSyncStatus() {
     const res = await auth.authFetch('/status-data');
     if (!res.ok) return;
     const j = await res.json();
-    applySyncingState(!!j.syncRunning);
+    const syncRunning = !!j.syncRunning;
+
+    // 同步刚完成 → 刷新站点数据（errSource 等实时状态）
+    if (_lastSyncRunning && !syncRunning) {
+      const reloadRes = await auth.authFetch('/admin/config-data');
+      if (reloadRes.ok) {
+        DATA = await reloadRes.json();
+        renderSites();
+        renderParses();
+        renderLives();
+        updateStats();
+      }
+    }
+    _lastSyncRunning = syncRunning;
+    applySyncingState(syncRunning);
     // If server says no dirty marker but client thinks it's dirty,
     // aggregation already ran and cleared it — sync client state
     if (!j.dirtyMarker && _dirty) {
