@@ -85,8 +85,9 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     const healthRecords: SourceHealthRecord[] = healthRaw ? JSON.parse(healthRaw) : [];
     const erroredSourceNames = new Set<string>();
     const erroredSourceReasons = new Map<string, string>();
+    const FAIL_STATUSES = new Set(['parse_error', 'timeout', 'network_error', 'http_error', 'decode_error']);
     for (const record of healthRecords) {
-      if (record.latestStatus === 'parse_error' && record.lastFailReason) {
+      if (FAIL_STATUSES.has(record.latestStatus) && record.lastFailReason && record.name) {
         erroredSourceNames.add(record.name);
         erroredSourceReasons.set(record.name, record.lastFailReason);
       }
@@ -106,7 +107,7 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     }
 
     const validationErrors = healthRecords
-      .filter(r => r.latestStatus === 'parse_error' && r.lastFailReason)
+      .filter(r => FAIL_STATUSES.has(r.latestStatus) && r.lastFailReason && r.name)
       .map(r => ({ url: r.url, name: r.name, reason: r.lastFailReason }));
 
     return c.json({ sites, parses, lives, regexRules: blacklist.regexRules, liveDisabled, validationErrors });
