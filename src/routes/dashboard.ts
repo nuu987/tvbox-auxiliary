@@ -3,9 +3,10 @@
 import { Hono } from 'hono';
 import { LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, MERGED_CONFIG, SOURCE_HEALTH, SYNC_STATUS } from '../core/config';
 import { getDirtyMarker } from '../core/dirty-marker';
+import { classifyStatus, STATUS_LABELS } from '../core/status-classifier';
 import type { RuntimeState } from './admin-auth';
 import type { Storage } from '../storage/interface';
-import type { AppConfig } from '../core/types';
+import type { AppConfig, SourceFetchStatus, SourceHealthRecord } from '../core/types';
 
 export interface DashboardRouteDeps {
   storage: Storage;
@@ -88,8 +89,47 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
   // ─── 源健康状态（无认证，Dashboard 需要访问）─────────────
   router.get('/source-status', async (c) => {
     const raw = await storage.get(SOURCE_HEALTH);
-    const records = raw ? JSON.parse(raw) : [];
-    return c.json(records);
+    // unknown[] because the KV may contain old-format records (latestStatus, no status)
+    const records: unknown[] = raw ? JSON.parse(raw) : [];
+
+    // Migrate old-format records (has latestStatus but no status).
+    // (r as any) supports old-format KV records that have latestStatus instead of fetchStatus —
+    // removed once all records migrated (post-deploy) per PATTERNS.md line 469.
+    const normalized: SourceHealthRecord[] = records.map((r: any) => {
+      if ('latestStatus' in r && !('status' in r)) {
+        const rawStatus = r.latestStatus as SourceFetchStatus;
+        const failures = (r.consecutiveFailures as number) || 0;
+        // Map old coarse types to valid granular types
+        const fetchStatus: SourceFetchStatus = rawStatus === 'http_error' ? 'http_4xx'
+          : rawStatus === 'network_error' ? 'fetch_failed'
+          : rawStatus;
+        return {
+          ...r,
+          status: classifyStatus(fetchStatus, failures),
+          fetchStatus,
+        };
+      }
+      return r as SourceHealthRecord;
+    });
+
+    // Compute summary
+    let ok = 0, warn = 0, err = 0;
+    for (const r of normalized) {
+      if (r.status === 'OK') ok++;
+      else if (r.status === 'WARN') warn++;
+      else err++;
+    }
+
+    // Add computed label field per record
+    const withLabels = normalized.map(r => ({
+      ...r,
+      label: STATUS_LABELS[r.fetchStatus] || 'ERR',
+    }));
+
+    return c.json({
+      records: withLabels,
+      summary: { ok, warn, err },
+    });
   });
 
   return router;

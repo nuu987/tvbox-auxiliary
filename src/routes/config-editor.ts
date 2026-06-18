@@ -87,7 +87,8 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     const erroredSourceNames = new Set<string>();
     const erroredSourceReasons = new Map<string, string>();
     // Plan 03.1 D-05: 使用 classifyStatus 替代本地 FAIL_STATUSES
-    // 兼容旧格式 KV 记录：`(r as any).fetchStatus || (r as any).latestStatus`（PATTERNS.md line 469）
+    // (record as any) supports old-format KV records that have latestStatus instead of fetchStatus —
+    // removed once all records migrated (post-deploy) per PATTERNS.md line 469.
     for (const record of healthRecords) {
       const r = record as unknown as Record<string, unknown>;
       const rawStatus = (r.fetchStatus || r.latestStatus) as SourceHealthRecord['fetchStatus'] | undefined;
@@ -113,6 +114,8 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
 
     const validationErrors = healthRecords
       .filter(r => {
+        // (r as any) supports old-format KV records that have latestStatus instead of fetchStatus —
+        // removed once all records migrated (post-deploy) per PATTERNS.md line 469.
         const rr = r as unknown as Record<string, unknown>;
         const rawStatus = (rr.fetchStatus || rr.latestStatus) as SourceHealthRecord['fetchStatus'] | undefined;
         return rawStatus && classifyStatus(rawStatus, r.consecutiveFailures) === 'ERR' && r.lastFailReason && r.name;
