@@ -1,10 +1,10 @@
 // JAR 代理：文件系统缓存 + 并发下载锁
 
-import { Hono } from 'hono';
+import { Hono, Context } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 import { lookupJarUrl, isMd5Key, getResourceUrlType, downloadResource } from '../core/jar-proxy';
-import { getSiteResourceDir, safeFileName, ensureSiteDir, findCacheFile } from '../core/site-store';
+import { getSiteResourceDir, ensureSiteDir, findCacheFile } from '../core/site-store';
 import { logger } from '../core/logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -55,9 +55,9 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     try {
       const sourceDir = await getJarSourceDir(key, storage);
       if (sourceDir) {
-        const name = safeFileName(originalUrl);
-        fs.writeFileSync(path.join(sourceDir, `${key}-${name}`), buf);
-        logger.debug('jar-proxy', `Cached ${key}-${name} in ${sourceDir} (${(buf.length / 1024).toFixed(1)} KB)`);
+        // F-01: 使用 {key}.jar 命名，不再依赖 safeName
+        fs.writeFileSync(path.join(sourceDir, `${key}.jar`), buf);
+        logger.debug('jar-proxy', `Cached ${key}.jar in ${sourceDir} (${(buf.length / 1024).toFixed(1)} KB)`);
       }
     } catch (writeErr) {
       logger.warn('jar-proxy', `Failed to write cache for ${key}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
@@ -75,10 +75,12 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     }
 
     // 2. 查文件缓存（站点目录）
+    // F-01: 先查新命名格式 {key}.jar，再查旧格式 {key}-{name}（向后兼容）
     const sourceDir = await getJarSourceDir(key, storage);
     if (sourceDir) {
       const md5Key = isMd5Key(key);
-      const cacheFile = findCacheFile(sourceDir, key);
+      const newPath = path.join(sourceDir, `${key}.jar`);
+      const cacheFile = fs.existsSync(newPath) ? newPath : findCacheFile(sourceDir, key);
       // CR-02: TOCTOU race — existsSync/statSync/readFileSync span the atomic-swap window.
       // swapSiteDirectories() renames sites/ aside and tmp/ into place; a sync firing mid-read
       // causes ENOENT/EACCES that would otherwise propagate as a 500 with stack trace.
@@ -129,11 +131,30 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     return c.json({ error: 'JAR unavailable from origin' }, 502);
   });
 
-  // GET /static/:key/:type — 静态资源代理（非 JAR：JS/PY/JSON/TXT 等）
-  // 缓存命中直接返回；缓存未命中时通过 KV 中的 url 字段从远程下载兜底（D-11）
+  // 保留 /static/:key/:type 向后兼容（308 永久重定向到 /:type/:key.:type）
+  // 注册优先级：/static/ 有字面量前缀 > /:type/ 通用参数
   router.get('/static/:key/:type', async (c) => {
     const key = c.req.param('key');
     const type = c.req.param('type');
+    return c.redirect(`/${type}/${key}.${type}`, 308);
+  });
+
+  // GET /:type/:key — 静态资源代理（非 JAR：JS/PY/JSON/TXT 等）
+  // 缓存命中直接返回；缓存未命中时通过 KV 中的 url 字段从远程下载兜底（D-11）
+  // URL 格式：/{type}/{key}.{type}（F-01：带上扩展名便于 TVBox 识别文件类型）
+  // 兼容旧格式：/{type}/{key}（不带扩展名，key 不变）
+  router.get('/:type/:key', async (c) => {
+    const type = c.req.param('type');
+    let key = c.req.param('key');
+    // F-01: 去掉 key 末尾的 .{type} 后缀（新 URL 格式 /type/key.type 中的扩展名部分）
+    const dotSuffix = `.${type}`;
+    if (key.endsWith(dotSuffix)) {
+      key = key.slice(0, -dotSuffix.length);
+    }
+    return handleStaticRequest(c, type, key);
+  });
+
+  async function handleStaticRequest(c: Context, type: string, key: string) {
 
     // CR-02: validate :type against whitelist before any path operation to prevent traversal
     if (!ALLOWED_STATIC_TYPES.has(type)) {
@@ -157,7 +178,10 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
     const contentType = getStaticContentType(type);
 
     const sourceDir = getSiteResourceDir(mapping.index, type);
-    const filePath = path.join(sourceDir, `${key}-${mapping.name}`);
+    // F-01: 优先查找 {key}.{type} 新格式，未命中则回退到 {key}-{name} 旧格式
+    const newPath = path.join(sourceDir, `${key}.${type}`);
+    const oldPath = path.join(sourceDir, `${key}-${mapping.name}`);
+    const filePath = fs.existsSync(newPath) ? newPath : oldPath;
 
     // 2. 缓存命中：直接读取并返回
     // CR-02: TOCTOU race — existsSync/readFileSync span the atomic-swap window.
@@ -211,7 +235,7 @@ export function createJarProxyRouter(deps: JarProxyRouteDeps): Hono {
         'Access-Control-Allow-Origin': '*',
       },
     });
-  });
+  }
 
   return router;
 }

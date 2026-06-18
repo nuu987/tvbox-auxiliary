@@ -41,7 +41,9 @@ export function getSiteResourceDir(index: number, type: string): string {
 export function safeFileName(url: string): string {
   const segments = url.split('/').filter(Boolean);
   const last = segments[segments.length - 1] || '';
-  const filtered = last.replace(/[^a-zA-Z0-9_.-]/g, '');
+  let filtered = last.replace(/[^a-zA-Z0-9_.-]/g, '');
+  // 只去掉末尾短横和点号，保留前导点号（F-01：前导点号作为命名描述的一部分是合理的）
+  filtered = filtered.replace(/[-.]+$/, '');
   return filtered || 'resource';
 }
 
@@ -49,7 +51,9 @@ export function safeFileName(url: string): string {
  * 生成资源文件名：{hash}-{originalName}
  */
 export function getResourceFileName(hash: string, originalName: string): string {
-  const safe = originalName.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  let safe = originalName.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  // 对齐 safeFileName 清理规则（F-01）：去掉前导点号 + 末尾特殊符号
+  safe = safe.replace(/^\.+/, '').replace(/[-.]+$/, '');
   return `${hash}-${safe}`;
 }
 
@@ -187,31 +191,23 @@ export async function cleanupZombieFiles(storage: Storage): Promise<void> {
 
     const whitelist = new Set<string>();
 
+    // jar-source → {hash}.jar（F-01：统一使用 {hash}.{type} 命名）
     const jarKeys = await storage.list('jar-source:');
     for (const key of jarKeys) {
-      const raw = await storage.get(key);
-      if (!raw) continue;
-      try {
-        const entry = JSON.parse(raw) as { name?: string };
-        if (entry.name) {
-          const hash = key.substring('jar-source:'.length);
-          whitelist.add(`${hash}-${entry.name}`);
-        }
-      } catch {
-        // Skip unparseable entries — defensive JSON parsing per project convention
-      }
+      const hash = key.substring('jar-source:'.length);
+      whitelist.add(`${hash}.jar`);
     }
 
+    // static-source → {hash}.{type}（F-01：从 KV type 字段获取扩展名）
     const staticKeys = await storage.list('static-source:');
     for (const key of staticKeys) {
       const raw = await storage.get(key);
       if (!raw) continue;
       try {
-        const entry = JSON.parse(raw) as { name?: string };
-        if (entry.name) {
-          const hash = key.substring('static-source:'.length);
-          whitelist.add(`${hash}-${entry.name}`);
-        }
+        const entry = JSON.parse(raw) as { type?: string };
+        const hash = key.substring('static-source:'.length);
+        const ext = entry.type || 'js';
+        whitelist.add(`${hash}.${ext}`);
       } catch {
         // Skip unparseable entries
       }

@@ -629,7 +629,14 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
         // D-07: TTL 检查 live 目录中是否已有有效缓存文件
         // MD5 key → 24h，URL hash key → 6h
         const liveDir = getSiteResourceDir(resourceIndex, type);
-        const liveFilePath = findCacheFile(liveDir, key);
+        // F-01: 先查新命名格式 {key}.{type}，再查旧格式 {key}-{name}（向后兼容）
+        let liveFilePath: string | null = null;
+        const newFilePath = path.join(liveDir, `${key}.${type}`);
+        if (fs.existsSync(newFilePath)) {
+          liveFilePath = newFilePath;
+        } else {
+          liveFilePath = findCacheFile(liveDir, key);
+        }
         const md5Key = isMd5Key(key);
         const ttlMs = md5Key ? 86_400_000 : 21_600_000;
 
@@ -698,7 +705,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   // Step 7.1.5: 改写非 JAR 静态资源 URL 为本地代理地址
   // 对 site.api/site.ext/parse.url/parse.ext 中的 JS/PY/JSON/TXT URL
-  // 改写为 {baseUrl}/static/{key}/{type}，并写入 static-source KV 映射
+  // 改写为 {baseUrl}/{type}/{key}.{type}，并写入 static-source KV 映射（F-01：带上扩展名）
   logger.info('sync', 'Step 7.1.5: Rewriting non-JAR resource URLs...');
   merged = await rewriteNonJarUrls(merged, BASE_URL_PLACEHOLDER, storage);
 

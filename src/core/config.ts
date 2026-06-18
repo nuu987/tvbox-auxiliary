@@ -3,7 +3,7 @@ import type { SyncSchedule } from './types';
 // 默认阈值
 export const DEFAULT_SPEED_TIMEOUT_MS = 5000; // 配置 URL 超时（fetch 耗时筛选）
 export const DEFAULT_SITE_TIMEOUT_MS = 3000;  // 站点 API 超时
-export const DEFAULT_FETCH_TIMEOUT_MS = 5000; // fetch 配置 JSON 超时
+export const DEFAULT_FETCH_TIMEOUT_MS = 30000; // fetch 配置 JSON 超时（30s，部分源响应较慢）
 
 // Storage keys
 export const MERGED_CONFIG = 'merged_config';

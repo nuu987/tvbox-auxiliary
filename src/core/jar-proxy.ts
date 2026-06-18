@@ -311,7 +311,7 @@ function extractExtUrls(
  * 改写非 JAR 静态资源 URL 为本地代理地址
  *
  * 遍历 config.sites 中的 site.api/site.ext 以及 config.parses 中的 parse.url/parse.ext，
- * 将 JS/PY/JSON/TXT URL 改写为 {baseUrl}/static/{key}/{type} 格式，
+ * 将 JS/PY/JSON/TXT URL 改写为 {baseUrl}/{type}/{key}.{type} 格式，
  * 同时写入 static-source:{key} KV 映射。
  *
  * JAR URL 不在此函数中处理（已在 rewriteJarUrls 处理）。
@@ -343,7 +343,7 @@ export async function rewriteNonJarUrls(
             type: apiType,
             url: site.api,
           }));
-          result.sites[i] = { ...site, api: `${cleanBaseUrl}/static/${key}/${apiType}` };
+          result.sites[i] = { ...site, api: `${cleanBaseUrl}/${apiType}/${key}.${apiType}` };
           rewriteCount++;
           logger.info('jar-proxy', `Rewrote site.api ${key} → ${apiType} (site ${i + 1})`);
         }
@@ -379,7 +379,7 @@ export async function rewriteNonJarUrls(
             type: urlType,
             url: parse.url,
           }));
-          result.parses[i] = { ...parse, url: `${cleanBaseUrl}/static/${key}/${urlType}` };
+          result.parses[i] = { ...parse, url: `${cleanBaseUrl}/${urlType}/${key}.${urlType}` };
           rewriteCount++;
           logger.info('jar-proxy', `Rewrote parse.url ${key} → ${urlType} (parse ${i + 1})`);
         }
@@ -432,7 +432,7 @@ async function rewriteExtFieldAsync(
         type,
         url: part,
       }));
-      parts[j] = `${baseUrl}/static/${key}/${type}`;
+      parts[j] = `${baseUrl}/${type}/${key}.${type}`;
       didRewrite = true;
     }
 
@@ -456,7 +456,7 @@ async function rewriteExtFieldAsync(
             type,
             url: val,
           }));
-          newObj[k] = `${baseUrl}/static/${key}/${type}`;
+          newObj[k] = `${baseUrl}/${type}/${key}.${type}`;
           didRewrite = true;
           continue;
         }
@@ -609,7 +609,7 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
 
 /**
  * Writes cached resource data to the site directory and creates static-source KV mapping.
- * File name format: {key}-{safeFileName(url)}.
+ * File name format: {key}.{type} (F-01).
  * Per D-11, the original URL is stored in the KV mapping so that /static/:key/:type
  * can re-download from origin on cache miss.
  */
@@ -624,7 +624,8 @@ export async function writeResourceCache(
 ): Promise<void> {
   const safeIndex = Number.isFinite(index) && index >= 0 ? index : 0;
   const safeName = safeFileName(url);
-  const fileName = `${key}-${safeName}`;
+  // F-01: 使用 {key}.{type} 命名，不再依赖 safeName 和分隔符 "-"
+  const fileName = `${key}.${type}`;
   const filePath = sourceDir.endsWith('/') || sourceDir.endsWith('\\')
     ? sourceDir + fileName
     : sourceDir + '/' + fileName;
