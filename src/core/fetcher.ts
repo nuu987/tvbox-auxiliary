@@ -234,10 +234,15 @@ function classifyHttpError(status: number): SourceFetchStatus {
 }
 
 // classifyNetworkError 按 Node.js error.cause.code 映射到 dns_error/conn_refused/...，兜底 fetch_failed
-function classifyNetworkError(error: unknown): SourceFetchStatus {
+export function classifyNetworkError(error: unknown): SourceFetchStatus {
+  // AbortController.abort() 抛出 AbortError —— 分类为 timeout (WARN) 而非 fetch_failed (ERR)
+  // 修复 VERIFICATION.md Truth #7 / REVIEW.md CR-02：proxy 路径此前缺此守卫
+  // 直接 fetch 路径 (fetchWithUA:468) 有内联 msg.includes('abort') 守卫，proxy 路径此前无等价保护
+  if (error instanceof Error && error.name === 'AbortError') return 'timeout';
   const cause = (error as { cause?: { code?: string } })?.cause;
   const code = cause?.code || '';
   switch (code) {
+    case 'ABORT_ERR':     return 'timeout';
     case 'ENOTFOUND':     return 'dns_error';
     case 'ECONNREFUSED':  return 'conn_refused';
     case 'ECONNRESET':    return 'conn_reset';
@@ -252,13 +257,17 @@ function classifyNetworkError(error: unknown): SourceFetchStatus {
 }
 
 // classifyNetworkErrorMessage 生成 D-09 中文标签的细分错误详情（含 hostname/port）
-function classifyNetworkErrorMessage(error: unknown): string {
+export function classifyNetworkErrorMessage(error: unknown): string {
+  // AbortError 优先处理 —— 返回中文标签，避免 default 分支返回英文 'The operation was aborted'
+  // 修复 REVIEW.md IN-05：proxy 超时消息此前为英文，违反 CLAUDE.md 中文-only UI 约束
+  if (error instanceof Error && error.name === 'AbortError') return '请求超时';
   const cause = (error as { cause?: { code?: string; hostname?: string; host?: string; port?: number | string } })?.cause;
   const code = cause?.code || '';
   const hostname = cause?.hostname || (error instanceof Error && (error as { hostname?: string }).hostname) || 'unknown host';
   const host = cause?.host || hostname;
   const port = cause?.port;
   switch (code) {
+    case 'ABORT_ERR':     return '请求超时';
     case 'ENOTFOUND':     return `DNS 解析失败: ${hostname}`;
     case 'ECONNREFUSED':  return port ? `连接被拒绝: ${host}:${port}` : `连接被拒绝: ${hostname}`;
     case 'ECONNRESET':    return '连接被重置';
