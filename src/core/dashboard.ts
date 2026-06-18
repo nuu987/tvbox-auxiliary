@@ -609,10 +609,8 @@ function escDash(s) { const d = document.createElement('div'); d.textContent = s
 async function loadSourceHealth() {
   try {
     const res = await fetch('/source-status');
-    const data = await res.json();
     // Plan 03.1 D-11: 后端返回 { records, summary }，前端不再自行分类
-    const records = data.records || data;
-    const summary = data.summary || { ok: 0, warn: 0, err: 0 };
+    const { records, summary } = await res.json();
 
     $('healthOk').textContent = summary.ok;
     $('healthWarn').textContent = summary.warn;
