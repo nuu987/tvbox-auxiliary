@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { adminAuthMiddleware } from './admin-auth';
 import { siteFingerprint, loadBlacklist } from '../core/blacklist';
 import { applyBaseUrlPlaceholder } from '../core/base-url';
+import { classifyStatus } from '../core/status-classifier';
 import { MERGED_CONFIG_FULL, MERGED_CONFIG, LIVE_DISABLED, SOURCE_HEALTH } from '../core/config';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceHealthRecord, TVBoxConfig } from '../core/types';
@@ -85,9 +86,13 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     const healthRecords: SourceHealthRecord[] = healthRaw ? JSON.parse(healthRaw) : [];
     const erroredSourceNames = new Set<string>();
     const erroredSourceReasons = new Map<string, string>();
-    const FAIL_STATUSES = new Set(['parse_error', 'timeout', 'network_error', 'http_error', 'decode_error']);
+    // Plan 03.1 D-05: 使用 classifyStatus 替代本地 FAIL_STATUSES
+    // 兼容旧格式 KV 记录：`(r as any).fetchStatus || (r as any).latestStatus`（PATTERNS.md line 469）
     for (const record of healthRecords) {
-      if (FAIL_STATUSES.has(record.latestStatus) && record.lastFailReason && record.name) {
+      const r = record as unknown as Record<string, unknown>;
+      const rawStatus = (r.fetchStatus || r.latestStatus) as SourceHealthRecord['fetchStatus'] | undefined;
+      if (!rawStatus) continue;
+      if (classifyStatus(rawStatus, record.consecutiveFailures) === 'ERR' && record.lastFailReason && record.name) {
         erroredSourceNames.add(record.name);
         erroredSourceReasons.set(record.name, record.lastFailReason);
       }
@@ -107,7 +112,11 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     }
 
     const validationErrors = healthRecords
-      .filter(r => FAIL_STATUSES.has(r.latestStatus) && r.lastFailReason && r.name)
+      .filter(r => {
+        const rr = r as unknown as Record<string, unknown>;
+        const rawStatus = (rr.fetchStatus || rr.latestStatus) as SourceHealthRecord['fetchStatus'] | undefined;
+        return rawStatus && classifyStatus(rawStatus, r.consecutiveFailures) === 'ERR' && r.lastFailReason && r.name;
+      })
       .map(r => ({ url: r.url, name: r.name, reason: r.lastFailReason }));
 
     return c.json({ sites, parses, lives, regexRules: blacklist.regexRules, liveDisabled, validationErrors });

@@ -3,6 +3,7 @@
 import type { Storage } from './storage/interface';
 import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFetchResult, SourceHealthRecord } from './core/types';
 import { fetchConfigs } from './core/fetcher';
+import { classifyStatus } from './core/status-classifier';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
@@ -819,7 +820,21 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
 
   // 读取历史健康记录
   const raw = await storage.get(SOURCE_HEALTH);
-  const oldRecords: SourceHealthRecord[] = raw ? JSON.parse(raw) : [];
+  // Plan 03.1 D-10: 兼容旧格式 KV 记录（latestStatus → fetchStatus），同一同步周期内规整为新格式
+  const oldRecords: SourceHealthRecord[] = raw ? (JSON.parse(raw) as Array<Record<string, unknown>>).map(r => {
+    if ('latestStatus' in r && !('fetchStatus' in r)) {
+      const legacy = r.latestStatus as SourceHealthRecord['fetchStatus'];
+      const failures = (r.consecutiveFailures as number) || 0;
+      const { latestStatus: _omit, ...rest } = r;
+      void _omit;
+      return {
+        ...rest,
+        fetchStatus: legacy,
+        status: classifyStatus(legacy, failures),
+      } as SourceHealthRecord;
+    }
+    return r as unknown as SourceHealthRecord;
+  }) : [];
   const oldMap = new Map(oldRecords.map(r => [r.url, r]));
 
   // 本次参与 fetch 的 URL 集合
@@ -835,7 +850,8 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
       newRecords.push({
         url: fr.url,
         name: fr.name,
-        latestStatus: 'ok',
+        status: classifyStatus(fr.status, 0),
+        fetchStatus: fr.status,
         consecutiveFailures: 0,
         lastSuccessTime: now,
         lastFailTime: old?.lastFailTime,
@@ -843,11 +859,13 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
         lastSpeedMs: fr.speedMs,
       });
     } else {
+      const newFailCount = (old?.consecutiveFailures ?? 0) + 1;
       newRecords.push({
         url: fr.url,
         name: fr.name,
-        latestStatus: fr.status,
-        consecutiveFailures: (old?.consecutiveFailures ?? 0) + 1,
+        status: classifyStatus(fr.status, newFailCount),
+        fetchStatus: fr.status,
+        consecutiveFailures: newFailCount,
         lastSuccessTime: old?.lastSuccessTime,
         lastFailTime: now,
         lastFailReason: fr.errorMessage,
