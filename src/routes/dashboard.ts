@@ -103,8 +103,10 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
         const fetchStatus: SourceFetchStatus = rawStatus === 'http_error' ? 'http_4xx'
           : rawStatus === 'network_error' ? 'fetch_failed'
           : rawStatus;
+        // Strip legacy latestStatus field so the response carries only the new schema
+        const { latestStatus: _omit, ...rest } = r;
         return {
-          ...r,
+          ...rest,
           status: classifyStatus(fetchStatus, failures),
           fetchStatus,
         };
