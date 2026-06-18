@@ -137,7 +137,34 @@ export interface ParseValidationResult {
 }
 
 // 单次 fetch 结果（内部传递，不持久化）
-export type SourceFetchStatus = 'ok' | 'http_error' | 'decode_error' | 'parse_error' | 'timeout' | 'network_error';
+// D-08: 扩展为 21 个变体 — 4 个保留 + 8 个 HTTP 细分 + 7 个网络错误细分 + 2 个 legacy
+// Legacy 变体 'http_error' / 'network_error' 在 Plan 02 fetcher.ts 迁移后移除（delayed-deletion）
+export type SourceFetchStatus =
+  | 'ok'
+  | 'timeout'
+  | 'decode_error'
+  | 'parse_error'
+  // HTTP 错误细分（按具体状态码 + 兜底）
+  | 'http_403'
+  | 'http_404'
+  | 'http_429'
+  | 'http_502'
+  | 'http_503'
+  | 'http_504'
+  | 'http_4xx'
+  | 'http_5xx'
+  // 网络错误细分（按 Node.js error.cause.code 映射）
+  | 'dns_error'
+  | 'conn_refused'
+  | 'conn_reset'
+  | 'tls_error'
+  | 'host_unreachable'
+  | 'net_unreachable'
+  | 'fetch_failed'
+  // legacy — removed in Plan 02 after fetcher.ts migration
+  | 'http_error'
+  // legacy — removed in Plan 02 after fetcher.ts migration
+  | 'network_error';
 
 export interface SourceFetchResult {
   url: string;
@@ -149,10 +176,12 @@ export interface SourceFetchResult {
 }
 
 // 持久化的源健康记录
+// D-10: latestStatus 替换为 status (OK/WARN/ERR 分类级别) + fetchStatus (原始细分状态)
 export interface SourceHealthRecord {
   url: string;
   name: string;
-  latestStatus: SourceFetchStatus;
+  status: 'OK' | 'WARN' | 'ERR';
+  fetchStatus: SourceFetchStatus;
   consecutiveFailures: number;
   lastSuccessTime?: string;
   lastFailTime?: string;

@@ -581,13 +581,6 @@ function fallbackCopy(text) {
   return ok;
 }
 
-const STATUS_LABELS = {
-  ok:'OK', http_error:'HTTP ERR', decode_error:'DECODE ERR',
-  parse_error:'PARSE ERR', timeout:'TIMEOUT', network_error:'NET ERR'
-};
-
-const FAIL_STATUSES = new Set(['parse_error', 'timeout', 'network_error', 'http_error', 'decode_error']);
-
 async function loadSearchQuotaSummary() {
   try {
     const res = await fetch('/search-quota/summary');
@@ -616,18 +609,14 @@ function escDash(s) { const d = document.createElement('div'); d.textContent = s
 async function loadSourceHealth() {
   try {
     const res = await fetch('/source-status');
-    const records = await res.json();
+    const data = await res.json();
+    // Plan 03.1 D-11: 后端返回 { records, summary }，前端不再自行分类
+    const records = data.records || data;
+    const summary = data.summary || { ok: 0, warn: 0, err: 0 };
 
-    let ok = 0, warn = 0, err = 0;
-    records.forEach(r => {
-      if (FAIL_STATUSES.has(r.latestStatus) || r.consecutiveFailures >= 5) err++;
-      else if (r.consecutiveFailures >= 3) warn++;
-      else ok++;
-    });
-
-    $('healthOk').textContent = ok;
-    $('healthWarn').textContent = warn;
-    $('healthError').textContent = err;
+    $('healthOk').textContent = summary.ok;
+    $('healthWarn').textContent = summary.warn;
+    $('healthError').textContent = summary.err;
 
     records.sort((a, b) => b.consecutiveFailures - a.consecutiveFailures);
     renderHealthTable(records);
@@ -635,7 +624,7 @@ async function loadSourceHealth() {
     // 智能折叠：有 error 级别时自动展开
     const toggle = $('healthToggle');
     const body = $('healthBody');
-    if (err > 0 && !toggle.classList.contains('open')) {
+    if (summary.err > 0 && !toggle.classList.contains('open')) {
       toggle.classList.add('open');
       body.classList.add('open');
     }
@@ -654,10 +643,13 @@ function renderHealthTable(records) {
   }
 
   $('healthTableBody').innerHTML = records.map(r => {
-    const level = FAIL_STATUSES.has(r.latestStatus) ? 'error'
-               : r.consecutiveFailures >= 5 ? 'error'
-               : r.consecutiveFailures >= 3 ? 'warn' : 'ok';
-    const statusLabel = STATUS_LABELS[r.latestStatus] || r.latestStatus;
+    // Plan 03.1 D-10: 后端已分类，前端直接使用 r.status
+    const level = r.status === 'ERR' ? 'error'
+               : r.status === 'WARN' ? 'warn' : 'ok';
+    // Plan 03.1 D-12: 标签单元格悬浮显示具体错误（lastFailReason）
+    // 标签优先使用后端返回的 label，否则按 fetchStatus 映射
+    const statusLabel = r.label
+      || (r.status === 'OK' ? 'OK' : (r.fetchStatus ? labelFor(r.fetchStatus) : r.status || 'ERR'));
 
     const lastOk = r.lastSuccessTime
       ? new Date(r.lastSuccessTime).toLocaleString('zh-CN', {
@@ -669,11 +661,27 @@ function renderHealthTable(records) {
       '<td><span class="health-dot ' + level + '"></span></td>' +
       '<td>' + esc(r.name || 'Unnamed') + '</td>' +
       '<td class="url-cell" title="' + esc(r.url) + '">' + esc(r.url) + '</td>' +
-      '<td class="status-' + level + '">' + statusLabel + '</td>' +
+      '<td class="status-' + level + '" title="' + esc(r.lastFailReason || '') + '">' + statusLabel + '</td>' +
       '<td>' + r.consecutiveFailures + '</td>' +
       '<td>' + lastOk + '</td>' +
     '</tr>';
   }).join('');
+}
+
+// Plan 03.1 D-06: 保留极简 fetchStatus → 标签的本地兜底映射（仅在 API 未返回 label 时使用）
+function labelFor(fetchStatus) {
+  if (fetchStatus === 'ok') return 'OK';
+  if (fetchStatus === 'timeout') return 'TIMEOUT';
+  if (fetchStatus === 'decode_error') return 'DECODE ERR';
+  if (fetchStatus === 'parse_error') return 'PARSE ERR';
+  if (typeof fetchStatus === 'string') {
+    if (fetchStatus.indexOf('http') === 0) return 'HTTP ERR';
+    if (fetchStatus === 'network_error' || fetchStatus === 'dns_error' || fetchStatus === 'conn_refused'
+      || fetchStatus === 'conn_reset' || fetchStatus === 'tls_error'
+      || fetchStatus === 'host_unreachable' || fetchStatus === 'net_unreachable'
+      || fetchStatus === 'fetch_failed') return 'NET ERR';
+  }
+  return fetchStatus || 'ERR';
 }
 
 async function triggerRefresh() {

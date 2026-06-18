@@ -505,14 +505,24 @@ async function loadSources() {
 
     list.innerHTML = sources.map(s => {
       const h = healthMap[s.url];
-      const level = !h ? 'unknown'
+      // Plan 03.1 D-10: 后端已分类，直接使用 h.status
+      // 兼容旧格式记录（latestStatus）：若 h.status 不存在则回退到本地分类
+      const classifiedLevel = !h ? 'unknown'
+        : h.status === 'ERR' ? 'error'
+        : h.status === 'WARN' ? 'warn'
+        : h.status === 'OK' ? 'ok'
         : h.latestStatus === 'parse_error' ? 'error'
         : h.consecutiveFailures >= 5 ? 'error'
         : h.consecutiveFailures >= 3 ? 'warn' : 'ok';
+      const level = classifiedLevel;
+      // Plan 03.1 D-12: tooltip 优先显示具体错误原因（lastFailReason），无则显示分类标签
       const tip = !h ? "暂无数据"
-        : h.latestStatus === 'parse_error' ? "JSON 验证失败" + (h.lastFailReason ? ': ' + h.lastFailReason : '')
-        : h.latestStatus + ' | ' + "失败" + ': ' + h.consecutiveFailures +
-          (h.lastSuccessTime ? ' | ' + "最后成功" + ': ' + new Date(h.lastSuccessTime).toLocaleString() : '');
+        : h.lastFailReason
+          ? (h.fetchStatus || h.latestStatus || h.status) + ' | ' + h.lastFailReason +
+            (h.consecutiveFailures != null ? ' | ' + "失败" + ': ' + h.consecutiveFailures : '') +
+            (h.lastSuccessTime ? ' | ' + "最后成功" + ': ' + new Date(h.lastSuccessTime).toLocaleString() : '')
+          : (h.fetchStatus || h.latestStatus || h.status) + ' | ' + "失败" + ': ' + (h.consecutiveFailures || 0) +
+            (h.lastSuccessTime ? ' | ' + "最后成功" + ': ' + new Date(h.lastSuccessTime).toLocaleString() : '');
 
       return \`<div class="source-item">
         <span class="source-health-dot \${level}" data-tooltip="\${esc(tip)}"></span>
