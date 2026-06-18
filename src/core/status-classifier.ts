@@ -34,8 +34,8 @@ export function classifyStatus(
   return 'ERR';
 }
 
-// D-06: STATUS_LABELS 标签映射，覆盖所有 SourceFetchStatus 变体
-// 包含 2 个 legacy 条目（http_error / network_error），随 Plan 02 一并移除
+// D-06: STATUS_LABELS 标签映射，覆盖所有 SourceFetchStatus 变体（19 个）
+// Plan 02 已完成 fetcher.ts 迁移，legacy 条目 http_error / network_error 已移除
 // 表达式级 satisfies 提供：(1) 编译期 exhaustive 键覆盖 (2) 值类型必须为 string 的校验
 export const STATUS_LABELS = {
   ok: 'OK',
@@ -59,8 +59,4 @@ export const STATUS_LABELS = {
   host_unreachable: 'NET ERR',
   net_unreachable: 'NET ERR',
   fetch_failed: 'NET ERR',
-  // legacy — removed in Plan 02 after fetcher.ts migration
-  http_error: 'HTTP ERR',
-  // legacy — removed in Plan 02 after fetcher.ts migration
-  network_error: 'NET ERR',
 } satisfies Record<SourceFetchStatus, string>;

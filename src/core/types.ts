@@ -137,8 +137,8 @@ export interface ParseValidationResult {
 }
 
 // 单次 fetch 结果（内部传递，不持久化）
-// D-08: 扩展为 21 个变体 — 4 个保留 + 8 个 HTTP 细分 + 7 个网络错误细分 + 2 个 legacy
-// Legacy 变体 'http_error' / 'network_error' 在 Plan 02 fetcher.ts 迁移后移除（delayed-deletion）
+// D-08: 19 个变体 — 4 个保留 + 8 个 HTTP 细分 + 7 个网络错误细分
+// Plan 02 已完成 fetcher.ts 迁移，legacy 变体 'http_error' / 'network_error' 已移除
 export type SourceFetchStatus =
   | 'ok'
   | 'timeout'
@@ -160,11 +160,7 @@ export type SourceFetchStatus =
   | 'tls_error'
   | 'host_unreachable'
   | 'net_unreachable'
-  | 'fetch_failed'
-  // legacy — removed in Plan 02 after fetcher.ts migration
-  | 'http_error'
-  // legacy — removed in Plan 02 after fetcher.ts migration
-  | 'network_error';
+  | 'fetch_failed';
 
 export interface SourceFetchResult {
   url: string;

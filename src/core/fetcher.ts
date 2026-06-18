@@ -3,7 +3,7 @@
 import { DEFAULT_FETCH_TIMEOUT_MS, TVBOX_UA, BROWSER_UA } from './config';
 import { decodeConfigResponse } from './decoder';
 import { logger } from './logger';
-import type { TVBoxConfig, SourcedConfig, SourceEntry, SourceFetchResult, ParseValidationResult } from './types';
+import type { TVBoxConfig, SourcedConfig, SourceEntry, SourceFetchResult, ParseValidationResult, SourceFetchStatus } from './types';
 
 const MAX_MULTI_REPO_DEPTH = 3; // 多仓最大展开深度
 
@@ -135,14 +135,14 @@ async function expandSources(
         name: source.name,
         url: source.url,
         depth,
-        status: 'network_error',
+        status: classifyNetworkError(result.reason),
         error: result.reason,
       });
       fetchResults.push({
         url: source.url,
         name: source.name,
-        status: 'network_error',
-        errorMessage: String(result.reason),
+        status: classifyNetworkError(result.reason),
+        errorMessage: classifyNetworkErrorMessage(result.reason),
       });
     }
   }
@@ -209,7 +209,67 @@ async function fetchSingleConfig(
 }
 
 function isProxyRetriable(status: string): boolean {
-  return status === 'timeout' || status === 'network_error' || status === 'http_error';
+  return status === 'timeout'
+    || status.startsWith('http_')
+    || ['dns_error', 'conn_refused', 'conn_reset', 'tls_error',
+        'host_unreachable', 'net_unreachable', 'fetch_failed'].includes(status);
+}
+
+// ─── 错误分类辅助 ─────────────────────────────────────────
+// Plan 03.1 D-08: 将粗粒度 'http_error' / 'network_error' 细分为具体子类型
+// classifyHttpError 按状态码映射到 http_403/http_404/.../http_4xx/http_5xx，兜底 fetch_failed
+function classifyHttpError(status: number): SourceFetchStatus {
+  switch (status) {
+    case 403: return 'http_403';
+    case 404: return 'http_404';
+    case 429: return 'http_429';
+    case 502: return 'http_502';
+    case 503: return 'http_503';
+    case 504: return 'http_504';
+    default:
+      if (status >= 400 && status < 500) return 'http_4xx';
+      if (status >= 500 && status < 600) return 'http_5xx';
+      return 'fetch_failed';
+  }
+}
+
+// classifyNetworkError 按 Node.js error.cause.code 映射到 dns_error/conn_refused/...，兜底 fetch_failed
+function classifyNetworkError(error: unknown): SourceFetchStatus {
+  const cause = (error as { cause?: { code?: string } })?.cause;
+  const code = cause?.code || '';
+  switch (code) {
+    case 'ENOTFOUND':     return 'dns_error';
+    case 'ECONNREFUSED':  return 'conn_refused';
+    case 'ECONNRESET':    return 'conn_reset';
+    case 'ERR_TLS_CERT_ALTNAME_INVALID':
+    case 'ERR_TLS_PROTOCOL_VERSION':
+    case 'ERR_TLS_HANDSHAKE_TIMEOUT':
+                          return 'tls_error';
+    case 'EHOSTUNREACH':  return 'host_unreachable';
+    case 'ENETUNREACH':   return 'net_unreachable';
+    default:              return 'fetch_failed';
+  }
+}
+
+// classifyNetworkErrorMessage 生成 D-09 中文标签的细分错误详情（含 hostname/port）
+function classifyNetworkErrorMessage(error: unknown): string {
+  const cause = (error as { cause?: { code?: string; hostname?: string; host?: string; port?: number | string } })?.cause;
+  const code = cause?.code || '';
+  const hostname = cause?.hostname || (error instanceof Error && (error as { hostname?: string }).hostname) || 'unknown host';
+  const host = cause?.host || hostname;
+  const port = cause?.port;
+  switch (code) {
+    case 'ENOTFOUND':     return `DNS 解析失败: ${hostname}`;
+    case 'ECONNREFUSED':  return port ? `连接被拒绝: ${host}:${port}` : `连接被拒绝: ${hostname}`;
+    case 'ECONNRESET':    return '连接被重置';
+    case 'ERR_TLS_CERT_ALTNAME_INVALID':
+    case 'ERR_TLS_PROTOCOL_VERSION':
+    case 'ERR_TLS_HANDSHAKE_TIMEOUT':
+                          return 'TLS 握手失败';
+    case 'EHOSTUNREACH':  return `主机不可达: ${hostname}`;
+    case 'ENETUNREACH':   return '网络不可达';
+    default:              return error instanceof Error ? error.message : String(error);
+  }
 }
 
 async function fetchViaProxy(
@@ -249,7 +309,7 @@ async function fetchViaProxy(
     if (!response.ok) {
       return {
         config: null,
-        fetchResult: { url: source.url, name: source.name, status: 'http_error', errorMessage: `Proxy: HTTP ${response.status}` },
+        fetchResult: { url: source.url, name: source.name, status: classifyHttpError(response.status), errorMessage: `Proxy: HTTP ${response.status} ${response.statusText}` },
       };
     }
 
@@ -296,10 +356,9 @@ async function fetchViaProxy(
       fetchResult: { url: source.url, name: source.name, status: 'ok', speedMs },
     };
   } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
     return {
       config: null,
-      fetchResult: { url: source.url, name: source.name, status: 'network_error', errorMessage: `Proxy: ${msg}` },
+      fetchResult: { url: source.url, name: source.name, status: classifyNetworkError(error), errorMessage: `Proxy: ${classifyNetworkErrorMessage(error)}` },
     };
   } finally {
     clearTimeout(timer);
@@ -350,7 +409,7 @@ async function fetchWithUA(
       });
       return {
         config: null,
-        fetchResult: { url: source.url, name: source.name, status: 'http_error', errorMessage: `HTTP ${response.status}` },
+        fetchResult: { url: source.url, name: source.name, status: classifyHttpError(response.status), errorMessage: `HTTP ${response.status} ${response.statusText}` },
       };
     }
 
@@ -426,7 +485,7 @@ async function fetchWithUA(
     });
     return {
       config: null,
-      fetchResult: { url: source.url, name: source.name, status: 'network_error', errorMessage: msg },
+      fetchResult: { url: source.url, name: source.name, status: classifyNetworkError(error), errorMessage: classifyNetworkErrorMessage(error) },
     };
   } finally {
     clearTimeout(timer);
