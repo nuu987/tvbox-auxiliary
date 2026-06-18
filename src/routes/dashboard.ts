@@ -97,12 +97,14 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
     // removed once all records migrated (post-deploy) per PATTERNS.md line 469.
     const normalized: SourceHealthRecord[] = records.map((r: any) => {
       if ('latestStatus' in r && !('status' in r)) {
-        const rawStatus = r.latestStatus as SourceFetchStatus;
+        // Old-format KV may carry coarse 'http_error'/'network_error' values that
+        // Plan 03.1-02 removed from the SourceFetchStatus union. Cast through string
+        // so the legacy-value comparison compiles while we migrate to granular subtypes.
+        const rawStatus = r.latestStatus as string;
         const failures = (r.consecutiveFailures as number) || 0;
-        // Map old coarse types to valid granular types
         const fetchStatus: SourceFetchStatus = rawStatus === 'http_error' ? 'http_4xx'
           : rawStatus === 'network_error' ? 'fetch_failed'
-          : rawStatus;
+          : rawStatus as SourceFetchStatus;
         // Strip legacy latestStatus field so the response carries only the new schema
         const { latestStatus: _omit, ...rest } = r;
         return {
