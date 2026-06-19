@@ -343,6 +343,7 @@ ${sharedStyles}
       <div class="update-label">最后聚合时间</div>
       <div class="update-time" id="updateTime"><span class="skeleton">&nbsp;Loading...&nbsp;</span></div>
     </div>
+    <button class="btn btn-sm" id="exportBtn" onclick="triggerExport()">导出配置</button>
     <button class="btn btn-sm" id="refreshBtn" onclick="triggerRefresh()">立即聚合</button>
   </div>
 
@@ -477,8 +478,14 @@ let lastSyncWarnKey = null;
 
 async function loadStatus() {
   try {
-    const res = await fetch('/status-data');
+    const res = await auth.authFetch('/status-data');
     const d = await res.json();
+
+    // D-08: 同步进行时禁用导出按钮（仅管理员会话能看到 syncRunning 字段；
+    // 非管理员会话 auth.authFetch 退化为普通 fetch，d.syncRunning 为 undefined，
+    // 按钮保持可点击 — 后端 409 是真正的保护）
+    const exportBtn = $('exportBtn');
+    if (exportBtn) exportBtn.disabled = !!d.syncRunning;
 
     $('statSites').textContent = d.sites ?? '—';
     $('statLives').textContent = d.lives ?? '—';
@@ -680,6 +687,50 @@ function labelFor(fetchStatus) {
       || fetchStatus === 'fetch_failed') return 'NET ERR';
   }
   return fetchStatus || 'ERR';
+}
+
+async function triggerExport() {
+  const btn = $('exportBtn');
+  btn.disabled = true;
+  btn.textContent = "导出中...";
+  try {
+    // D-10: auth.authFetch 带 Bearer Token
+    const res = await auth.authFetch('/admin/export-config');
+    // D-11: 同步中拒绝导出
+    if (res.status === 409) {
+      toast("同步进行中，请稍后", 'error');
+      return;
+    }
+    // D-12: 没有可用快照
+    if (res.status === 503) {
+      toast("请先同步", 'error');
+      return;
+    }
+    // 401/500/其他错误
+    if (!res.ok) {
+      toast("导出失败", 'error');
+      return;
+    }
+    // D-09: 浏览器下载 attachment — 从 Content-Disposition 取文件名，回退用默认名
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?(.+?)"?$/);
+    const filename = match ? match[1] : 'tvbox-config.json';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast("导出成功");
+  } catch {
+    toast("网络错误", 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "导出配置";
+  }
 }
 
 async function triggerRefresh() {
