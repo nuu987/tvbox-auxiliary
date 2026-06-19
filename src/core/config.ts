@@ -8,6 +8,7 @@ export const DEFAULT_FETCH_TIMEOUT_MS = 30000; // fetch 配置 JSON 超时（30s
 // Storage keys
 export const MERGED_CONFIG = 'merged_config';
 export const MERGED_CONFIG_FULL = 'merged_config_full'; // 黑名单过滤前的完整配置（供配置编辑器使用）
+export const EXPORT_CONFIG = 'export_config'; // 导出快照配置（含原始 URL，供 /admin/export-config 下载，D-01）
 export const SOURCE_URLS = 'source_urls';
 export const LAST_UPDATE = 'last_update';
 export const MANUAL_SOURCES = 'manual_sources';

@@ -2,7 +2,7 @@
 
 import type { Storage } from '../storage/interface';
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxConfig, RegexRule, RegexValidationResult } from './types';
-import { BLACKLIST, MERGED_CONFIG, MERGED_CONFIG_FULL, LAST_UPDATE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './config';
+import { BLACKLIST, MERGED_CONFIG, MERGED_CONFIG_FULL, LAST_UPDATE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, EXPORT_CONFIG } from './config';
 import { rewriteJarUrls } from './jar-proxy';
 import { logger } from './logger';
 
@@ -285,6 +285,37 @@ export async function applyBlacklist(
 }
 
 /**
+ * 生成导出快照配置：应用黑名单、LIVE_DISABLED 清空 lives、删除 pic 前缀，
+ * URL 保持原始（不调用 rewriteJarUrls）。供 syncer Step 4.6.5 和 patchMergedConfig 共用 (D-03)。
+ *
+ * - D-01: 不调用 rewriteJarUrls，URL 保持原始
+ * - D-02: 调用 applyBlacklist 复用黑名单过滤（与 MERGED_CONFIG 屏蔽状态一致）
+ * - D-04: liveDisabled=true 时清空 lives
+ * - D-05: 删除 pic 字段
+ * - D-06: 返回完整 TVBoxConfig 字段集，不引入 _meta
+ *
+ * @param merged       MERGED_CONFIG_FULL 解析后的完整配置（含原始 URL）
+ * @param blacklist    当前黑名单
+ * @param liveDisabled 直播功能禁用开关
+ * @returns            导出快照 TVBoxConfig
+ */
+export async function generateExportConfig(
+  merged: TVBoxConfig,
+  blacklist: Blacklist,
+  liveDisabled: boolean,
+): Promise<TVBoxConfig> {
+  const { config: filtered } = await applyBlacklist(merged, blacklist);
+
+  if (liveDisabled) {
+    filtered.lives = [];
+  }
+
+  delete (filtered as TVBoxConfig).pic;
+
+  return filtered;
+}
+
+/**
  * 即时应用黑名单 patch：
  *  - 从 MERGED_CONFIG_FULL 加载完整配置
  *  - 加载当前黑名单（含正则规则、白名单覆盖）
@@ -332,6 +363,16 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
   const result = await rewriteJarUrls(filtered, BASE_URL_PLACEHOLDER, storage);
 
   await storage.put(MERGED_CONFIG, JSON.stringify(result));
+  // D-03: 同步更新 EXPORT_CONFIG（含原始 URL，供 /admin/export-config 下载）
+  // result 含改写后的代理 URL（写入 MERGED_CONFIG），exportConfig 含原始 URL（写入 EXPORT_CONFIG）
+  const exportConfig = await generateExportConfig(full, blacklist, liveDisabled);
+  delete (exportConfig as TVBoxConfig).pic; // D-05: 删除图片代理前缀（防御性，generateExportConfig 已删）
+  await storage.put(EXPORT_CONFIG, JSON.stringify(exportConfig));
+  logger.infoFields('blacklist', 'export-config-patched', {
+    sites: exportConfig.sites?.length || 0,
+    parses: exportConfig.parses?.length || 0,
+    lives: exportConfig.lives?.length || 0,
+  });
   await storage.put(LAST_UPDATE, new Date().toISOString());
 
   // Build warning string reflecting what was and wasn't reapplied
