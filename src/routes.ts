@@ -14,6 +14,7 @@ import { createSearchQuotaRouter } from './routes/search-quota';
 import { createCloudCredRouter } from './routes/cloud-credentials';
 import { createMaccmsAdminRouter } from './routes/maccms-admin';
 import { createBlacklistRouter } from './routes/blacklist';
+import { createExportConfigRouter } from './routes/export-config';
 import { createConfigEditorRouter } from './routes/config-editor';
 import { createLiveSourcesRouter } from './routes/live-sources';
 import { createMaccmsProxyRouter } from './routes/maccms-proxy';
@@ -52,6 +53,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route('/', createCloudCredRouter({ storage, config }));
   app.route('/', createMaccmsAdminRouter({ storage, config }));
   app.route('/', createBlacklistRouter({ storage, config, runtime }));
+  app.route('/', createExportConfigRouter({ storage, config, runtime }));
   app.route('/', createConfigEditorRouter({ storage, config }));
   app.route('/', createLiveSourcesRouter({ storage, config }));
 
