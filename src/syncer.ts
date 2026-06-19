@@ -1,7 +1,7 @@
 // 同步流程编排
 
 import type { Storage } from './storage/interface';
-import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFetchResult, SourceHealthRecord } from './core/types';
+import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFetchResult, SourceHealthRecord, TVBoxConfig } from './core/types';
 import { fetchConfigs } from './core/fetcher';
 import { classifyStatus } from './core/status-classifier';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
@@ -10,8 +10,8 @@ import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, SYNC_STATUS } from './core/config';
-import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist } from './core/blacklist';
+import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, SYNC_STATUS, EXPORT_CONFIG } from './core/config';
+import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
 import { scrapeSourceList, scrapeMacCMSSources, type ScrapeSourceConfig, type ScrapeMacCMSConfig } from './core/source-scraper';
@@ -361,6 +361,21 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   merged = cleanLocalRefs(merged);
   logger.infoFields('sync', 'cleanup-complete', {
     ...beforeAfterCounts(beforeClean, configCounts(merged)),
+  });
+
+  // Step 4.6.5: 生成 EXPORT_CONFIG 快照（含原始 URL，供 /admin/export-config 下载，D-01/D-02）
+  // 必须在 Step 7 JAR URL 重写之前 — 此时 site.jar/api/ext 等仍是远程原始 URL
+  logger.info('sync', 'Step 4.6.5: Generating EXPORT_CONFIG snapshot...');
+  const liveDisabledRaw465 = await storage.get(LIVE_DISABLED);
+  const liveDisabled465 = liveDisabledRaw465 !== 'false';
+  const exportConfig = await generateExportConfig(merged, blacklist, liveDisabled465);
+  delete (exportConfig as TVBoxConfig).pic; // D-05: 导出版本不含图片代理前缀（防御性，generateExportConfig 已删）
+  await storage.put(EXPORT_CONFIG, JSON.stringify(exportConfig));
+  logger.infoFields('sync', 'export-config-snapshot', {
+    sites: exportConfig.sites?.length || 0,
+    parses: exportConfig.parses?.length || 0,
+    lives: exportConfig.lives?.length || 0,
+    liveDisabled: liveDisabled465,
   });
 
   // Step 4.7: 搜索配额（JS 排除 + 置顶排序 + 可选截断）
