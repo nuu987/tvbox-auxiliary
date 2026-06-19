@@ -483,7 +483,7 @@ async function fetchWithUA(
       });
       return {
         config: null,
-        fetchResult: { url: source.url, name: source.name, status: 'timeout', errorMessage: `Timeout (${timeoutMs}ms)` },
+        fetchResult: { url: source.url, name: source.name, status: 'timeout', errorMessage: '请求超时' },
       };
     }
     logger.warnFields('fetcher', 'source-network-error', {
