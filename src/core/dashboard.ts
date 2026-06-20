@@ -113,6 +113,13 @@ ${sharedStyles}
   display:flex;flex-direction:column;gap:4px;
 }
 
+/* 04-UI: 把导出/聚合两个动作按钮收进同一组，避免 space-between 把单个按钮挤到容器中心 */
+.update-actions{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
 .update-label{
   font-family:var(--mono);
   font-size:0.7rem;
@@ -343,8 +350,10 @@ ${sharedStyles}
       <div class="update-label">最后聚合时间</div>
       <div class="update-time" id="updateTime"><span class="skeleton">&nbsp;Loading...&nbsp;</span></div>
     </div>
-    <button class="btn btn-sm" id="exportBtn" onclick="triggerExport()">导出配置</button>
-    <button class="btn btn-sm" id="refreshBtn" onclick="triggerRefresh()">立即聚合</button>
+    <div class="update-actions">
+      <button class="btn btn-sm" id="exportBtn" onclick="triggerExport()">导出配置</button>
+      <button class="btn btn-sm" id="refreshBtn" onclick="triggerRefresh()">立即聚合</button>
+    </div>
   </div>
 
   <div class="config-section">
