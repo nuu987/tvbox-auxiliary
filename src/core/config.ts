@@ -138,6 +138,3 @@ export const CHANNEL_PROBE_CONCURRENCY = 50;
 export const CHANNEL_PROBE_TIMEOUT_MS = 5000;
 // 缓存过期（7 天）
 export const CHANNEL_SPEED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-// 同步状态标志（成功/失败）
-export const SYNC_STATUS = 'sync_status';

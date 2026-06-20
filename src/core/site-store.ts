@@ -146,7 +146,7 @@ export function swapSiteDirectories(): void {
       } catch (restoreErr) {
         logger.error('site-store', `FATAL: restore from backup also failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
       }
-      throw e; // surface to caller — sync will fail and SYNC_STATUS will record failure
+      throw e; // surface to caller — sync will fail and runSync catch block will log + write LAST_UPDATE error marker
     }
   } else {
     // No existing sites/ — direct rename

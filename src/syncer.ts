@@ -10,7 +10,7 @@ import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, SYNC_STATUS, EXPORT_CONFIG } from './core/config';
+import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, EXPORT_CONFIG } from './core/config';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
@@ -42,16 +42,6 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
     logger.error('sync', `Stack: ${stack}`);
     // 写入错误信息方便调试
     await storage.put(LAST_UPDATE, `ERROR @ ${new Date().toISOString()}: ${msg}`);
-    // D-12: 记录同步失败状态，不清空缓存
-    try {
-      await storage.put(SYNC_STATUS, JSON.stringify({
-        success: false,
-        timestamp: new Date().toISOString(),
-        error: msg,
-      }));
-    } catch (statusErr) {
-      logger.warn('sync', `Failed to record SYNC_STATUS failure: ${statusErr instanceof Error ? statusErr.message : String(statusErr)}`);
-    }
     // D-06: 同步失败删除临时目录，确保现有缓存不受影响
     try {
       cleanStaleTempDir();
@@ -62,7 +52,6 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
 }
 
 async function _runSync(storage: Storage, config: AppConfig, startTime: number): Promise<void> {
-  let step71FailedCount = 0;
 
   // Step 0: 自动抓取源（需配置 SCRAPE_SOURCE_URL 环境变量）
   if (config.scrapeSourceUrl && config.scrapeSourceReferer) {
@@ -710,7 +699,6 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
       }
 
       logger.infoFields('sync', 'static-resource-download-complete', { downloaded, copiedFromLive, failed, total: sorted.length });
-      step71FailedCount = failed;
     } else {
       logger.info('sync', 'Step 7.1: No static resources found');
     }
@@ -761,13 +749,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   // Step 9: 记录同步成功状态（D-12）
   // 旧的 organizeSiteDirectories 步骤已被原子交换取代：临时目录在下载阶段已建好正确的结构
-  logger.info('sync', 'Step 9: Recording sync success status...');
-  await storage.put(SYNC_STATUS, JSON.stringify({
-    success: true,
-    timestamp: new Date().toISOString(),
-    lastSyncMs: Date.now() - startTime,
-    downloadFailed: step71FailedCount,
-  }));
+  logger.info('sync', 'Step 9: Sync complete');
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   logger.infoFields('sync', 'run-complete', {
