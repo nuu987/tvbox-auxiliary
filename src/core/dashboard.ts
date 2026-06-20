@@ -666,7 +666,9 @@ function renderHealthTable(records) {
       '<td><span class="health-dot ' + level + '"></span></td>' +
       '<td>' + esc(r.name || 'Unnamed') + '</td>' +
       '<td class="url-cell" title="' + esc(r.url) + '">' + esc(r.url) + '</td>' +
-      '<td class="status-' + level + '" title="' + esc(r.lastFailReason || '') + '">' + statusLabel + '</td>' +
+      '<td class="status-' + level + '"' +
+        (r.status === 'OK' ? '' : ' title="' + esc(r.lastFailReason || '') + '"') +
+        '>' + statusLabel + '</td>' +
       '<td>' + r.consecutiveFailures + '</td>' +
       '<td>' + lastOk + '</td>' +
     '</tr>';

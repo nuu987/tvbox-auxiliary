@@ -512,8 +512,10 @@ async function loadSources() {
         : h.status === 'WARN' ? 'warn'
         : 'ok';
       // Plan 03.1 D-12: tooltip 优先显示具体错误原因（lastFailReason），无则显示分类标签
+      // 修复：OK 状态下不展示历史 lastFailReason（写入层会保留作为历史档案）
       const tip = !h ? "暂无数据"
-        : h.lastFailReason || h.status;
+        : h.status === 'OK' ? h.status
+        : (h.lastFailReason || h.status);
 
       return \`<div class="source-item">
         <span class="source-health-dot \${level}" data-tooltip="\${esc(tip)}"></span>
