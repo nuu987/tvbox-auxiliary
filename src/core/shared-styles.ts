@@ -317,6 +317,12 @@ body::before{
   pointer-events:none;
 }
 
+.btn[disabled], .btn:disabled{
+  opacity:0.4;
+  cursor:not-allowed;
+  pointer-events:none;
+}
+
 .btn-danger, .btn.danger{
   border-color:var(--red);
   color:var(--red);
