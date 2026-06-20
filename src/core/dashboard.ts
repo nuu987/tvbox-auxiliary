@@ -737,6 +737,10 @@ async function triggerRefresh() {
   const btn = $('refreshBtn');
   btn.textContent = "运行中...";
   btn.className = 'btn btn-sm loading';
+  // 04-06: 同步触发期间禁用导出按钮（前端时序竞态修复）
+  // /refresh 阻塞到同步完成才返回，await 前同步禁用，finally 恢复
+  const exportBtn = $('exportBtn');
+  if (exportBtn) exportBtn.disabled = true;
   try {
     const res = await auth.authFetch('/refresh', { method: 'POST' });
     const d = await res.json();
@@ -748,6 +752,8 @@ async function triggerRefresh() {
     }
   } catch {
     toast("网络错误", 'error');
+  } finally {
+    if (exportBtn) exportBtn.disabled = false;
   }
   setTimeout(() => {
     btn.textContent = "立即聚合";
