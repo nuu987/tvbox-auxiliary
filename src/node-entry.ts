@@ -209,6 +209,7 @@ async function main() {
   } catch { /* keep localhost */ }
 
   serve({ fetch: app.fetch, port }, (info) => {
+    // 启动横幅保留 console.log：一次性运维信息，转 logger 会破坏 ASCII 多行缩进美观（D-09/D-12）
     console.log('  TVBox Auxiliary');
     if (displayHost !== 'localhost') {
       console.log(`  管理面板：http://${displayHost}:${info.port}/status`);
