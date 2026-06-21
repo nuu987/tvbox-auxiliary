@@ -1,6 +1,7 @@
 // 去重逻辑
 
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxDoh, TVBoxRule } from './types';
+import { logger } from './logger';
 
 /**
  * 站点去重
@@ -198,12 +199,12 @@ export function deduplicateSimilarNames(
 
     if (indices.length > 1) {
       const names = indices.map(i => `${sites[i].name || sites[i].key}(${speedMap.get(sites[i].api) ?? '?'}ms)`);
-      console.log(`[dedup-similar] Group: ${names.join(' | ')} → kept: ${sites[bestIdx].name || sites[bestIdx].key}`);
+      logger.info('dedup', `Group: ${names.join(' | ')} → kept: ${sites[bestIdx].name || sites[bestIdx].key}`);
     }
   }
 
   if (dedupCount > 0) {
-    console.log(`[dedup-similar] Removed ${dedupCount} similar-name duplicates (threshold: ${threshold})`);
+    logger.info('dedup', `Removed ${dedupCount} similar-name duplicates (threshold: ${threshold})`);
   }
 
   const keptKeys = new Set(kept.map(s => s.key));
