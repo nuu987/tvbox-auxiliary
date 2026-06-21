@@ -15,6 +15,7 @@ import {
   LIVE_DISABLED,
 } from './config';
 import { extractAllUrls } from './live-merger';
+import { logger } from './logger';
 
 // ─── 开关/状态 ─────────────────────────────────────────
 
@@ -189,25 +190,25 @@ let running = false;
 
 export async function runChannelProbe(storage: Storage): Promise<ChannelProbeStatus> {
   if (running) {
-    console.log('[channel-probe] Already running, skipping');
+    logger.info('channel-probe', 'Already running, skipping');
     return loadStatus(storage);
   }
 
   if (!(await isProbeEnabled(storage))) {
-    console.log('[channel-probe] Disabled by user, skipping');
+    logger.info('channel-probe', 'Disabled by user, skipping');
     return loadStatus(storage);
   }
 
   // 直播功能禁用时跳过测速（无意义）
   if ((await storage.get(LIVE_DISABLED)) === 'true') {
-    console.log('[channel-probe] Live disabled, skipping');
+    logger.info('channel-probe', 'Live disabled, skipping');
     return loadStatus(storage);
   }
 
   // 读取上次合并的频道树
   const treeRaw = await storage.get(CHANNEL_MERGED_TREE);
   if (!treeRaw) {
-    console.log('[channel-probe] No merged tree available, skipping (run main sync first)');
+    logger.info('channel-probe', 'No merged tree available, skipping (run main sync first)');
     const status: ChannelProbeStatus = {
       state: 'error',
       totalUrls: 0,
@@ -277,7 +278,7 @@ export async function runChannelProbe(storage: Storage): Promise<ChannelProbeSta
   };
   await saveStatus(storage, status);
 
-  console.log(`[channel-probe] Started: ${urls.length} URLs, ${totalChannels} channels, concurrency=${CHANNEL_PROBE_CONCURRENCY}`);
+  logger.info('channel-probe', `Started: ${urls.length} URLs, ${totalChannels} channels, concurrency=${CHANNEL_PROBE_CONCURRENCY}`);
 
   try {
     // 先读旧缓存，复用未过期条目（减少重复测试）
@@ -286,7 +287,7 @@ export async function runChannelProbe(storage: Storage): Promise<ChannelProbeSta
 
     // 只测缓存里没有的 URL
     const toProbe = urls.filter((u) => !fresh[u]);
-    console.log(`[channel-probe] ${toProbe.length} new URLs to probe (${urls.length - toProbe.length} cached)`);
+    logger.info('channel-probe', `${toProbe.length} new URLs to probe (${urls.length - toProbe.length} cached)`);
 
     const results = await runWithConcurrency(
       toProbe,
@@ -296,7 +297,7 @@ export async function runChannelProbe(storage: Storage): Promise<ChannelProbeSta
         status.probed = done + (urls.length - toProbe.length); // 含缓存命中
         saveStatus(storage, status).catch(() => {});
         if (done % 200 === 0) {
-          console.log(`[channel-probe] Progress: ${done}/${total}`);
+          logger.info('channel-probe', `Progress: ${done}/${total}`);
         }
       },
     );
@@ -335,10 +336,7 @@ export async function runChannelProbe(storage: Storage): Promise<ChannelProbeSta
     };
     await saveStatus(storage, finalStatus);
 
-    console.log(
-      `[channel-probe] Done in ${(durationMs / 1000).toFixed(1)}s: ` +
-      `${success} success, ${failed} failed, coverage=${coverage}%`,
-    );
+    logger.info('channel-probe', `Done in ${(durationMs / 1000).toFixed(1)}s: ${success} success, ${failed} failed, coverage=${coverage}%`);
 
     return finalStatus;
   } catch (err: unknown) {
@@ -357,7 +355,7 @@ export async function runChannelProbe(storage: Storage): Promise<ChannelProbeSta
       error: msg,
     };
     await saveStatus(storage, errStatus);
-    console.error(`[channel-probe] Error: ${msg}`);
+    logger.error('channel-probe', `Error: ${msg}`);
     return errStatus;
   } finally {
     running = false;
