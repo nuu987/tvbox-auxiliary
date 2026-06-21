@@ -11,6 +11,7 @@ import {
   deduplicateHosts,
   deduplicateStrings,
 } from './dedup';
+import { logger } from './logger';
 
 /**
  * 将多个 TVBox 配置合并成一个
@@ -85,10 +86,7 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
     flags: deduplicateStrings(allFlags),
   };
 
-  console.log(
-    `[merger] Merged: ${merged.sites?.length} sites, ` +
-      `${merged.parses?.length} parses, ${merged.lives?.length} lives`,
-  );
+  logger.info('merger', `Merged: ${merged.sites?.length} sites, ${merged.parses?.length} parses, ${merged.lives?.length} lives`);
 
   return { config: merged };
 }
@@ -162,11 +160,7 @@ export function cleanEmptyEntries(config: TVBoxConfig): TVBoxConfig {
     (before.doh - doh.length);
 
   if (removed > 0) {
-    console.log(
-      `[cleaner] Removed ${removed} empty entries: ` +
-      `${before.sites - sites.length} sites, ${before.parses - parses.length} parses, ` +
-      `${before.lives - lives.length} lives, ${before.doh - doh.length} doh`,
-    );
+    logger.info('cleaner', `Removed ${removed} empty entries: ${before.sites - sites.length} sites, ${before.parses - parses.length} parses, ${before.lives - lives.length} lives, ${before.doh - doh.length} doh`);
   }
 
   return { ...config, sites, parses, lives, doh };
@@ -183,12 +177,12 @@ export function cleanLocalRefs(config: TVBoxConfig): TVBoxConfig {
   const sites = (config.sites || []).filter((site) => {
     // 过滤 api 包含本地地址的站点
     if (site.api && isLocal(site.api)) {
-      console.log(`[cleaner] Removed site ${site.key}: local api ${site.api}`);
+      logger.info('cleaner', `Removed site ${site.key}: local api ${site.api}`);
       return false;
     }
     // 过滤 ext 字符串包含本地地址的站点
     if (typeof site.ext === 'string' && isLocal(site.ext)) {
-      console.log(`[cleaner] Removed site ${site.key}: local ext`);
+      logger.info('cleaner', `Removed site ${site.key}: local ext`);
       return false;
     }
     return true;
@@ -196,7 +190,7 @@ export function cleanLocalRefs(config: TVBoxConfig): TVBoxConfig {
 
   const lives = (config.lives || []).filter((live) => {
     if (live.url && isLocal(live.url)) {
-      console.log(`[cleaner] Removed live ${live.name || 'unnamed'}: local url ${live.url}`);
+      logger.info('cleaner', `Removed live ${live.name || 'unnamed'}: local url ${live.url}`);
       return false;
     }
     return true;
@@ -205,7 +199,7 @@ export function cleanLocalRefs(config: TVBoxConfig): TVBoxConfig {
   const removedSites = (config.sites?.length || 0) - sites.length;
   const removedLives = (config.lives?.length || 0) - lives.length;
   if (removedSites > 0 || removedLives > 0) {
-    console.log(`[cleaner] Removed ${removedSites} sites, ${removedLives} lives with local refs`);
+    logger.info('cleaner', `Removed ${removedSites} sites, ${removedLives} lives with local refs`);
   }
 
   return { ...config, sites, lives };
