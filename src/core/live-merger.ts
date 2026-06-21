@@ -7,6 +7,7 @@ import type {
   ChannelSpeedMap,
 } from './types';
 import { TVBOX_UA, BROWSER_UA } from './config';
+import { logger } from './logger';
 
 // ─── 输入条目 ──────────────────────────────────────────
 
@@ -224,7 +225,7 @@ export async function mergeLivesToNative(
     return { groups: [], totalChannels: 0, totalUrls: 0, sourcesDownloaded: 0, sourcesFailed: 0 };
   }
 
-  console.log(`[live-merger] Downloading ${sources.length} live source files...`);
+  logger.info('live-merger', `Downloading ${sources.length} live source files...`);
 
   // 并发下载
   const downloadResults = await Promise.allSettled(
@@ -242,17 +243,14 @@ export async function mergeLivesToNative(
         const entries = parseLiveContent(r.value.content, r.value.input.name, r.value.input.speedMs);
         allEntries.push(...entries);
       } catch (err) {
-        console.warn(`[live-merger] Parse failed for ${r.value.input.name}: ${err}`);
+        logger.warn('live-merger', `Parse failed for ${r.value.input.name}: ${err}`);
       }
     } else {
       sourcesFailed++;
     }
   }
 
-  console.log(
-    `[live-merger] Downloaded ${sourcesDownloaded}/${sources.length} sources, ` +
-    `parsed ${allEntries.length} channel entries`,
-  );
+  logger.info('live-merger', `Downloaded ${sourcesDownloaded}/${sources.length} sources, parsed ${allEntries.length} channel entries`);
 
   // 按频道名（规范化）+ group 合并 urls
   // key: normalizedName → { group, rawName, logo, urls: Map<url, ChannelEntry> }
@@ -346,7 +344,7 @@ export async function mergeLivesToNative(
   let cleanedGroups: TVBoxLiveGroup[] = groups;
 
   if (/"type"\s*:/i.test(finalJson)) {
-    console.warn('[live-merger] WARNING: "type" field leaked into output, stripping...');
+    logger.warn('live-merger', 'WARNING: "type" field leaked into output, stripping...');
     finalJson = finalJson
       .replace(/,\s*"type"\s*:\s*("[^"]*"|[\d.]+|null|true|false)/gi, '')
       .replace(/"type"\s*:\s*("[^"]*"|[\d.]+|null|true|false)\s*,?/gi, '');
@@ -355,7 +353,7 @@ export async function mergeLivesToNative(
 
   // value 内 type 子串兜底：排除字段名（"xxx":）位置，其他全部 encode
   if (/type/i.test(finalJson)) {
-    console.warn('[live-merger] WARNING: "type" substring in value, encoding to %74ype...');
+    logger.warn('live-merger', 'WARNING: "type" substring in value, encoding to %74ype...');
     finalJson = finalJson.replace(/type/gi, (m) => {
       const hex = m.charCodeAt(0).toString(16).toUpperCase();
       return '%' + hex + m.slice(1);
@@ -380,9 +378,7 @@ export async function mergeLivesToNative(
     };
   }
 
-  console.log(
-    `[live-merger] Merged ${channelMap.size} channels / ${totalUrls} URLs across ${groups.length} groups`,
-  );
+  logger.info('live-merger', `Merged ${channelMap.size} channels / ${totalUrls} URLs across ${groups.length} groups`);
 
   return {
     groups,

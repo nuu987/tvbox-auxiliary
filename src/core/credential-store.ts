@@ -3,6 +3,7 @@
 import type { Storage } from '../storage/interface';
 import type { CloudPlatform, CloudCredential, CredentialPolicyConfig } from './types';
 import { CLOUD_CREDENTIALS, CREDENTIAL_POLICY, CREDENTIAL_ENCRYPTION_KEY } from './config';
+import { logger } from './logger';
 import { webcrypto } from 'crypto';
 
 type CryptoKey = webcrypto.CryptoKey;
@@ -64,7 +65,7 @@ export async function loadCredentials(storage: Storage): Promise<Map<CloudPlatfo
       map.set(cred.platform, cred);
     }
   } catch (err) {
-    console.error('[credential-store] Failed to decrypt credentials:', err instanceof Error ? err.message : err);
+    logger.error('credential-store', `Failed to decrypt credentials: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   return map;
