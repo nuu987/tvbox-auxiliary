@@ -38,9 +38,32 @@ export function formatFields(fields: LogFields): string {
     .join(' ');
 }
 
+// D-03: 手动拼接 YYYY-MM-DD HH:MM:SS 时间戳，避免 toLocaleString 的 locale 不确定性。
+// D-02: 时区跟随 process.env.TZ（new Date() 本地时区），不显式硬编码 Asia/Shanghai。
+function formatTimestamp(): string {
+  const d = new Date();
+  const Y = d.getFullYear();
+  const M = String(d.getMonth() + 1).padStart(2, '0');
+  const D = String(d.getDate()).padStart(2, '0');
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const s = String(d.getSeconds()).padStart(2, '0');
+  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+}
+
+// D-08: formatLine 私有函数统一拼接时间戳 + 条件 scope。
+// D-05/D-06: VERBOSE=true 保留 [scope]，VERBOSE=false 移除 [scope]。
+// D-07: security 不例外，走同一逻辑。
+// 不缓存 isVerbose() 结果——每次调用都读 env，避免 vi.stubEnv 测试间污染。
+function formatLine(scope: string, message: string): string {
+  const ts = formatTimestamp();
+  if (isVerbose()) return `${ts} [${scope}] ${message}`;
+  return `${ts} ${message}`;
+}
+
 export const logger = {
   info(scope: string, message: string): void {
-    console.log(`[${scope}] ${message}`);
+    console.log(formatLine(scope, message));
   },
 
   infoFields(scope: string, event: string, fields: LogFields): void {
@@ -48,7 +71,7 @@ export const logger = {
   },
 
   debug(scope: string, message: string): void {
-    if (isVerbose()) console.log(`[${scope}] ${message}`);
+    if (isVerbose()) console.log(formatLine(scope, message));
   },
 
   debugFields(scope: string, event: string, fields: LogFields): void {
@@ -56,7 +79,7 @@ export const logger = {
   },
 
   warn(scope: string, message: string): void {
-    console.warn(`[${scope}] ${message}`);
+    console.warn(formatLine(scope, message));
   },
 
   warnFields(scope: string, event: string, fields: LogFields): void {
@@ -64,7 +87,7 @@ export const logger = {
   },
 
   error(scope: string, message: string): void {
-    console.error(`[${scope}] ${message}`);
+    console.error(formatLine(scope, message));
   },
 
   errorFields(scope: string, event: string, fields: LogFields): void {
@@ -72,7 +95,7 @@ export const logger = {
   },
 
   security(message: string): void {
-    console.warn(`[security] ${message}`);
+    console.warn(formatLine('security', message));
   },
 
   securityFields(event: string, fields: LogFields): void {
