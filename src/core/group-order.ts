@@ -1,6 +1,7 @@
 import type { Storage } from '../storage/interface';
 import type { TVBoxSite } from './types';
 import { KV_GROUP_ORDER } from './config';
+import { logger } from './logger';
 
 export interface GroupOrderRule {
   name: string;
@@ -74,7 +75,7 @@ export function applyGroupOrder(sites: TVBoxSite[], cfg: GroupOrderConfig): TVBo
 
   const matchedCount = matched.length;
   const unmatchedCount = unmatched.length;
-  console.log(`[group-order] Applied: ${matchedCount} matched (${cfg.rules.length} rules), ${unmatchedCount} unmatched (position: ${cfg.unmatchedPosition})`);
+  logger.info('group-order', `Applied: ${matchedCount} matched (${cfg.rules.length} rules), ${unmatchedCount} unmatched (position: ${cfg.unmatchedPosition})`);
 
   return ordered;
 }

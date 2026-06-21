@@ -3,6 +3,7 @@
 import type { LiveSourceEntry, TVBoxLive } from './types';
 import type { Storage } from '../storage/interface';
 import { LIVE_PROXY_TTL } from './config';
+import { logger } from './logger';
 
 const LIVE_PREFIX = 'live:';
 
@@ -64,7 +65,7 @@ async function testLiveSource(
             /^.+,https?:\/\//m.test(text);
 
           if (!looksValid) {
-            console.log(`[live-source] ${entry.name}: content doesn't look like m3u/txt, keeping anyway`);
+            logger.info('live-source', `${entry.name}: content doesn't look like m3u/txt, keeping anyway`);
           }
         }
       } finally {
@@ -90,7 +91,7 @@ export async function batchTestLiveSources(
 ): Promise<{ passed: LiveSourceEntry[]; speedMap: Map<string, number> }> {
   if (entries.length === 0) return { passed: [], speedMap: new Map() };
 
-  console.log(`[live-source] Testing ${entries.length} live sources concurrently...`);
+  logger.info('live-source', `Testing ${entries.length} live sources concurrently...`);
 
   const results = await Promise.allSettled(
     entries.map((entry) => testLiveSource(entry, timeoutMs)),
@@ -104,11 +105,11 @@ export async function batchTestLiveSources(
       passed.push({ name: result.value.name, url: result.value.url });
       speedMap.set(result.value.url, result.value.speedMs);
     } else if (result.status === 'fulfilled') {
-      console.log(`[live-source] Dropped: ${result.value.name} (unreachable)`);
+      logger.info('live-source', `Dropped: ${result.value.name} (unreachable)`);
     }
   }
 
-  console.log(`[live-source] ${passed.length}/${entries.length} live sources reachable`);
+  logger.info('live-source', `${passed.length}/${entries.length} live sources reachable`);
   return { passed, speedMap };
 }
 
