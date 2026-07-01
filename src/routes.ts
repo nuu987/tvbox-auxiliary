@@ -17,6 +17,7 @@ import { createBlacklistRouter } from './routes/blacklist';
 import { createExportConfigRouter } from './routes/export-config';
 import { createConfigEditorRouter } from './routes/config-editor';
 import { createLiveSourcesRouter } from './routes/live-sources';
+import { createLogViewerRouter } from './routes/log-viewer';
 import { createMaccmsProxyRouter } from './routes/maccms-proxy';
 import { createJarProxyRouter } from './routes/jar-proxy';
 import { createRefreshRouter } from './routes/refresh';
@@ -56,6 +57,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route('/', createExportConfigRouter({ storage, config, runtime }));
   app.route('/', createConfigEditorRouter({ storage, config }));
   app.route('/', createLiveSourcesRouter({ storage, config }));
+  app.route('/', createLogViewerRouter({ storage, config }));
 
   // ─── Conditional proxy routes ─────────────────────────────
   if (config.localBaseUrl) {
