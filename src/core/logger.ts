@@ -2,6 +2,35 @@ const VERBOSE_TRUE = new Set(['1', 'true', 'yes', 'on']);
 
 export type LogFields = Record<string, unknown>;
 
+// Phase 6 VIEWER-02: sink 钩子结构化日志条目。
+// D-06: 每条缓冲条目存结构化对象 {ts, level, scope, message}，复用 formatTimestamp 产出。
+export type LogLevel = 'info' | 'warn' | 'error' | 'security' | 'debug';
+
+export interface LogEntry {
+  ts: string;
+  level: LogLevel;
+  scope: string;
+  message: string;
+}
+
+// D-05: sink 订阅机制——logger 内部维护订阅者 Set，subscribeLogSink 返回取消订阅函数。
+type LogSink = (entry: LogEntry) => void;
+const sinks = new Set<LogSink>();
+
+// 注册 sink 订阅者，返回取消订阅函数。log-buffer 模块加载时自动调用。
+export function subscribeLogSink(fn: LogSink): () => void {
+  sinks.add(fn);
+  return () => { sinks.delete(fn); };
+}
+
+// 遍历订阅者，每个回调独立 try/catch 包裹（T-06-sink: 一个订阅者异常不阻塞 logger 调用方）。
+// catch 块静默——不输出，防 sink→logger→sink 递归（Pitfall 1）。
+function emitSink(entry: LogEntry): void {
+  for (const fn of sinks) {
+    try { fn(entry); } catch { /* 静默：防递归与阻塞 */ }
+  }
+}
+
 export function isVerbose(): boolean {
   return VERBOSE_TRUE.has(String(process.env.VERBOSE || '').trim().toLowerCase());
 }
@@ -51,27 +80,39 @@ function formatTimestamp(): string {
   return `${Y}-${M}-${D} ${h}:${m}:${s}`;
 }
 
-// D-08: formatLine 私有函数统一拼接时间戳 + 条件 scope。
+// D-08: formatLineFromTs 私有函数统一拼接预计算时间戳 + 条件 scope。
 // D-05/D-06: VERBOSE=true 保留 [scope]，VERBOSE=false 移除 [scope]。
 // D-07: security 不例外，走同一逻辑。
+// 接收预计算 ts（D-06：避免 sink 和 console 各算一次时间戳，保证同一 ts）。
 // 不缓存 isVerbose() 结果——每次调用都读 env，避免 vi.stubEnv 测试间污染。
-function formatLine(scope: string, message: string): string {
-  const ts = formatTimestamp();
+function formatLineFromTs(ts: string, scope: string, message: string): string {
   if (isVerbose()) return `${ts} [${scope}] ${message}`;
   return `${ts} ${message}`;
 }
 
+// 保留 formatLine 兼容签名（内部先 formatTimestamp 再调 formatLineFromTs）。
+function formatLine(scope: string, message: string): string {
+  return formatLineFromTs(formatTimestamp(), scope, message);
+}
+
 export const logger = {
   info(scope: string, message: string): void {
-    console.log(formatLine(scope, message));
+    const ts = formatTimestamp();
+    emitSink({ ts, level: 'info', scope, message });
+    console.log(formatLineFromTs(ts, scope, message));
   },
 
   infoFields(scope: string, event: string, fields: LogFields): void {
     this.info(scope, `${event} ${formatFields(fields)}`.trim());
   },
 
+  // D-13/Pitfall 6: 严格顺序——if (!isVerbose()) return 必须在 emitSink 之前，
+  // VERBOSE=false 时直接 return，不构造 entry 不触发 sink（DEBUG gate）。
   debug(scope: string, message: string): void {
-    if (isVerbose()) console.log(formatLine(scope, message));
+    if (!isVerbose()) return;
+    const ts = formatTimestamp();
+    emitSink({ ts, level: 'debug', scope, message });
+    console.log(formatLineFromTs(ts, scope, message));
   },
 
   debugFields(scope: string, event: string, fields: LogFields): void {
@@ -79,7 +120,9 @@ export const logger = {
   },
 
   warn(scope: string, message: string): void {
-    console.warn(formatLine(scope, message));
+    const ts = formatTimestamp();
+    emitSink({ ts, level: 'warn', scope, message });
+    console.warn(formatLineFromTs(ts, scope, message));
   },
 
   warnFields(scope: string, event: string, fields: LogFields): void {
@@ -87,15 +130,20 @@ export const logger = {
   },
 
   error(scope: string, message: string): void {
-    console.error(formatLine(scope, message));
+    const ts = formatTimestamp();
+    emitSink({ ts, level: 'error', scope, message });
+    console.error(formatLineFromTs(ts, scope, message));
   },
 
   errorFields(scope: string, event: string, fields: LogFields): void {
     this.error(scope, `${event} ${formatFields(fields)}`.trim());
   },
 
+  // D-07: security 走同一 scope 逻辑（scope='security'），不例外。
   security(message: string): void {
-    console.warn(formatLine('security', message));
+    const ts = formatTimestamp();
+    emitSink({ ts, level: 'security', scope: 'security', message });
+    console.warn(formatLineFromTs(ts, 'security', message));
   },
 
   securityFields(event: string, fields: LogFields): void {
