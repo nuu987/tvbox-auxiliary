@@ -119,7 +119,7 @@ function toggleTheme() {
 // Phase 6 VIEWER-03 (Plan 03): streamSse — 浏览器侧 SSE 帧解析（fetch + getReader）。
 // D-11: 不用 EventSource（无法设 Authorization 头），用 fetch + ReadableStream 手动解析帧。
 // Pitfall 2: TextDecoder.decode(value, {stream:true}) 处理跨 chunk 的多字节 UTF-8（防中文乱码）。
-// 按 WHATWG HTML §9.2 SSE wire format 切帧：以 '\n\n' 分隔帧，每帧按行解析 'field: value'。
+// 按 WHATWG HTML §9.2 SSE wire format 切帧：以 '\\n\\n' 分隔帧，每帧按行解析 'field: value'。
 // 返回 { abort } handle 供调用方主动断开（abort 后的 AbortError 不触发 onError）。
 function streamSse(url, token, onMessage, onOpen, onError) {
   var controller = new AbortController();
@@ -143,7 +143,7 @@ function streamSse(url, token, onMessage, onOpen, onError) {
         if (r.done) break;
         // {stream:true} 处理跨 chunk 的多字节 UTF-8 字符（Pitfall 2，防中文乱码）
         buf += decoder.decode(r.value, { stream: true });
-        // 按 '\n\n' 切完整帧，半帧留 buf（per WHATWG HTML §9.2）
+        // 按 '\\n\\n' 切完整帧，半帧留 buf（per WHATWG HTML §9.2）
         var idx;
         while ((idx = buf.indexOf('\\n\\n')) >= 0) {
           var frame = buf.slice(0, idx);
