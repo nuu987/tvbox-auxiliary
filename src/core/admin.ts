@@ -211,6 +211,7 @@ ${sharedStyles}
     <div class="tab" data-tab="live" onclick="switchTab('live')"><span>直播</span> <span class="badge" id="badgeLive">0</span></div>
     <div class="tab" data-tab="searchQuota" onclick="switchTab('searchQuota')" id="tabSearchQuota" style="display:none"><span>搜索</span> <span class="badge" id="badgeSearchQuota">0</span></div>
     <div class="tab" data-tab="settings" onclick="switchTab('settings')"><span>设置</span></div>
+    <div class="tab" data-tab="logs" onclick="switchTab('logs')"><span>日志</span></div>
   </div>
 
   <!-- Sources Tab -->
@@ -438,6 +439,22 @@ ${sharedStyles}
     </div>
   </div>
 
+  <!-- Logs Tab (Phase 6 VIEWER-03 / Plan 03) -->
+  <div class="tab-panel" id="panelLogs">
+    <div class="section">
+      <div class="section-title">实时日志</div>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="logAutoScroll" checked>
+          <span>自动滚动</span>
+        </label>
+        <button class="btn btn-sm" id="logPauseBtn" onclick="toggleLogPause()">暂停</button>
+        <span class="status-text" id="logConnStatus" style="font-family:var(--mono);font-size:0.75rem">未连接</span>
+      </div>
+      <div id="logViewer" class="log-viewer"></div>
+    </div>
+  </div>
+
   <div class="footer">
     <span>TVBox Auxiliary</span>
   </div>
@@ -458,6 +475,10 @@ function switchTab(tab) {
     const id = 'panel' + tab.charAt(0).toUpperCase() + tab.slice(1);
     p.classList.toggle('active', p.id === id);
   });
+  // Phase 6 VIEWER-03 (Plan 03): logs tab SSE 生命周期管理（D-17）
+  // 切到 logs 时延迟初始化 SSE 连接，切走时主动 abort 释放（Pitfall 4 防泄漏）
+  if (tab === 'logs') startLogStream();
+  else if (logSseHandle) stopLogStream();
 }
 
 // --- Source health ---
@@ -1341,6 +1362,93 @@ async function triggerRefresh() {
     btn.textContent = "刷新";
     btn.className = 'btn btn-sm';
   }, 3000);
+}
+
+// --- Phase 6 VIEWER-03 (Plan 03): 实时日志 SSE 客户端 ---
+// D-13~D-18 锁定决策：不级别过滤 / DOM 500 / auto-scroll 底部跟随 / 暂停不断连 / tab 集成 / 布局
+// 端点路径 /admin/logs 与 Plan 02 D-09 一致；token 走 Authorization 头（D-11）
+let logSseHandle = null;
+let logPaused = false;
+let logPendingQueue = [];
+const LOG_DOM_MAX = 500;       // D-14: DOM 渲染上限
+const LOG_QUEUE_MAX = 500;     // D-16: 暂停内存暂存队列上限
+
+function startLogStream() {
+  if (logSseHandle) return; // 防重复连接
+  var statusEl = $('logConnStatus');
+  statusEl.textContent = '连接中...';
+  // D-11: streamSse 用 fetch + Authorization 头（不用 EventSource，无法设头）
+  logSseHandle = streamSse('/admin/logs', auth.getToken(),
+    function(data) { onLogEntry(data); },
+    function() { statusEl.textContent = '已连接'; },
+    function(err) {
+      statusEl.textContent = '已断开';
+      logSseHandle = null;
+      // 固定 3s 重连（仅当 logs 面板仍激活——切走时 stopLogStream 已置 logSseHandle=null）
+      setTimeout(function() {
+        if ($('panelLogs').classList.contains('active')) startLogStream();
+      }, 3000);
+    }
+  );
+}
+
+function stopLogStream() {
+  if (logSseHandle) { logSseHandle.abort(); logSseHandle = null; }
+  $('logConnStatus').textContent = '未连接';
+}
+
+function onLogEntry(data) {
+  // T-06-json-parse (V5 Input Validation): 畸形 JSON 静默跳过不崩溃
+  var entry;
+  try { entry = JSON.parse(data); } catch (e) { return; }
+  if (logPaused) {
+    // D-16: 暂停时进内存队列，超限丢最旧，SSE 不断
+    logPendingQueue.push(entry);
+    if (logPendingQueue.length > LOG_QUEUE_MAX) logPendingQueue.shift();
+    return;
+  }
+  appendLogLine(entry);
+}
+
+function appendLogLine(entry) {
+  var viewer = $('logViewer');
+  // D-15: 底部判定阈值 30px——上滚时不抢断 tail -f
+  var wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 30;
+  var line = document.createElement('div');
+  // 复用 Task 1 .log-line.log-* 样式（info/warn/error/security/debug）
+  line.className = 'log-line log-' + entry.level;
+  // D-18: 每行 ts level message 格式（scope 已隐含在 message 内或可后续追加）
+  line.textContent = entry.ts + ' ' + entry.level.toUpperCase().padEnd(8) + ' ' + entry.message;
+  viewer.appendChild(line);
+  // D-14: DOM 上限 500，超限丢最旧
+  while (viewer.children.length > LOG_DOM_MAX) {
+    viewer.removeChild(viewer.firstChild);
+  }
+  // D-15: 仅当已在底部且 auto-scroll 开启时跟随
+  if (wasAtBottom && $('logAutoScroll').checked) {
+    viewer.scrollTop = viewer.scrollHeight;
+  }
+}
+
+function toggleLogPause() {
+  logPaused = !logPaused;
+  $('logPauseBtn').textContent = logPaused ? '继续' : '暂停';
+  if (!logPaused) {
+    // D-16: 恢复时用 DocumentFragment 批量插入暂存队列（Anti-pattern 4 避免逐条 appendChild）
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < logPendingQueue.length; i++) {
+      var entry = logPendingQueue[i];
+      var line = document.createElement('div');
+      line.className = 'log-line log-' + entry.level;
+      line.textContent = entry.ts + ' ' + entry.level.toUpperCase().padEnd(8) + ' ' + entry.message;
+      frag.appendChild(line);
+    }
+    var viewer = $('logViewer');
+    viewer.appendChild(frag);
+    while (viewer.children.length > LOG_DOM_MAX) viewer.removeChild(viewer.firstChild);
+    if ($('logAutoScroll').checked) viewer.scrollTop = viewer.scrollHeight;
+    logPendingQueue = [];
+  }
 }
 
 applyTheme(getTheme());

@@ -116,4 +116,67 @@ function toggleTheme() {
   applyTheme(next);
 }
 
+// Phase 6 VIEWER-03 (Plan 03): streamSse — 浏览器侧 SSE 帧解析（fetch + getReader）。
+// D-11: 不用 EventSource（无法设 Authorization 头），用 fetch + ReadableStream 手动解析帧。
+// Pitfall 2: TextDecoder.decode(value, {stream:true}) 处理跨 chunk 的多字节 UTF-8（防中文乱码）。
+// 按 WHATWG HTML §9.2 SSE wire format 切帧：以 '\n\n' 分隔帧，每帧按行解析 'field: value'。
+// 返回 { abort } handle 供调用方主动断开（abort 后的 AbortError 不触发 onError）。
+function streamSse(url, token, onMessage, onOpen, onError) {
+  var controller = new AbortController();
+  var decoder = new TextDecoder();
+  var buf = '';
+
+  (async function() {
+    try {
+      var res = await fetch(url, {
+        headers: { Authorization: 'Bearer ' + token },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        onError(new Error('HTTP ' + res.status));
+        return;
+      }
+      if (onOpen) onOpen();
+      var reader = res.body.getReader();
+      while (true) {
+        var r = await reader.read();
+        if (r.done) break;
+        // {stream:true} 处理跨 chunk 的多字节 UTF-8 字符（Pitfall 2，防中文乱码）
+        buf += decoder.decode(r.value, { stream: true });
+        // 按 '\n\n' 切完整帧，半帧留 buf（per WHATWG HTML §9.2）
+        var idx;
+        while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+          var frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          // 解析帧：每行 'field: value'，跳过 ':' 注释行（heartbeat），合并多行 data
+          var dataLines = [];
+          var lines = frame.split('\\n');
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line.charAt(0) === ':') continue; // 注释/heartbeat 帧，忽略
+            var colonIdx = line.indexOf(':');
+            if (colonIdx < 0) continue;
+            var field = line.slice(0, colonIdx);
+            var val = line.slice(colonIdx + 1);
+            if (val.charAt(0) === ' ') val = val.slice(1); // spec: 冒号后可选空格
+            if (field === 'data') dataLines.push(val);
+            // event/id/retry 字段本方案不用（D-13 统一 data JSON），忽略
+          }
+          if (dataLines.length > 0) {
+            onMessage(dataLines.join('\\n'));
+          }
+        }
+      }
+      // 流正常结束（服务器关闭）——视为断开，触发重连
+      onError(new Error('stream ended'));
+    } catch (e) {
+      // 主动 abort（AbortError）不触发 onError，避免断开时误触发重连
+      if (e && e.name === 'AbortError') return;
+      onError(e);
+    }
+  })();
+
+  return { abort: function() { controller.abort(); } };
+}
+
 `;
