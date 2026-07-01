@@ -700,4 +700,40 @@ body::before{
   0%{background-position:200% 0}
   100%{background-position:-200% 0}
 }
+
+/* Phase 6 VIEWER-03 (Plan 03): 日志查看器样式 */
+/* D-18: level 颜色映射——info 默认色、warn 琥珀、error 红、security 独立色（蓝，无 --purple）、debug dim */
+.log-line{
+  padding:1px 0;
+  line-height:1.4;
+}
+.log-line.log-info{
+  color:var(--text);
+}
+.log-line.log-warn{
+  color:var(--amber);
+}
+.log-line.log-error{
+  color:var(--red);
+}
+.log-line.log-security{
+  color:var(--blue);
+}
+.log-line.log-debug{
+  color:var(--text-dim);
+}
+
+/* 日志滚动区容器（per RESEARCH.md Example 3） */
+.log-viewer{
+  font-family:var(--mono);
+  font-size:0.75rem;
+  background:var(--bg);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:8px;
+  height:500px;
+  overflow-y:auto;
+  white-space:pre-wrap;
+  word-break:break-all;
+}
 `;
