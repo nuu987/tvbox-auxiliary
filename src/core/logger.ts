@@ -80,26 +80,23 @@ function formatTimestamp(): string {
   return `${Y}-${M}-${D} ${h}:${m}:${s}`;
 }
 
-// D-08: formatLineFromTs 私有函数统一拼接预计算时间戳 + 条件 scope。
+// D-08: formatLineFromTs 私有函数统一拼接预计算时间戳 + level 标签 + 条件 scope。
 // D-05/D-06: VERBOSE=true 保留 [scope]，VERBOSE=false 移除 [scope]。
 // D-07: security 不例外，走同一逻辑。
 // 接收预计算 ts（D-06：避免 sink 和 console 各算一次时间戳，保证同一 ts）。
 // 不缓存 isVerbose() 结果——每次调用都读 env，避免 vi.stubEnv 测试间污染。
-function formatLineFromTs(ts: string, scope: string, message: string): string {
-  if (isVerbose()) return `${ts} [${scope}] ${message}`;
-  return `${ts} ${message}`;
-}
-
-// 保留 formatLine 兼容签名（内部先 formatTimestamp 再调 formatLineFromTs）。
-function formatLine(scope: string, message: string): string {
-  return formatLineFromTs(formatTimestamp(), scope, message);
+// 2026-07-02: 新增 level 参数，padEnd(8) 对齐网页日志格式（排除 ANSI 着色）。
+function formatLineFromTs(ts: string, level: string, scope: string, message: string): string {
+  const label = level.padEnd(8);
+  if (isVerbose()) return `${ts} ${label} [${scope}] ${message}`;
+  return `${ts} ${label} ${message}`;
 }
 
 export const logger = {
   info(scope: string, message: string): void {
     const ts = formatTimestamp();
     emitSink({ ts, level: 'info', scope, message });
-    console.log(formatLineFromTs(ts, scope, message));
+    console.log(formatLineFromTs(ts, 'INFO', scope, message));
   },
 
   infoFields(scope: string, event: string, fields: LogFields): void {
@@ -112,7 +109,7 @@ export const logger = {
     if (!isVerbose()) return;
     const ts = formatTimestamp();
     emitSink({ ts, level: 'debug', scope, message });
-    console.log(formatLineFromTs(ts, scope, message));
+    console.log(formatLineFromTs(ts, 'DEBUG', scope, message));
   },
 
   debugFields(scope: string, event: string, fields: LogFields): void {
@@ -122,7 +119,7 @@ export const logger = {
   warn(scope: string, message: string): void {
     const ts = formatTimestamp();
     emitSink({ ts, level: 'warn', scope, message });
-    console.warn(formatLineFromTs(ts, scope, message));
+    console.warn(formatLineFromTs(ts, 'WARN', scope, message));
   },
 
   warnFields(scope: string, event: string, fields: LogFields): void {
@@ -132,7 +129,7 @@ export const logger = {
   error(scope: string, message: string): void {
     const ts = formatTimestamp();
     emitSink({ ts, level: 'error', scope, message });
-    console.error(formatLineFromTs(ts, scope, message));
+    console.error(formatLineFromTs(ts, 'ERROR', scope, message));
   },
 
   errorFields(scope: string, event: string, fields: LogFields): void {
@@ -143,7 +140,7 @@ export const logger = {
   security(message: string): void {
     const ts = formatTimestamp();
     emitSink({ ts, level: 'security', scope: 'security', message });
-    console.warn(formatLineFromTs(ts, 'security', message));
+    console.warn(formatLineFromTs(ts, 'SECURITY', 'security', message));
   },
 
   securityFields(event: string, fields: LogFields): void {
