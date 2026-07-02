@@ -7,6 +7,12 @@ import type { TVBoxConfig, SourcedConfig, SourceEntry, SourceFetchResult, ParseV
 
 const MAX_MULTI_REPO_DEPTH = 3; // 多仓最大展开深度
 
+// Phase 7 同步失败重试机制：逐源失败重试 + 串行化（D-01 ~ D-11）
+// D-04 口径：首轮失败后重试 3 次（exhausted 场景共 4 次 fetch 调用）
+const MAX_RETRY_ATTEMPTS = 3; // 首轮失败后的最大重试次数
+const RETRY_BACKOFF_MS = [5000, 10000, 20000]; // D-04 指数退避档位 5s/10s/20s
+const RETRY_JITTER = 0.2; // D-04 ±20% jitter 系数，防多源节奏整齐对远端聚集
+
 export interface FetchConfigsResult {
   configs: SourcedConfig[];
   fetchResults: SourceFetchResult[];
@@ -78,71 +84,52 @@ async function expandSources(
     });
   });
 
-  const results = await Promise.allSettled(
-    uniqueSources.map((source) => fetchSingleConfig(source, timeoutMs, proxyConfig, depth)),
-  );
-
+  // D-08: 串行化逐源拉取（有意偏离 CLAUDE.md 'Promise.allSettled for 批量部分失败' 约定——
+  // 仅此调用点改为串行，CLAUDE.md 约定不全局废弃，见 CONTEXT.md D-08）。
+  // 串行 + 重试使同时只有 1 源在拉取/重试，避免多源重试风暴对同一远端聚集（T-07-02）。
   const multiRepoChildren: SourceEntry[] = [];
 
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
-    const source = uniqueSources[i];
-    if (result.status === 'fulfilled' && result.value) {
-      const { config: fetchedConfig, fetchResult } = result.value;
-      fetchResults.push(fetchResult);
+  for (const source of uniqueSources) {
+    const { config: fetchedConfig, fetchResult } = await fetchSingleConfig(source, timeoutMs, proxyConfig, depth);
+    fetchResults.push(fetchResult);
 
-      if (fetchResult.status !== 'ok') {
-        // 失败的，已记录到 fetchResults，跳过
-        continue;
-      }
+    if (fetchResult.status !== 'ok') {
+      // 失败已记录到 fetchResults（含重试耗尽场景），跳过多仓展开
+      continue;
+    }
 
-      if (isMultiRepoConfig(fetchedConfig!)) {
-        const children = extractMultiRepoEntries(fetchedConfig!, fetchResult.name);
-        logger.debugFields('fetcher', 'multi-repo-detected', {
+    if (isMultiRepoConfig(fetchedConfig!)) {
+      const children = extractMultiRepoEntries(fetchedConfig!, fetchResult.name);
+      logger.debugFields('fetcher', 'multi-repo-detected', {
+        parent: source.name,
+        url: source.url,
+        depth,
+        children: children.length,
+      });
+      children.forEach((child, childIndex) => {
+        logger.debugFields('fetcher', 'multi-repo-child', {
+          parent: source.name,
+          index: childIndex + 1,
+          name: child.name,
+          url: child.url,
+        });
+      });
+      if (depth < MAX_MULTI_REPO_DEPTH) {
+        multiRepoChildren.push(...children);
+      } else {
+        logger.debugFields('fetcher', 'multi-repo-max-depth', {
           parent: source.name,
           url: source.url,
           depth,
-          children: children.length,
-        });
-        children.forEach((child, childIndex) => {
-          logger.debugFields('fetcher', 'multi-repo-child', {
-            parent: source.name,
-            index: childIndex + 1,
-            name: child.name,
-            url: child.url,
-          });
-        });
-        if (depth < MAX_MULTI_REPO_DEPTH) {
-          multiRepoChildren.push(...children);
-        } else {
-          logger.debugFields('fetcher', 'multi-repo-max-depth', {
-            parent: source.name,
-            url: source.url,
-            depth,
-            maxDepth: MAX_MULTI_REPO_DEPTH,
-          });
-        }
-      } else {
-        configs.push({
-          sourceUrl: source.url,
-          sourceName: source.name,
-          config: fetchedConfig!,
-          speedMs: fetchResult.speedMs,
+          maxDepth: MAX_MULTI_REPO_DEPTH,
         });
       }
-    } else if (result.status === 'rejected') {
-      logger.warnFields('fetcher', 'source-failed', {
-        name: source.name,
-        url: source.url,
-        depth,
-        status: classifyNetworkError(result.reason),
-        error: result.reason,
-      });
-      fetchResults.push({
-        url: source.url,
-        name: source.name,
-        status: classifyNetworkError(result.reason),
-        errorMessage: classifyNetworkErrorMessage(result.reason),
+    } else {
+      configs.push({
+        sourceUrl: source.url,
+        sourceName: source.name,
+        config: fetchedConfig!,
+        speedMs: fetchResult.speedMs,
       });
     }
   }
@@ -159,9 +146,22 @@ interface SingleFetchResult {
 }
 
 /**
- * 获取单个配置 JSON，返回结构化结果（成功或失败原因）
+ * 退避 sleep 工具：baseMs ± RETRY_JITTER 比例抖动（D-04 ±20% jitter）。
+ * Math.random 运行时可用（CLAUDE.md 禁令仅针对 workflow scripts）。
  */
-async function fetchSingleConfig(
+function sleepWithJitter(baseMs: number): Promise<void> {
+  const offset = baseMs * RETRY_JITTER * (2 * Math.random() - 1); // ±baseMs*0.2
+  const delay = Math.round(baseMs + offset);
+  return new Promise(resolve => setTimeout(resolve, delay));
+}
+
+/**
+ * 获取单个配置 JSON（不重试）——从原 fetchSingleConfig 体抽取的内层核心拉取函数。
+ * 双 UA 回退 + 边缘代理回退逻辑全部保留不变。
+ * 内部已 try/catch 返回结构化 SingleFetchResult，永不 reject。
+ * 模块私有不 export——重试包装器调用之避免递归（Pitfall 1）。
+ */
+async function fetchSingleConfigNoRetry(
   source: SourceEntry,
   timeoutMs: number,
   proxyConfig?: FetchProxyConfig,
@@ -205,6 +205,61 @@ async function fetchSingleConfig(
     });
   }
 
+  return result;
+}
+
+/**
+ * 获取单个配置 JSON，返回结构化结果（成功或失败原因）
+ *
+ * Phase 7 重试包装器：首轮失败后按 RETRY_BACKOFF_MS=[5s,10s,20s] + ±20% jitter 重试
+ * MAX_RETRY_ATTEMPTS=3 次（D-04 口径：exhausted 场景共 4 次 fetch 调用 = 首轮 1 + 重试 3）。
+ *
+ * 触发判据：status !== 'ok'（D-02，含 timeout/parse_error/http_404 等全部 fail/warn 子类型——
+ * D-03 不区分瞬时 vs 确定性错误，Q5 有意偏离 downloadResource 的 AbortError 不重试守卫）。
+ *
+ * 日志事件（D-10，通过 emitSink → log-buffer → Phase 6 /admin/logs SSE 实时可见）：
+ * - source-retry-attempt: 每次重试前发出，字段含 attempt/reason
+ * - source-retry-recovered: 重试成功时发出
+ * - source-retry-exhausted: 重试耗尽时发出
+ *
+ * 关键设计（Pitfall 1/2）：重试包装器只调 fetchSingleConfigNoRetry，永不调自身（避免无限递归）；
+ * 每次 attempt 的 AbortController 由 fetchWithUA/fetchViaProxy 内部各自新建，跨 attempt 不复用。
+ */
+async function fetchSingleConfig(
+  source: SourceEntry,
+  timeoutMs: number,
+  proxyConfig?: FetchProxyConfig,
+  depth = 0,
+): Promise<SingleFetchResult> {
+  let result = await fetchSingleConfigNoRetry(source, timeoutMs, proxyConfig, depth);
+  if (result.fetchResult.status === 'ok') return result;
+
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    logger.infoFields('fetcher', 'source-retry-attempt', {
+      name: source.name,
+      url: source.url,
+      attempt,
+      reason: result.fetchResult.errorMessage || result.fetchResult.status,
+    });
+    await sleepWithJitter(RETRY_BACKOFF_MS[attempt - 1]);
+    result = await fetchSingleConfigNoRetry(source, timeoutMs, proxyConfig, depth);
+    if (result.fetchResult.status === 'ok') {
+      logger.infoFields('fetcher', 'source-retry-recovered', {
+        name: source.name,
+        url: source.url,
+        attempt,
+        recovered: true,
+      });
+      return result;
+    }
+  }
+
+  logger.infoFields('fetcher', 'source-retry-exhausted', {
+    name: source.name,
+    url: source.url,
+    attempts: MAX_RETRY_ATTEMPTS,
+    finalReason: result.fetchResult.errorMessage || result.fetchResult.status,
+  });
   return result;
 }
 
