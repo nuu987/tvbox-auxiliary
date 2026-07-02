@@ -235,13 +235,17 @@ async function fetchSingleConfig(
   if (result.fetchResult.status === 'ok') return result;
 
   for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    // 退避基准值：jitter 前的固定档位（5s/10s/20s），同时用于日志展示与 sleepWithJitter 入参，
+    // 保证用户在 /admin/logs 看到的 backoffMs 与实际 sleep 同源（jitter 仅作用于实际 sleep）。
+    const backoffMs = RETRY_BACKOFF_MS[attempt - 1];
     logger.infoFields('fetcher', 'source-retry-attempt', {
       name: source.name,
       url: source.url,
       attempt,
       reason: result.fetchResult.errorMessage || result.fetchResult.status,
+      backoffMs,
     });
-    await sleepWithJitter(RETRY_BACKOFF_MS[attempt - 1]);
+    await sleepWithJitter(backoffMs);
     result = await fetchSingleConfigNoRetry(source, timeoutMs, proxyConfig, depth);
     if (result.fetchResult.status === 'ok') {
       logger.infoFields('fetcher', 'source-retry-recovered', {
