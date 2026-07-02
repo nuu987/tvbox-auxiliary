@@ -448,7 +448,6 @@ ${sharedStyles}
           <input type="checkbox" id="logAutoScroll" checked>
           <span>自动滚动</span>
         </label>
-        <button class="btn btn-sm" id="logPauseBtn" onclick="toggleLogPause()">暂停</button>
         <span class="status-text" id="logConnStatus" style="font-family:var(--mono);font-size:0.75rem">未连接</span>
       </div>
       <div id="logViewer" class="log-viewer"></div>
@@ -1365,13 +1364,10 @@ async function triggerRefresh() {
 }
 
 // --- Phase 6 VIEWER-03 (Plan 03): 实时日志 SSE 客户端 ---
-// D-13~D-18 锁定决策：不级别过滤 / DOM 500 / auto-scroll 底部跟随 / 暂停不断连 / tab 集成 / 布局
+// D-13~D-18 锁定决策：不级别过滤 / DOM 500 / auto-scroll 底部跟随 / 持续实时流 / tab 集成 / 布局
 // 端点路径 /admin/logs 与 Plan 02 D-09 一致；token 走 Authorization 头（D-11）
 let logSseHandle = null;
-let logPaused = false;
-let logPendingQueue = [];
 const LOG_DOM_MAX = 500;       // D-14: DOM 渲染上限
-const LOG_QUEUE_MAX = 500;     // D-16: 暂停内存暂存队列上限
 
 function startLogStream() {
   if (logSseHandle) return; // 防重复连接
@@ -1401,12 +1397,6 @@ function onLogEntry(data) {
   // T-06-json-parse (V5 Input Validation): 畸形 JSON 静默跳过不崩溃
   var entry;
   try { entry = JSON.parse(data); } catch (e) { return; }
-  if (logPaused) {
-    // D-16: 暂停时进内存队列，超限丢最旧，SSE 不断
-    logPendingQueue.push(entry);
-    if (logPendingQueue.length > LOG_QUEUE_MAX) logPendingQueue.shift();
-    return;
-  }
   appendLogLine(entry);
 }
 
@@ -1430,26 +1420,6 @@ function appendLogLine(entry) {
   }
 }
 
-function toggleLogPause() {
-  logPaused = !logPaused;
-  $('logPauseBtn').textContent = logPaused ? '继续' : '暂停';
-  if (!logPaused) {
-    // D-16: 恢复时用 DocumentFragment 批量插入暂存队列（Anti-pattern 4 避免逐条 appendChild）
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i < logPendingQueue.length; i++) {
-      var entry = logPendingQueue[i];
-      var line = document.createElement('div');
-      line.className = 'log-line log-' + entry.level;
-      line.textContent = entry.ts + ' ' + entry.level.toUpperCase().padEnd(8) + ' ' + entry.message;
-      frag.appendChild(line);
-    }
-    var viewer = $('logViewer');
-    viewer.appendChild(frag);
-    while (viewer.children.length > LOG_DOM_MAX) viewer.removeChild(viewer.firstChild);
-    if ($('logAutoScroll').checked) viewer.scrollTop = viewer.scrollHeight;
-    logPendingQueue = [];
-  }
-}
 
 applyTheme(getTheme());
 </script>
