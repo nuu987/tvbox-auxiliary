@@ -11,3 +11,12 @@ dev-log/
 .ace-tool/
 CLAUDE.md
 tmp/
+
+tests/
+SECURITY.md
+scripts/preflight.py
+scripts/session-log.sh
+scripts/statusline.sh
+scripts/verify-phase18-security.cjs
+scripts/verify-phase19-maintenance.cjs
+scripts/migrate-jars.ts
