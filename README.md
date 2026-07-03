@@ -1,6 +1,6 @@
 
 # TVBox Auxiliary
-A JSON Formatter & Automation Helper for TVBox
+A JSON Formatter & Automation Helper for TVBox  
 基于 https://gitee.com/tengxiaobao/tvbox-source-aggregator 二次开发，不考虑兼容性，专为容器版开发
 > ⚠️ 警告：本项目**纯使用** AI 辅助开发，不推荐也不应将此项目用于生产等环境中。  
 > ⚠️ 警告：本项目不提供也不存储任何影片资源与资产。
@@ -39,7 +39,7 @@ docker compose up -d
 ```
 
 ### 本地运行（仅供开发）
-前置依赖
+前置依赖  
 - Node.js 18+
 
 ```
