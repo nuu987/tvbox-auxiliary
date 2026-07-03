@@ -39,28 +39,15 @@ docker compose up -d
 ```
 
 ### 本地运行（仅供开发）
-
-```
-node scripts\start.js
-```
-
-#### 环境要求
-
-- Node.js 20+
-
-#### 配置变量
-
-使用模板文件
+前置依赖
+- Node.js 18+
 
 ```
 cp .env.example .env
+node scripts\start.js
 ```
 
-- `ADMIN_TOKEN`：管理密码，建议更改，否则您可能会面临安全隐患
-- `PORT`：默认 `5678`
-- `BASE_URL`：服务对外可达地址，留空则自动检测局域网 IP。
-- `CRON_SCHEDULE`：自动聚合 cron 表达式，留空禁用。
-- `VERBOSE`：`true/1/yes/on` 开启 debug 日志。
+
 
 ## LICENSE
 MIT LICENSE

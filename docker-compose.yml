@@ -7,9 +7,12 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      - "ADMIN_TOKEN=test123" # 管理密码
-      - "BASE_URL="  # Docker 部署建议填写，如 http://192.168.1.100:5678，不填则需要开启设置中的智能响应
-      - "CRON_SCHEDULE=0 5 * * *" #预设自动聚合时间
+      #
+      # 使用 env 或手动在此设定，二选一
+      #
+      # - "ADMIN_TOKEN=test123" # 管理密码
+      # - "BASE_URL="  # Docker 部署建议填写，如 http://192.168.1.100:5678，不填则需要开启设置中的智能响应
+      # - "CRON_SCHEDULE=0 5 * * *" #预设自动聚合时间
 
       # - REFRESH_TOKEN=${REFRESH_TOKEN:-} # 独立设置刷新接口访问令牌，一般不用
       #
