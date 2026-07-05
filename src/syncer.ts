@@ -451,87 +451,53 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     logger.info('sync', 'Step 6: No sites to test');
   }
 
-  // Step 6.5: 直播源频道级合并（方案 D+）
-  logger.info('sync', 'Step 6.5: Channel-level live merging...');
+  // Step 6.5: 直播源处理（保持 FongMi 格式，不做频道合并）
+  logger.info('sync', 'Step 6.5: Live sources (FongMi format, no channel merging)');
   {
-    // 检查直播功能禁用开关
     const liveDisabledRaw = await storage.get(LIVE_DISABLED);
     const liveDisabled = liveDisabledRaw !== 'false';
     if (liveDisabled) {
-      logger.info('sync', 'Step 6.5: live_disabled=true, skipping live merge and clearing lives');
+      logger.info('sync', 'Step 6.5: live_disabled=true, clearing lives');
       merged.lives = [];
     } else {
-    const liveInputs: LiveSourceInput[] = [];
+      const fongMiLives: Array<{ name: string; type: number; url: string; ua?: string; header?: Record<string, string> }> = [];
+      const seen = new Set<string>();
 
-    // 配置源合并来的 lives（FongMi 格式）
-    for (const l of (merged.lives || []) as Array<{ name?: string; url?: string; api?: string; ua?: string; header?: Record<string, string>; group?: string }>) {
-      // 跳过已经是 Native 格式的（含 group 字段无 url）
-      if (l.group && !l.url && !l.api) continue;
-      const u = l.url || l.api;
-      if (!u || !/^https?:\/\//i.test(u)) continue;
-      if (u.includes('127.0.0.1') || u.includes('localhost')) continue;
-      liveInputs.push({
-        name: l.name || 'source',
-        url: u,
-        ua: l.ua,
-        header: l.header,
-      });
-    }
-
-    // admin 手动源
-    const liveRaw = await storage.get(LIVE_SOURCES);
-    if (liveRaw) {
-      try {
-        const manual: Array<{ name: string; url: string }> = JSON.parse(liveRaw);
-        for (const m of manual) {
-          if (!m.url || !/^https?:\/\//i.test(m.url)) continue;
-          if (m.url.includes('127.0.0.1') || m.url.includes('localhost')) continue;
-          liveInputs.push({ name: m.name || 'manual', url: m.url });
-        }
-      } catch {
-        /* ignore */
+      // 配置源合并来的 lives（保持 FongMi 格式）
+      for (const l of (merged.lives || []) as Array<{ name?: string; url?: string; api?: string; type?: number; ua?: string; header?: Record<string, string>; group?: string }>) {
+        if (l.group && !l.url && !l.api) continue; // 跳过 Native 格式
+        const u = l.url || l.api;
+        if (!u || !/^https?:\/\//i.test(u)) continue;
+        if (u.includes('127.0.0.1') || u.includes('localhost')) continue;
+        if (seen.has(u)) continue;
+        seen.add(u);
+        fongMiLives.push({
+          name: l.name || 'source',
+          type: l.type ?? 0,
+          url: u,
+          ua: l.ua,
+          header: l.header,
+        });
       }
+
+      // admin 手动源
+      const liveRaw = await storage.get(LIVE_SOURCES);
+      if (liveRaw) {
+        try {
+          const manual: Array<{ name: string; url: string }> = JSON.parse(liveRaw);
+          for (const m of manual) {
+            if (!m.url || !/^https?:\/\//i.test(m.url)) continue;
+            if (m.url.includes('127.0.0.1') || m.url.includes('localhost')) continue;
+            if (seen.has(m.url)) continue;
+            seen.add(m.url);
+            fongMiLives.push({ name: m.name || 'manual', type: 0, url: m.url });
+          }
+        } catch { /* ignore */ }
+      }
+
+      merged.lives = fongMiLives as any;
+      logger.infoFields('sync', 'live-sources-kept', { count: fongMiLives.length });
     }
-
-    // URL 去重
-    const seen = new Set<string>();
-    const uniqueInputs = liveInputs.filter((i) => {
-      if (seen.has(i.url)) return false;
-      seen.add(i.url);
-      return true;
-    });
-
-    if (uniqueInputs.length === 0) {
-      logger.info('sync', 'Step 6.5: No live sources to merge');
-      merged.lives = [];
-    } else {
-      logger.infoFields('sync', 'live-merge-inputs', { unique: uniqueInputs.length });
-      uniqueInputs.forEach((input, index) => logger.infoFields('sync', 'live-source', {
-        index: index + 1,
-        name: input.name,
-        url: input.url,
-        ua: input.ua ? 'present' : 'none',
-        header: input.header ? 'present' : 'none',
-      }));
-
-      // 加载频道级测速缓存（仅 Node/Docker 有）
-      const channelSpeedMap = await loadChannelSpeedMap(storage);
-
-      const mergeResult = await mergeLivesToNative(uniqueInputs, config.fetchTimeoutMs, channelSpeedMap);
-      merged.lives = mergeResult.groups;
-
-      // 保存合并树供 channel-probe 使用
-      await storage.put(CHANNEL_MERGED_TREE, JSON.stringify(mergeResult.groups));
-
-      logger.infoFields('sync', 'live-merge-complete', {
-        sourcesDownloaded: mergeResult.sourcesDownloaded,
-        sourcesTotal: uniqueInputs.length,
-        groups: mergeResult.groups.length,
-        channels: mergeResult.totalChannels,
-        urls: mergeResult.totalUrls,
-      });
-    }
-    } // end of else (liveDisabled=false)
   }
 
   // Step 6.8: Build JAR URL → source index map
