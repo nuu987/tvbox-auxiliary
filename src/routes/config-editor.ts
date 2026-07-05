@@ -5,7 +5,7 @@ import { adminAuthMiddleware } from './admin-auth';
 import { siteFingerprint, loadBlacklist } from '../core/blacklist';
 import { applyBaseUrlPlaceholder } from '../core/base-url';
 import { classifyStatus } from '../core/status-classifier';
-import { MERGED_CONFIG_FULL, MERGED_CONFIG, LIVE_DISABLED, SOURCE_HEALTH } from '../core/config';
+import { MERGED_CONFIG_FULL, MERGED_CONFIG, LIVE_DISABLED, LIVE_SOURCES, SOURCE_HEALTH } from '../core/config';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceHealthRecord, TVBoxConfig } from '../core/types';
 
@@ -73,10 +73,26 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
       blocked: parseSet.has(p.url),
     }));
 
-    const lives = (parsed.lives || []).map(l => ({
-      ...l,
-      blocked: liveSet.has(l.url || l.api || ''),
-    }));
+    // 合并配置源 lives + 手动添加的直播源
+    const configLives = (parsed.lives || []).map((l: any) => {
+      const url = l.url || l.api || '';
+      return { ...l, blocked: liveSet.has(url) };
+    });
+    const manualLiveRaw = await storage.get(LIVE_SOURCES);
+    if (manualLiveRaw) {
+      try {
+        const manualParsed = JSON.parse(manualLiveRaw);
+        if (Array.isArray(manualParsed)) {
+          const existingUrls = new Set(configLives.map((l: any) => l.url || l.api || ''));
+          for (const m of manualParsed) {
+            if (m.url && !existingUrls.has(m.url)) {
+              configLives.push({ ...m, blocked: liveSet.has(m.url) });
+            }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    const lives = configLives;
 
     const liveDisabledRaw = await storage.get(LIVE_DISABLED);
     const liveDisabled = liveDisabledRaw !== 'false';
