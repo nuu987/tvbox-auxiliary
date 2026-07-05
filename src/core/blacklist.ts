@@ -358,14 +358,18 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
     filtered.lives = [];
   } else {
     // 直播启用时：MERGED_CONFIG_FULL 在 Step 4.5 保存，不含 Step 6.5 才加入的手动直播源
-    // 从当前 MERGED_CONFIG 恢复 lives（含手动源），避免 patch 时丢失
+    // 从当前 MERGED_CONFIG 恢复 lives（含手动源），并过滤黑名单
     const currentRaw = await storage.get(MERGED_CONFIG);
     if (currentRaw) {
       try {
         const current: TVBoxConfig = JSON.parse(currentRaw);
         if (Array.isArray(current.lives) && current.lives.length > 0) {
-          filtered.lives = current.lives;
-          logger.infoFields('blacklist', 'patchMergedConfig: preserved lives from MERGED_CONFIG', { count: current.lives.length });
+          const liveBlockSet = new Set(blacklist.lives);
+          filtered.lives = (current.lives as any[]).filter((l: any) => {
+            const url = l.url || l.api || '';
+            return !url || !liveBlockSet.has(url);
+          });
+          logger.infoFields('blacklist', 'patchMergedConfig: preserved lives from MERGED_CONFIG', { count: current.lives.length, blocked: current.lives.length - filtered.lives.length });
         }
       } catch { /* ignore parse error */ }
     }
@@ -401,6 +405,7 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
 export async function pruneBlacklist(
   blacklist: Blacklist,
   currentConfig: TVBoxConfig,
+  extraLiveUrls: string[] = [],
 ): Promise<Blacklist> {
   // 收集当前所有 site fingerprint
   const currentSiteFps = new Set<string>();
@@ -411,10 +416,13 @@ export async function pruneBlacklist(
   // 收集当前所有 parse url
   const currentParseUrls = new Set((currentConfig.parses || []).map(p => p.url));
 
-  // 收集当前所有 live url
+  // 收集当前所有 live url（含配置源 + 手动添加的直播源）
   const currentLiveUrls = new Set(
     (currentConfig.lives || []).map(l => l.url || l.api || '').filter(Boolean),
   );
+  for (const u of extraLiveUrls) {
+    if (u) currentLiveUrls.add(u);
+  }
 
   const prunedSites = blacklist.sites.filter(fp => currentSiteFps.has(fp));
   const prunedParses = blacklist.parses.filter(url => currentParseUrls.has(url));
