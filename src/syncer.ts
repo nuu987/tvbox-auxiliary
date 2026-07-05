@@ -311,7 +311,16 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   if (hasBlacklist) {
     // 自动清理黑名单中已不存在的条目（必须在过滤前比对，否则被屏蔽的条目会被误判为"过时"而清掉）
-    const pruned = await pruneBlacklist(blacklist, merged);
+    // 手动添加的直播源在 Step 6.5 才加入 merged.lives，此处需额外读入手动源 URL，避免其黑名单条目被误删
+    let manualLiveUrls: string[] = [];
+    const manualLiveRaw = await storage.get(LIVE_SOURCES);
+    if (manualLiveRaw) {
+      try {
+        const manualParsed: Array<{ url: string }> = JSON.parse(manualLiveRaw);
+        manualLiveUrls = manualParsed.map(m => m.url).filter(Boolean);
+      } catch { /* ignore */ }
+    }
+    const pruned = await pruneBlacklist(blacklist, merged, manualLiveUrls);
     if (JSON.stringify(pruned) !== JSON.stringify(blacklist)) {
       await saveBlacklist(storage, pruned);
       logger.infoFields('sync', 'blacklist-pruned', {
@@ -480,15 +489,18 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
         });
       }
 
-      // admin 手动源
+      // admin 手动源（过滤黑名单）
       const liveRaw = await storage.get(LIVE_SOURCES);
       if (liveRaw) {
         try {
           const manual: Array<{ name: string; url: string }> = JSON.parse(liveRaw);
+          const bl = await loadBlacklist(storage);
+          const liveBlockSet = new Set(bl.lives);
           for (const m of manual) {
             if (!m.url || !/^https?:\/\//i.test(m.url)) continue;
             if (m.url.includes('127.0.0.1') || m.url.includes('localhost')) continue;
             if (seen.has(m.url)) continue;
+            if (liveBlockSet.has(m.url)) continue;
             seen.add(m.url);
             fongMiLives.push({ name: m.name || 'manual', type: 0, url: m.url });
           }
