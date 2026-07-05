@@ -356,6 +356,19 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
   if (liveDisabled) {
     logger.info('blacklist', 'patchMergedConfig: live_disabled=true, clearing lives');
     filtered.lives = [];
+  } else {
+    // 直播启用时：MERGED_CONFIG_FULL 在 Step 4.5 保存，不含 Step 6.5 才加入的手动直播源
+    // 从当前 MERGED_CONFIG 恢复 lives（含手动源），避免 patch 时丢失
+    const currentRaw = await storage.get(MERGED_CONFIG);
+    if (currentRaw) {
+      try {
+        const current: TVBoxConfig = JSON.parse(currentRaw);
+        if (Array.isArray(current.lives) && current.lives.length > 0) {
+          filtered.lives = current.lives;
+          logger.infoFields('blacklist', 'patchMergedConfig: preserved lives from MERGED_CONFIG', { count: current.lives.length });
+        }
+      } catch { /* ignore parse error */ }
+    }
   }
 
   // Reapply JAR proxy URL rewrite with placeholder (mirrors sync Step 7)
