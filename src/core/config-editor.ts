@@ -349,6 +349,7 @@ ${sharedStyles}
   .item.has-source .item-label,
   .item.has-source > .item-title{flex-basis:100%}
   .item.has-source .item-api{flex:1;min-width:0}
+  .item.has-source .item-actions{margin-left:auto}
   .apply-bar,.batch-bar{font-size:0.65rem;padding:8px 12px;gap:8px}
   .apply-bar .btn,.batch-bar .btn{font-size:0.6rem;padding:4px 8px}
 }
