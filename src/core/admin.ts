@@ -1,5 +1,6 @@
 import { sharedStyles } from './shared-styles';
 import { sharedUi } from './shared-ui';
+import { footerHtml } from './shared-footer';
 
 export const adminHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -81,6 +82,11 @@ ${sharedStyles}
 .nt-textarea:focus{border-color:var(--green)}
 
 
+/* Complete operation diagnostics; no ellipsis or fixed-height clipping. */
+.source-operation-result{white-space:pre-wrap;overflow-wrap:anywhere;overflow:visible;min-width:0;margin-top:8px;font-size:0.8rem}
+.source-operation-result.error{color:var(--red)}
+.source-operation-result.success{color:var(--green)}
+
 /* Import textarea */
 .import-textarea{
   width:100%;
@@ -141,27 +147,27 @@ ${sharedStyles}
 
 .source-item{position:relative}
 
-.source-item .source-health-dot::after{
-  content:attr(data-tooltip);
-  position:absolute;
-  left:0;
-  bottom:calc(100% + 8px);
-  padding:6px 10px;
-  background:var(--surface-2);
-  border:1px solid var(--border);
-  border-radius:4px;
+#sourceList .source-status,
+#sourceList .source-reason,
+#sourceList .source-cache-time{
   font-family:var(--mono);
-  font-size:0.6rem;
-  color:var(--text);
-  white-space:nowrap;
-  pointer-events:none;
-  opacity:0;
-  transition:opacity 0.2s;
-  z-index:100;
+  font-size:0.7rem;
+  color:var(--text-dim);
 }
 
-.source-item:hover .source-health-dot::after{
-  opacity:1;
+#sourceList .source-info{
+  overflow:visible;
+}
+
+#sourceList .source-name,
+#sourceList .source-url,
+#sourceList .source-status,
+#sourceList .source-reason,
+#sourceList .source-cache-time{
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  overflow-wrap:anywhere;
 }
 
 @media(max-width:560px){
@@ -225,14 +231,15 @@ ${sharedStyles}
         <input class="name-input" type="text" id="addConfigKey" placeholder="Config Key (optional, for AES ECB)">
         <button class="btn" id="addBtn" onclick="addSource()">添加</button>
       </div>
+      <div id="addResult" class="source-operation-result" role="status" aria-live="polite"></div>
       <!-- Import (collapsible) -->
       <div class="collapsible-toggle" onclick="toggleCollapsible(this)">导入配置</div>
       <div class="collapsible-body">
         <textarea id="importInput" class="import-textarea" placeholder="粘贴 TVBox JSON 内容或 URL..."></textarea>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn btn-sm" id="importBtn" onclick="importConfig()">导入</button>
-          <span class="status-text" id="importResult" style="font-family:var(--mono);font-size:0.75rem"></span>
         </div>
+        <div id="importResult" class="source-operation-result" role="status" aria-live="polite"></div>
       </div>
     </div>
 
@@ -454,9 +461,7 @@ ${sharedStyles}
     </div>
   </div>
 
-  <div class="footer">
-    <span>TVBox Auxiliary</span>
-  </div>
+  ${footerHtml}
 </div>
 
 <script>
@@ -527,21 +532,30 @@ async function loadSources() {
     list.innerHTML = sources.map(s => {
       const h = healthMap[s.url];
       // Plan 03.1 D-10: 后端已分类，直接使用 h.status
-      const level = !h ? 'unknown'
+      const level = h && h.aggregation && h.aggregation.latest && h.aggregation.latest.reason ? 'error' : !h ? 'unknown'
         : h.status === 'ERR' ? 'error'
         : h.status === 'WARN' ? 'warn'
         : 'ok';
-      // Plan 03.1 D-12: tooltip 优先显示具体错误原因（lastFailReason），无则显示分类标签
-      // 修复：OK 状态下不展示历史 lastFailReason（写入层会保留作为历史档案）
-      const tip = !h ? "暂无数据"
-        : h.status === 'OK' ? h.status
-        : (h.lastFailReason || h.status);
+      const a = h && h.aggregation;
+      const latest = a && a.latest;
+      const saved = a && a.lastSuccessful;
+      const reason = (latest && latest.reason) || (h && h.status !== 'OK' && h.lastFailReason) || '';
+      const cached = !!(reason && latest && latest.mode === 'restored');
+      const status = !h ? '暂无数据'
+        : h.local ? (reason || h.status !== 'OK' ? '本地配置不可用' : '本地配置正常')
+        : h.status === 'OK' && reason ? '配置不可用（获取 OK）' : h.label || h.status;
+      const statusLine = '<div class="source-status">状态：' + esc(status) +
+        (h && !h.local && h.status !== 'OK' ? ' · 连续失败 ' + esc(String(h.consecutiveFailures || 0)) : '') + '</div>';
+      const reasonLine = reason ? '<div class="source-reason">原因：' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
+      const cacheTime = cached && saved && saved.fallbackApplied && saved.snapshotTime
+        ? '<div class="source-cache-time">已缓存的最后成功聚合时间：' + esc(saved.snapshotTime) + '</div>' : '';
 
       return \`<div class="source-item">
-        <span class="source-health-dot \${level}" data-tooltip="\${esc(tip)}"></span>
+        <span class="source-health-dot \${level}"></span>
         <div class="source-info">
           <div class="source-name">\${esc(s.name || 'Unnamed')}\${s.configKey ? ' 🔑' : ''}</div>
           <div class="source-url">\${esc(s.url)}</div>
+          \${statusLine}\${reasonLine}\${cacheTime}
         </div>
         <div class="source-actions">
           <button class="btn btn-sm btn-danger" onclick="removeSource('\${esc(s.url)}')">\${"删除"}</button>
@@ -553,41 +567,43 @@ async function loadSources() {
   }
 }
 
+// --- Final operation results ---
+function renderSourceImportResult(element, data) {
+  element.className = 'source-operation-result' + (data.error || data.outcome === 'none' ? ' error' : ' success');
+  if (data.error) { element.textContent = data.error; return; }
+  const lines = [(data.type === 'multi' ? '多仓导入' : '单仓检查') + '：新增 ' + data.added + '，重复 ' + data.duplicates + '，跳过 ' + (data.skipped || []).length];
+  for (const item of data.skipped || []) lines.push([item.name, item.url].filter(Boolean).join(' · ') + '：' + item.reason);
+  element.textContent = lines.join('\\n');
+}
 // --- Add source ---
 async function addSource() {
+  const btn = $('addBtn');
+  if (btn.disabled) return;
   const url = $('addUrl').value.trim();
   if (!url) { $('addUrl').focus(); return; }
   const name = $('addName').value.trim() || '';
   const configKey = $('addConfigKey').value.trim() || '';
-
-  const btn = $('addBtn');
-  btn.textContent = "添加中...";
+  const result = $('addResult');
+  btn.disabled = true;
+  btn.textContent = '检查中...';
   btn.className = 'btn loading';
-
+  result.className = 'source-operation-result';
+  result.textContent = '检查中，请等待完成';
   try {
-    const payload = { name, url };
-    if (configKey) payload.configKey = configKey;
     const res = await auth.authFetch('/admin/sources', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, url, configKey })
     });
     const d = await res.json();
-    if (res.ok) {
-      toast("源已添加");
-      $('addUrl').value = '';
-      $('addName').value = '';
-      $('addConfigKey').value = '';
+    renderSourceImportResult(result, res.ok ? d : { error: d.error || '添加失败' });
+    if (res.ok && d.added > 0) {
+      if (!(d.skipped || []).length) {
+        $('addUrl').value = ''; $('addName').value = ''; $('addConfigKey').value = '';
+      }
       loadSources();
-    } else {
-      toast(d.error || "加载源失败", 'error');
     }
-  } catch {
-    toast("网络错误", 'error');
-  }
-
-  btn.textContent = "添加";
-  btn.className = 'btn';
+  } catch { renderSourceImportResult(result, { error: '网络错误' }); }
+  finally { btn.disabled = false; btn.textContent = '添加'; btn.className = 'btn'; }
 }
 
 // --- Remove source ---
@@ -800,41 +816,28 @@ async function removeLive(url) {
 
 // --- Import Config ---
 async function importConfig() {
+  const btn = $('importBtn');
+  if (btn.disabled) return;
   const input = $('importInput').value.trim();
   if (!input) { $('importInput').focus(); return; }
-
-  const btn = $('importBtn');
   const result = $('importResult');
-  btn.textContent = "导入中...";
+  btn.disabled = true;
+  btn.textContent = '检查中...';
   btn.className = 'btn btn-sm loading';
-  result.textContent = '';
-
+  result.className = 'source-operation-result';
+  result.textContent = '检查中，请等待完成';
   try {
     const res = await auth.authFetch('/admin/sources/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input })
     });
     const d = await res.json();
-    if (res.ok) {
-      const typeLabel = d.type === 'multi' ? "检测到多仓" : "检测到单仓";
-      result.textContent = typeLabel + ': ' + d.added + ' ' + "已添加" + (d.duplicates > 0 ? ', ' + d.duplicates + ' ' + "重复跳过" : '');
-      result.className = 'status-text success';
-      if (d.added > 0) {
-        $('importInput').value = '';
-        loadSources();
-      }
-    } else {
-      result.textContent = d.error || "解析失败";
-      result.className = 'status-text error';
+    renderSourceImportResult(result, res.ok ? d : { error: d.error || '解析失败' });
+    if (res.ok && d.added > 0) {
+      if (!(d.skipped || []).length) $('importInput').value = '';
+      loadSources();
     }
-  } catch {
-    result.textContent = "网络错误";
-    result.className = 'status-text error';
-  }
-
-  btn.textContent = "导入";
-  btn.className = 'btn btn-sm';
+  } catch { renderSourceImportResult(result, { error: '网络错误' }); }
+  finally { btn.disabled = false; btn.textContent = '导入'; btn.className = 'btn btn-sm'; }
 }
 
 // --- Name Transform ---
@@ -1349,7 +1352,7 @@ async function triggerRefresh() {
     const d = await res.json();
     if (d.success) {
       toast("同步已开始");
-      setTimeout(() => loadSourceHealth(), 3000);
+      setTimeout(() => { loadSourceHealth(); loadSources(); }, 3000);
     } else {
       toast("刷新失败", 'error');
     }

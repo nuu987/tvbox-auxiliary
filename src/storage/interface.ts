@@ -3,6 +3,8 @@
 export interface Storage {
   get(key: string): Promise<string | null>;
   put(key: string, value: string): Promise<void>;
+  /** Persist related keys in one local write; expose them in memory only after success. */
+  putMany(values: Record<string, string>): Promise<void>;
   /**
    * Removes a key and its value from storage.
    * No-op if the key does not exist.

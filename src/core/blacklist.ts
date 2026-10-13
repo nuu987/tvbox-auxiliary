@@ -2,7 +2,8 @@
 
 import type { Storage } from '../storage/interface';
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxConfig, RegexRule, RegexValidationResult } from './types';
-import { BLACKLIST, MERGED_CONFIG, MERGED_CONFIG_FULL, LAST_UPDATE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, EXPORT_CONFIG } from './config';
+import { BLACKLIST, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './config';
+import { readAggregateOutputs, publishAggregatePatch } from './aggregate-output';
 import { rewriteJarUrls } from './jar-proxy';
 import { logger } from './logger';
 
@@ -328,16 +329,17 @@ export async function generateExportConfig(
  *
  * @param storage  存储抽象
  *
- * 已知局限（D-05）：MERGED_CONFIG_FULL 在管道 Step 4.5 存储，patch 后的配置
+ * 已知局限（D-05）：MERGED_CONFIG_FULL 在管道 Step 4.5 暂存、最后统一发布，patch 后的配置
  * 与完整聚合结果可能不同（例如名称变换 Step 5.5、凭证注入 Step 5.7、搜索配额
  * Step 4.7、空条目清理 Step 4.6、图片代理前缀 Step 7.5 等仍被跳过），下次完整聚合后恢复正常。
  */
 export async function patchMergedConfig(storage: Storage): Promise<{ patched: boolean; reason?: string; warning?: string }> {
-  const fullRaw = await storage.get(MERGED_CONFIG_FULL);
-  if (!fullRaw) {
+  const outputs = await readAggregateOutputs(storage);
+  if (!outputs?.full) {
     logger.warn('blacklist', 'patchMergedConfig: MERGED_CONFIG_FULL is null, skipping');
     return { patched: false, reason: 'MERGED_CONFIG_FULL not available' };
   }
+  const fullRaw = outputs.full;
 
   let full: TVBoxConfig;
   try {
@@ -362,18 +364,17 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
   logger.info('blacklist', 'patchMergedConfig: reapplying JAR rewrite with placeholder');
   const result = await rewriteJarUrls(filtered, BASE_URL_PLACEHOLDER, storage);
 
-  await storage.put(MERGED_CONFIG, JSON.stringify(result));
   // D-03: 同步更新 EXPORT_CONFIG（含原始 URL，供 /admin/export-config 下载）
   // result 含改写后的代理 URL（写入 MERGED_CONFIG），exportConfig 含原始 URL（写入 EXPORT_CONFIG）
   const exportConfig = await generateExportConfig(full, blacklist, liveDisabled);
   delete (exportConfig as TVBoxConfig).pic; // D-05: 删除图片代理前缀（防御性，generateExportConfig 已删）
-  await storage.put(EXPORT_CONFIG, JSON.stringify(exportConfig));
+  const patched = await publishAggregatePatch(storage, outputs.token, JSON.stringify(result), JSON.stringify(exportConfig));
+  if (!patched) return { patched: false, reason: 'Aggregate output changed or became unavailable; retry after sync' };
   logger.infoFields('blacklist', 'export-config-patched', {
     sites: exportConfig.sites?.length || 0,
     parses: exportConfig.parses?.length || 0,
     lives: exportConfig.lives?.length || 0,
   });
-  await storage.put(LAST_UPDATE, new Date().toISOString());
 
   // Build warning string reflecting what was and wasn't reapplied
   const skipped = ['name transforms (Step 5.5)', 'credential injection (Step 5.7)', 'search quota (Step 4.7)', 'empty-entry cleanup (Step 4.6)', 'image proxy prefix (Step 7.5)'];

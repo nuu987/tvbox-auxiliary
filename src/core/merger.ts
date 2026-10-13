@@ -26,7 +26,7 @@ export interface MergeResult {
 
 export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
   // Step 1: 规范化所有配置
-  const normalized = sourcedConfigs.map(normalizeConfig);
+  const normalized = sourcedConfigs.map(source => source.prepared ? source : normalizeConfig(source));
 
   // Step 2: 确定全局 spider（投票制：选引用最多 type:3 站点的 JAR）
   const globalSpider = selectGlobalSpider(normalized);

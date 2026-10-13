@@ -1,8 +1,9 @@
 // 配置输出路由（主配置 + 纯直播配置）
 
 import { Hono } from 'hono';
+import { readAggregateOutputs } from '../core/aggregate-output';
 import { getRequestBaseUrl, applyBaseUrlPlaceholder, assertHostAllowed } from '../core/base-url';
-import { MERGED_CONFIG, SMART_JAR_URL_ENABLED, LIVE_DISABLED } from '../core/config';
+import { SMART_JAR_URL_ENABLED, LIVE_DISABLED } from '../core/config';
 import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
@@ -18,7 +19,7 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
 
   // ─── 主配置 ────────────────────────────────────────────
   router.get('/', async (c) => {
-    const cached = await storage.get(MERGED_CONFIG);
+    const cached = (await readAggregateOutputs(storage))?.merged;
 
     if (!cached) {
       return c.json(
@@ -75,7 +76,7 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
 
   // ─── 纯直播配置 ────────────────────────────────────────
   router.get('/live-config', async (c) => {
-    const cached = await storage.get(MERGED_CONFIG);
+    const cached = (await readAggregateOutputs(storage))?.merged;
 
     if (!cached) {
       return c.json({ error: 'No config available yet.' }, 503);

@@ -1,9 +1,9 @@
 // 导出完整接口配置路由（含原始 URL 的快照下载，D-01..D-13）
 
 import { Hono } from 'hono';
+import { readAggregateOutputs } from '../core/aggregate-output';
 import { adminAuthMiddleware } from './admin-auth';
 import type { RuntimeState } from './admin-auth';
-import { EXPORT_CONFIG } from '../core/config';
 import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
@@ -28,7 +28,7 @@ export function createExportConfigRouter(deps: ExportConfigRouteDeps): Hono {
     }
 
     // D-12: EXPORT_CONFIG KV 不存在 → 提示先同步
-    const cached = await storage.get(EXPORT_CONFIG);
+    const cached = (await readAggregateOutputs(storage))?.exported;
     if (!cached) {
       return c.json({ error: '请先同步' }, 503);
     }

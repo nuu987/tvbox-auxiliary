@@ -1,13 +1,13 @@
 // 网盘凭证管理 + 扫码/密码登录 + token.json
 
 import { Hono } from 'hono';
+import { readAggregateOutputs } from '../core/aggregate-output';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, CloudPlatform, CloudCredential, TVBoxConfig } from '../core/types';
 import { generateQR, pollQRStatus, passwordLogin, PLATFORM_NAMES, QR_PLATFORMS, PASSWORD_PLATFORMS } from '../core/cloud-login';
 import { loadCredentials, saveCredential, deleteCredential, loadCredentialPolicy, saveCredentialPolicy } from '../core/credential-store';
 import { assessAllSources } from '../core/credential-risk';
 import { generateTokenJson } from '../core/credential-injector';
-import { MERGED_CONFIG_FULL } from '../core/config';
 import { applyBaseUrlPlaceholder } from '../core/base-url';
 
 export interface CloudCredRouteDeps {
@@ -162,7 +162,7 @@ export function createCloudCredRouter(deps: CloudCredRouteDeps): Hono {
   // 风险分级报告
   router.get('/admin/credential-risk-report', async (c) => {
     if (!verifyAdmin(c.req.raw, config)) return c.json({ error: 'Unauthorized' }, 401);
-    const configRaw = await storage.get(MERGED_CONFIG_FULL);
+    const configRaw = (await readAggregateOutputs(storage))?.full;
     if (!configRaw) return c.json({ error: 'No config available. Run sync first.' }, 404);
 
     const adminBase = (config.localBaseUrl || '').replace(/\/$/, '');

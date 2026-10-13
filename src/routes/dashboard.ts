@@ -1,12 +1,14 @@
 // 监控面板数据路由
 
 import { Hono } from 'hono';
-import { LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, MERGED_CONFIG, SOURCE_HEALTH } from '../core/config';
+import { readAggregateOutputs } from '../core/aggregate-output';
+import { LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, SOURCE_HEALTH } from '../core/config';
 import { getDirtyMarker } from '../core/dirty-marker';
 import { classifyStatus, STATUS_LABELS } from '../core/status-classifier';
 import type { RuntimeState } from './admin-auth';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceFetchStatus, SourceHealthRecord } from '../core/types';
+import { sourceAggregationStatuses, type SourceAggregationStatus } from '../core/source-fallback';
 
 export interface DashboardRouteDeps {
   storage: Storage;
@@ -24,7 +26,7 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
     const sources = await storage.get(MANUAL_SOURCES);
     const macCMSSources = await storage.get(MACCMS_SOURCES);
     const liveSources = await storage.get(LIVE_SOURCES);
-    const cached = await storage.get(MERGED_CONFIG);
+    const cached = (await readAggregateOutputs(storage))?.merged;
 
     let siteCount = 0;
     let parseCount = 0;
@@ -96,22 +98,33 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
       return r as SourceHealthRecord;
     });
 
+    const aggregation = await sourceAggregationStatuses(storage);
+    const withLabels: Array<SourceHealthRecord & { label: string; aggregation?: SourceAggregationStatus; local?: boolean }> = normalized.map(r => ({
+      ...r,
+      label: STATUS_LABELS[r.fetchStatus] || 'ERR',
+      aggregation: aggregation.get(r.url)?.aggregation,
+    }));
+    // Local reads have no remote fetch status or fabricated HTTP success/failure count.
+    const localRecords = [...aggregation.entries()].filter(([url, value]) => value.local && !withLabels.some(r => r.url === url))
+      .map(([url, value]) => ({
+        url, name: value.name, local: true,
+        status: value.aggregation.latest?.reason ? 'ERR' : 'OK',
+        consecutiveFailures: 0,
+        label: value.aggregation.latest?.reason ? 'LOCAL UNAVAILABLE' : 'LOCAL OK',
+        aggregation: value.aggregation,
+      }));
+    const responseRecords = [...withLabels, ...localRecords];
+
     // Compute summary
     let ok = 0, warn = 0, err = 0;
-    for (const r of normalized) {
+    for (const r of responseRecords) {
       if (r.status === 'OK') ok++;
       else if (r.status === 'WARN') warn++;
       else err++;
     }
 
-    // Add computed label field per record
-    const withLabels = normalized.map(r => ({
-      ...r,
-      label: STATUS_LABELS[r.fetchStatus] || 'ERR',
-    }));
-
     return c.json({
-      records: withLabels,
+      records: responseRecords,
       summary: { ok, warn, err },
     });
   });

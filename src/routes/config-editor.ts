@@ -1,11 +1,12 @@
 // Config Editor API 路由
 
 import { Hono } from 'hono';
+import { readAggregateOutputs } from '../core/aggregate-output';
 import { adminAuthMiddleware } from './admin-auth';
 import { siteFingerprint, loadBlacklist } from '../core/blacklist';
 import { applyBaseUrlPlaceholder } from '../core/base-url';
 import { classifyStatus } from '../core/status-classifier';
-import { MERGED_CONFIG_FULL, MERGED_CONFIG, LIVE_DISABLED, SOURCE_HEALTH } from '../core/config';
+import { LIVE_DISABLED, SOURCE_HEALTH } from '../core/config';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceHealthRecord, TVBoxConfig } from '../core/types';
 
@@ -23,8 +24,8 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
   // ─── Config Editor API ─────────────────────────────────
   router.get('/admin/config-data', async (c) => {
     // 读取过滤前的完整配置（含被屏蔽的项），降级到已过滤配置
-    const full = await storage.get(MERGED_CONFIG_FULL);
-    const cached = full || await storage.get(MERGED_CONFIG);
+    const outputs = await readAggregateOutputs(storage);
+    const cached = outputs?.full || outputs?.merged;
     if (!cached) {
       return c.json({ sites: [], parses: [], lives: [] });
     }

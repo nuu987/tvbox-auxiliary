@@ -14,7 +14,7 @@ export interface TVBoxSite {
   ext?: string | Record<string, unknown>;
   categories?: string[];
   click?: string;
-  style?: string;
+  style?: string | Record<string, unknown>;
 }
 
 export interface TVBoxParse {
@@ -108,6 +108,7 @@ export interface SourcedConfig {
   sourceName: string;
   config: TVBoxConfig;
   speedMs?: number; // 配置 URL 响应时间
+  prepared?: boolean; // Internal: already normalized once; no extra field-type validation
 }
 
 // 名称定制配置
@@ -118,10 +119,28 @@ export interface NameTransformConfig {
 
 // JSON 导入结果
 export interface ImportResult {
+  success: boolean;
   type: 'multi' | 'single';
+  outcome: 'added' | 'partial' | 'duplicates_only' | 'none';
+  checked: number;
   added: number;
   duplicates: number;
   sources: string[];
+  skipped: ImportSkip[];
+}
+
+export interface ImportSkip {
+  url?: string;
+  name?: string;
+  reason: string;
+  stage: 'input' | 'acquisition' | 'decode' | 'parse' | 'preparation' | 'directory';
+}
+export interface FlatMigrationReport {
+  savedAt: string;
+  added: number;
+  duplicates: number;
+  skipped: ImportSkip[];
+  removed: Array<{ url: string; name: string; reason: string }>;
 }
 
 // JSON 解析验证错误类别
@@ -200,7 +219,6 @@ export interface SyncSchedule {
 export interface AppConfig {
   adminToken?: string;
   refreshToken?: string;
-  speedTimeoutMs: number;
   siteTimeoutMs: number;
   fetchTimeoutMs: number;
   cronSchedule?: string;

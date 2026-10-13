@@ -12,7 +12,6 @@ import { runSync } from './syncer';
 import { runChannelProbe, isProbeEnabled } from './core/channel-probe';
 import { logger } from './core/logger';
 import {
-  DEFAULT_SPEED_TIMEOUT_MS,
   DEFAULT_SITE_TIMEOUT_MS,
   DEFAULT_FETCH_TIMEOUT_MS,
   CRON_INTERVAL,
@@ -65,7 +64,6 @@ async function buildConfig(port: number): Promise<AppConfig> {
   return {
     adminToken: process.env.ADMIN_TOKEN,
     refreshToken: process.env.REFRESH_TOKEN,
-    speedTimeoutMs: parseInt(process.env.SPEED_TIMEOUT_MS || '') || DEFAULT_SPEED_TIMEOUT_MS,
     siteTimeoutMs: parseInt(process.env.SITE_TIMEOUT_MS || '') || DEFAULT_SITE_TIMEOUT_MS,
     fetchTimeoutMs: parseInt(process.env.FETCH_TIMEOUT_MS || '') || DEFAULT_FETCH_TIMEOUT_MS,
     cronSchedule: process.env.CRON_SCHEDULE || undefined,

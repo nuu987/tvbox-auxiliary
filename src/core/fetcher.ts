@@ -5,8 +5,6 @@ import { decodeConfigResponse } from './decoder';
 import { logger } from './logger';
 import type { TVBoxConfig, SourcedConfig, SourceEntry, SourceFetchResult, ParseValidationResult, SourceFetchStatus } from './types';
 
-const MAX_MULTI_REPO_DEPTH = 3; // 多仓最大展开深度
-
 // Phase 7 同步失败重试机制：逐源失败重试 + 串行化（D-01 ~ D-11）
 // D-04 口径：首轮失败后重试 3 次（exhausted 场景共 4 次 fetch 调用）
 const MAX_RETRY_ATTEMPTS = 3; // 首轮失败后的最大重试次数
@@ -18,9 +16,14 @@ export interface FetchConfigsResult {
   fetchResults: SourceFetchResult[];
 }
 
+export interface SourceConfigResolver {
+  source(source: SourceEntry): SourceEntry;
+  resolve(source: SourceEntry, config: TVBoxConfig | null, result: SourceFetchResult, depth: number): { config: TVBoxConfig; prepared?: boolean } | null;
+}
+
 /**
- * 批量获取配置 JSON，并发执行，带超时
- * 自动检测多仓格式（storeHouse / urls），递归展开（最多 3 层）
+ * 批量获取配置 JSON，串行重试，带超时
+ * 仅处理独立单仓；多仓只能在添加/导入时使用
  * 返回成功获取的配置列表 + 每个源的 fetch 结果（含失败原因）
  */
 export interface FetchProxyConfig {
@@ -32,12 +35,13 @@ export async function fetchConfigs(
   sources: SourceEntry[],
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
   proxyConfig?: FetchProxyConfig,
+  resolver?: SourceConfigResolver,
 ): Promise<FetchConfigsResult> {
   const configs: SourcedConfig[] = [];
   const fetchResults: SourceFetchResult[] = [];
   const seen = new Set<string>(); // URL 去重，防循环引用
 
-  await expandSources(sources, configs, fetchResults, seen, timeoutMs, 0, proxyConfig);
+  await fetchSources(sources, configs, fetchResults, seen, timeoutMs, 0, proxyConfig, resolver);
 
   logger.infoFields('fetcher', 'fetch-complete', {
     configs: configs.length,
@@ -48,9 +52,9 @@ export async function fetchConfigs(
 }
 
 /**
- * 递归展开多仓源
+ * 串行获取独立单仓源
  */
-async function expandSources(
+async function fetchSources(
   sources: SourceEntry[],
   configs: SourcedConfig[],
   fetchResults: SourceFetchResult[],
@@ -58,6 +62,7 @@ async function expandSources(
   timeoutMs: number,
   depth: number,
   proxyConfig?: FetchProxyConfig,
+  resolver?: SourceConfigResolver,
 ): Promise<void> {
   // 去重
   const uniqueSources = sources.filter(s => {
@@ -87,57 +92,32 @@ async function expandSources(
   // D-08: 串行化逐源拉取（有意偏离 CLAUDE.md 'Promise.allSettled for 批量部分失败' 约定——
   // 仅此调用点改为串行，CLAUDE.md 约定不全局废弃，见 CONTEXT.md D-08）。
   // 串行 + 重试使同时只有 1 源在拉取/重试，避免多源重试风暴对同一远端聚集（T-07-02）。
-  const multiRepoChildren: SourceEntry[] = [];
 
-  for (const source of uniqueSources) {
+  for (const queuedSource of uniqueSources) {
+    const source = resolver ? resolver.source(queuedSource) : queuedSource;
     const { config: fetchedConfig, fetchResult } = await fetchSingleConfig(source, timeoutMs, proxyConfig, depth);
     fetchResults.push(fetchResult);
+    const resolved = resolver ? resolver.resolve(source, fetchedConfig, fetchResult, depth)
+      : fetchResult.status === 'ok' && fetchedConfig ? { config: fetchedConfig, prepared: false } : null;
+    if (!resolved) continue;
 
-    if (fetchResult.status !== 'ok') {
-      // 失败已记录到 fetchResults（含重试耗尽场景），跳过多仓展开
+    if (isMultiRepoConfig(resolved.config)) {
+      logger.warn('fetcher', `Directory is import-only; skipped: ${source.url}`);
       continue;
     }
-
-    if (isMultiRepoConfig(fetchedConfig!)) {
-      const children = extractMultiRepoEntries(fetchedConfig!, fetchResult.name);
-      logger.debugFields('fetcher', 'multi-repo-detected', {
-        parent: source.name,
-        url: source.url,
-        depth,
-        children: children.length,
-      });
-      children.forEach((child, childIndex) => {
-        logger.debugFields('fetcher', 'multi-repo-child', {
-          parent: source.name,
-          index: childIndex + 1,
-          name: child.name,
-          url: child.url,
-        });
-      });
-      if (depth < MAX_MULTI_REPO_DEPTH) {
-        multiRepoChildren.push(...children);
-      } else {
-        logger.debugFields('fetcher', 'multi-repo-max-depth', {
-          parent: source.name,
-          url: source.url,
-          depth,
-          maxDepth: MAX_MULTI_REPO_DEPTH,
-        });
-      }
-    } else {
-      configs.push({
-        sourceUrl: source.url,
-        sourceName: source.name,
-        config: fetchedConfig!,
-        speedMs: fetchResult.speedMs,
-      });
-    }
+    configs.push({
+      sourceUrl: source.url,
+      sourceName: source.name,
+      config: resolved.config,
+      prepared: resolved.prepared,
+      speedMs: fetchResult.speedMs,
+    });
   }
+}
 
-  // 递归展开子多仓
-  if (multiRepoChildren.length > 0) {
-    await expandSources(multiRepoChildren, configs, fetchResults, seen, timeoutMs, depth + 1, proxyConfig);
-  }
+/** One direct timed request for Add/Import/migration, without UA/proxy/backoff retries. */
+export async function inspectSourceOnce(source: SourceEntry, timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS): Promise<SingleFetchResult> {
+  return fetchWithUA(source, timeoutMs, 'okhttp/3.12.0', 'import', 0);
 }
 
 interface SingleFetchResult {
@@ -533,7 +513,7 @@ async function fetchWithUA(
     };
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes('abort')) {
+    if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError') || msg.includes('abort')) {
       logger.warnFields('fetcher', 'source-timeout', {
         name: source.name,
         url: source.url,
@@ -591,19 +571,24 @@ export function parseConfigJson(text: string): ParseValidationResult {
   }
 
   // 尝试直接解析
-  const first = tryParseJsonWithMessage(cleaned);
-  let parsed = first.parsed;
+  let result = tryParseJsonWithMessage(cleaned);
+  let compatibility: JsonCompatibilityResult | undefined;
 
-  // 如果失败，尝试去掉行尾注释后再解析
-  if (!parsed) {
-    const stripped = stripJsonComments(cleaned);
-    const second = tryParseJsonWithMessage(stripped);
-    parsed = second.parsed;
-    if (!parsed) {
-      const errMsg = second.error || first.error || 'Unknown JSON parse error';
-      return { ok: false, errorCategory: 'syntax', message: errMsg, preview: text.slice(0, 200) };
+  // 仅语法失败时兼容注释和字符串内的实际换行，不改变字段字符值。
+  if (!result.ok) {
+    compatibility = normalizeJsonCompatibility(cleaned);
+    if (compatibility.error) {
+      return { ok: false, errorCategory: 'syntax', message: compatibility.error, preview: text.slice(0, 200) };
+    }
+    if (!compatibility.text.trim()) {
+      return { ok: false, errorCategory: 'empty', message: 'Empty response after comment removal', preview: text.slice(0, 200) };
+    }
+    result = tryParseJsonWithMessage(compatibility.text);
+    if (!result.ok) {
+      return { ok: false, errorCategory: 'syntax', message: result.error, preview: text.slice(0, 200) };
     }
   }
+  const parsed = result.parsed;
 
   // 结构验证：必须是对象
   if (parsed === null) {
@@ -616,15 +601,25 @@ export function parseConfigJson(text: string): ParseValidationResult {
     return { ok: false, errorCategory: 'structure', message: `Parsed value is ${typeof parsed}, expected object`, preview: text.slice(0, 200) };
   }
 
+  if (compatibility) {
+    logger.infoFields('parser', 'config-compatibility-applied', {
+      lineComments: compatibility.lineComments,
+      blockComments: compatibility.blockComments,
+      lfEscapes: compatibility.lfEscapes,
+      crEscapes: compatibility.crEscapes,
+    });
+  }
   return { ok: true, config: parsed as TVBoxConfig };
 }
 
-function tryParseJsonWithMessage(text: string): { parsed: Record<string, unknown> | null; error?: string } {
+type JsonParseAttempt = { ok: true; parsed: unknown } | { ok: false; error: string };
+
+function tryParseJsonWithMessage(text: string): JsonParseAttempt {
   try {
-    return { parsed: JSON.parse(text) as Record<string, unknown> };
+    return { ok: true, parsed: JSON.parse(text) as unknown };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { parsed: null, error: msg };
+    return { ok: false, error: msg };
   }
 }
 
@@ -673,46 +668,64 @@ export function extractMultiRepoEntries(config: TVBoxConfig, parentName: string)
   return entries;
 }
 
-/**
- * 安全地去掉 JSON 中的单行注释
- * 只处理不在字符串引号内的 // 注释
- */
-function stripJsonComments(text: string): string {
-  let result = '';
-  let inString = false;
-  let escape = false;
+interface JsonCompatibilityResult {
+  text: string;
+  lineComments: number;
+  blockComments: number;
+  lfEscapes: number;
+  crEscapes: number;
+  error?: string;
+}
+
+/** Normalize only comments and raw in-string LF/CR; JSON.parse checks syntax. */
+function normalizeJsonCompatibility(text: string): JsonCompatibilityResult {
+  const chunks: string[] = [];
+  const result: JsonCompatibilityResult = { text: '', lineComments: 0, blockComments: 0, lfEscapes: 0, crEscapes: 0 };
+  let state: 'normal' | 'string' | 'escape' | 'line-comment' | 'block-comment' = 'normal';
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
 
-    if (escape) {
-      result += ch;
-      escape = false;
-      continue;
+    switch (state) {
+      case 'normal':
+        if (ch === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+          if (text[i + 1] === '/') { state = 'line-comment'; result.lineComments++; }
+          else { state = 'block-comment'; result.blockComments++; }
+          chunks.push('  ');
+          i++;
+        } else {
+          chunks.push(ch);
+          if (ch === '"') state = 'string';
+        }
+        break;
+      case 'string':
+        if (ch === '\n') { chunks.push('\\n'); result.lfEscapes++; }
+        else if (ch === '\r') { chunks.push('\\r'); result.crEscapes++; }
+        else {
+          chunks.push(ch);
+          if (ch === '\\') state = 'escape';
+          else if (ch === '"') state = 'normal';
+        }
+        break;
+      case 'escape':
+        chunks.push(ch);
+        state = 'string';
+        break;
+      case 'line-comment':
+        if (ch === '\n' || ch === '\r') { chunks.push(ch); state = 'normal'; }
+        else chunks.push(' ');
+        break;
+      case 'block-comment':
+        if (ch === '*' && text[i + 1] === '/') {
+          chunks.push('  ');
+          i++;
+          state = 'normal';
+        } else chunks.push(ch === '\n' || ch === '\r' ? ch : ' ');
+        break;
     }
-
-    if (ch === '\\' && inString) {
-      result += ch;
-      escape = true;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = !inString;
-      result += ch;
-      continue;
-    }
-
-    if (!inString && ch === '/' && text[i + 1] === '/') {
-      // 跳到行尾
-      const newline = text.indexOf('\n', i);
-      if (newline === -1) break;
-      i = newline - 1; // for 循环会 +1
-      continue;
-    }
-
-    result += ch;
   }
-
+  if (state === 'string' || state === 'escape') result.error = 'Unterminated JSON string in compatibility input';
+  else if (state === 'block-comment') result.error = 'Unterminated block comment in compatibility input';
+  result.text = chunks.join('');
   return result;
 }

@@ -1,5 +1,6 @@
 import { sharedStyles } from './shared-styles';
 import { sharedUi } from './shared-ui';
+import { footerHtml } from './shared-footer';
 
 export const configEditorHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -404,9 +405,7 @@ ${sharedStyles}
     <div class="loading-msg" id="loadingLives">加载中...</div>
   </div>
 
-  <div class="footer">
-    <span>TVBox Auxiliary</span>
-  </div>
+  ${footerHtml}
 </div>
 
 <div class="batch-bar" id="batchBar" style="display:none">

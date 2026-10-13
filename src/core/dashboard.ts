@@ -1,5 +1,6 @@
 import { sharedStyles } from './shared-styles';
 import { sharedUi } from './shared-ui';
+import { footerHtml } from './shared-footer';
 
 export const dashboardHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -461,9 +462,7 @@ ${sharedStyles}
     </div>
   </div>
 
-  <div class="footer">
-    <span>TVBox Auxiliary</span>
-  </div>
+  ${footerHtml}
 </div>
 
 <script>
@@ -658,7 +657,10 @@ function renderHealthTable(records) {
 
   $('healthTableBody').innerHTML = records.map(r => {
     // Plan 03.1 D-10: 后端已分类，前端直接使用 r.status
-    const level = r.status === 'ERR' ? 'error'
+    const latest = r.aggregation && r.aggregation.latest;
+    const reason = (latest && latest.reason) || (r.status !== 'OK' && r.lastFailReason) || '';
+    const cached = !!(reason && latest && latest.mode === 'restored');
+    const level = latest && latest.reason ? 'error' : r.status === 'ERR' ? 'error'
                : r.status === 'WARN' ? 'warn' : 'ok';
     // Plan 03.1 D-12: 标签单元格悬浮显示具体错误（lastFailReason）
     // 标签优先使用后端返回的 label，否则按 fetchStatus 映射
@@ -671,14 +673,16 @@ function renderHealthTable(records) {
         })
       : "--";
 
+    const processing = reason ? '<div>本轮不可用：' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
+
     return '<tr class="row-' + level + '">' +
       '<td><span class="health-dot ' + level + '"></span></td>' +
       '<td>' + esc(r.name || 'Unnamed') + '</td>' +
       '<td class="url-cell" title="' + esc(r.url) + '">' + esc(r.url) + '</td>' +
       '<td class="status-' + level + '"' +
         (r.status === 'OK' ? '' : ' title="' + esc(r.lastFailReason || '') + '"') +
-        '>' + statusLabel + '</td>' +
-      '<td>' + r.consecutiveFailures + '</td>' +
+        '>' + esc(statusLabel) + processing + '</td>' +
+      '<td>' + (r.local ? '--' : r.consecutiveFailures) + '</td>' +
       '<td>' + lastOk + '</td>' +
     '</tr>';
   }).join('');

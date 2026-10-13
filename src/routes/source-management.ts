@@ -1,194 +1,77 @@
-// 源管理 CRUD + JSON 导入
-
+// 源管理 CRUD + 单层配置导入
 import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceEntry } from '../core/types';
-import { MANUAL_SOURCES, INLINE_PREFIX } from '../core/config';
-import { parseConfigJson, isMultiRepoConfig, extractMultiRepoEntries } from '../core/fetcher';
-import { decodeConfigResponse } from '../core/decoder';
+import { MANUAL_SOURCES } from '../core/config';
 import { adminAuthMiddleware } from './admin-auth';
+import { withSourceGate, saveSourceRoots, captureSourceBaseline, type SourceBaseline } from '../core/source-fallback';
+import { importSourceEntry, planSourceImport, SourceImportError, type SourceImportPlan } from '../core/source-import';
+import { sourceMigrationReport } from '../core/source-import-policy';
 
-export interface SourceMgmtRouteDeps {
-  storage: Storage;
-  config: AppConfig;
-}
+export interface SourceMgmtRouteDeps { storage: Storage; config: AppConfig }
 
-export function createSourceMgmtRouter(deps: SourceMgmtRouteDeps): Hono {
-  const { storage, config } = deps;
+export function createSourceMgmtRouter({ storage, config }: SourceMgmtRouteDeps): Hono {
   const router = new Hono();
-
-  // All endpoints require admin auth
   router.use('/admin/*', adminAuthMiddleware(config));
-
-  router.get('/admin/sources', async (c) => {
+  router.get('/admin/sources', async c => {
     const raw = await storage.get(MANUAL_SOURCES);
-    const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
-    return c.json(sources);
+    return c.json(raw ? JSON.parse(raw) : []);
+  });
+  router.get('/admin/sources/migration-result', async c => c.json({ report: await sourceMigrationReport(storage) }));
+
+  const baseline = () => withSourceGate(storage, () => captureSourceBaseline(storage));
+  const commit = (before: SourceBaseline, plan: SourceImportPlan) => withSourceGate(storage, async () => {
+    const current = await captureSourceBaseline(storage);
+    if (current.token !== before.token) throw new SourceImportError('Sources changed during checking; please retry', 409);
+    if (plan.entries.length) await saveSourceRoots(storage, [...current.sources, ...plan.entries],
+      plan.inline ? { [plan.inline.key]: plan.inline.text } : {}, plan.entries.map(entry => entry.url));
+    return plan.result;
   });
 
-  router.post('/admin/sources', async (c) => {
+  router.post('/admin/sources', async c => {
     let body: { name?: string; url?: string; configKey?: string };
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (typeof body?.url !== 'string' || !body.url.trim()) return c.json({ error: 'URL is required' }, 400);
+    if ((body.name !== undefined && typeof body.name !== 'string')
+      || (body.configKey !== undefined && typeof body.configKey !== 'string')) return c.json({ error: 'Invalid name or configKey' }, 400);
     try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
+      const source = importSourceEntry({ name: body.name?.trim() || '', url: body.url, configKey: body.configKey });
+      const before = await baseline();
+      if (before.sources.some(entry => entry.url === source.url)) return c.json({ error: 'Source already exists' }, 409);
+      const plan = await planSourceImport({ source }, { sources: before.sources, knownLeaves: before.knownLeaves, timeoutMs: config.fetchTimeoutMs });
+      return c.json(await commit(before, plan));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, error instanceof SourceImportError ? error.status : 500);
     }
-
-    let url = body.url?.trim() || '';
-    if (!url) return c.json({ error: 'URL is required' }, 400);
-
-    // 自动提取 ;pk; 密钥
-    let configKey = body.configKey?.trim() || '';
-    const pkMatch = url.match(/;pk;(.+)$/);
-    if (pkMatch) {
-      configKey = configKey || pkMatch[1];
-      url = url.replace(/;pk;.+$/, '');
-    }
-
-    try {
-      new URL(url);
-    } catch {
-      return c.json({ error: 'Invalid URL format' }, 400);
-    }
-
-    const name = body.name?.trim() || '';
-    const raw = await storage.get(MANUAL_SOURCES);
-    const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
-
-    if (sources.some((s) => s.url === url)) {
-      return c.json({ error: 'Source already exists' }, 409);
-    }
-
-    const entry: SourceEntry = { name, url };
-    if (configKey) entry.configKey = configKey;
-    sources.push(entry);
-    await storage.put(MANUAL_SOURCES, JSON.stringify(sources));
-
-    return c.json({ success: true });
   });
 
-  router.delete('/admin/sources', async (c) => {
+  router.delete('/admin/sources', async c => {
     let body: { url?: string };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    const url = body.url?.trim();
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    const url = typeof body?.url === 'string' ? body.url.trim() : '';
     if (!url) return c.json({ error: 'URL is required' }, 400);
-
-    const raw = await storage.get(MANUAL_SOURCES);
-    const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
-    const filtered = sources.filter((s) => s.url !== url);
-    await storage.put(MANUAL_SOURCES, JSON.stringify(filtered));
-
-    return c.json({ success: true });
+    return withSourceGate(storage, async () => {
+      const raw = await storage.get(MANUAL_SOURCES);
+      const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
+      await saveSourceRoots(storage, sources.filter(source => source.url !== url));
+      return c.json({ success: true });
+    });
   });
 
-  // ─── JSON 导入 ─────────────────────────────────────────
-  router.post('/admin/sources/import', async (c) => {
+  router.post('/admin/sources/import', async c => {
     let body: { input?: string };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    const input = body.input?.trim();
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    const input = typeof body?.input === 'string' ? body.input.trim() : '';
     if (!input) return c.json({ error: 'input is required' }, 400);
-
-    // 判断是 URL 还是 JSON 内容
-    const isUrl = /^https?:\/\//i.test(input);
-    let jsonText: string;
-    let sourceUrl: string | null = null;
-
-    // 自动提取 ;pk; 密钥
-    let configKey: string | undefined;
-    let fetchUrl = input;
-    if (isUrl) {
-      const pkMatch = input.match(/;pk;(.+)$/);
-      if (pkMatch) {
-        configKey = pkMatch[1];
-        fetchUrl = input.replace(/;pk;.+$/, '');
-      }
-      sourceUrl = fetchUrl;
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs);
-        try {
-          const resp = await fetch(fetchUrl, {
-            headers: { 'Accept': 'application/json, text/plain, */*', 'User-Agent': 'okhttp/3.12.0' },
-            signal: controller.signal,
-          });
-          if (!resp.ok) return c.json({ error: `Fetch failed: HTTP ${resp.status}` }, 502);
-          const buffer = await resp.arrayBuffer();
-          const decoded = await decodeConfigResponse(buffer, configKey);
-          jsonText = decoded || '';
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch (err: unknown) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return c.json({ error: 'Fetch failed: request timed out' }, 504);
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        return c.json({ error: `Fetch failed: ${msg}` }, 502);
-      }
-    } else {
-      jsonText = input;
-    }
-
-    const parsed = parseConfigJson(jsonText);
-    if (!parsed.ok) return c.json({ error: `Failed to parse JSON: ${parsed.errorCategory}: ${parsed.message}` }, 400);
-
-    // 读取现有源
-    const raw = await storage.get(MANUAL_SOURCES);
-    const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
-    const existingUrls = new Set(sources.map(s => s.url));
-
-    let added = 0;
-    let duplicates = 0;
-    const addedSources: string[] = [];
-
-    if (isMultiRepoConfig(parsed.config!)) {
-      // 多仓：提取子 URL 批量添加
-      const entries = extractMultiRepoEntries(parsed.config!, 'Imported');
-      for (const entry of entries) {
-        if (existingUrls.has(entry.url)) {
-          duplicates++;
-        } else {
-          sources.push(entry);
-          existingUrls.add(entry.url);
-          addedSources.push(entry.url);
-          added++;
-        }
-      }
-      await storage.put(MANUAL_SOURCES, JSON.stringify(sources));
-      return c.json({ type: 'multi', added, duplicates, sources: addedSources });
-    } else {
-      // 单仓
-      if (sourceUrl) {
-        // 来自 URL：直接添加
-        if (existingUrls.has(sourceUrl)) {
-          return c.json({ type: 'single', added: 0, duplicates: 1, sources: [] });
-        }
-        const entry: SourceEntry = { name: 'Imported', url: sourceUrl };
-        if (configKey) entry.configKey = configKey;
-        sources.push(entry);
-        await storage.put(MANUAL_SOURCES, JSON.stringify(sources));
-        return c.json({ type: 'single', added: 1, duplicates: 0, sources: [sourceUrl] });
-      } else {
-        // 粘贴的内容：存 KV 用 inline:// 引用
-        const key = `${INLINE_PREFIX}${Date.now()}`;
-        await storage.put(key, jsonText);
-        const inlineUrl = `inline://${key}`;
-        sources.push({ name: 'Inline Config', url: inlineUrl });
-        await storage.put(MANUAL_SOURCES, JSON.stringify(sources));
-        return c.json({ type: 'single', added: 1, duplicates: 0, sources: [inlineUrl] });
-      }
+    try {
+      const before = await baseline();
+      const plan = await planSourceImport(/^https?:\/\//i.test(input)
+        ? { source: { name: 'Imported', url: input } } : { text: input },
+        { sources: before.sources, knownLeaves: before.knownLeaves, timeoutMs: config.fetchTimeoutMs });
+      return c.json(await commit(before, plan));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, error instanceof SourceImportError ? error.status : 500);
     }
   });
-
   return router;
 }

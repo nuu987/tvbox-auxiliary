@@ -10,7 +10,7 @@ import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_URLS, LAST_UPDATE, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED, EXPORT_CONFIG } from './core/config';
+import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
@@ -24,34 +24,44 @@ import { getSiteResourceDir, siteIndexToDirName, getTmpSitesDir, cleanStaleTempD
 import * as fs from 'fs';
 import * as path from 'path';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
+import { SourceFallbackRound, withSourceGate, saveSourceRoots, beginSourceOutputRun } from './core/source-fallback';
+import { publishAggregateOutputs, recordAggregateFailure, type OutputRunTicket } from './core/aggregate-output';
+import { prepareImportOnlyRun } from './core/source-import-policy';
 
 export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
   const startTime = Date.now();
+  let round: SourceFallbackRound | undefined;
+  let ticket: OutputRunTicket | undefined;
+  let failed = false;
   logger.infoFields('sync', 'run-start', {
     fetchTimeoutMs: config.fetchTimeoutMs,
     siteTimeoutMs: config.siteTimeoutMs,
-    speedTimeoutMs: config.speedTimeoutMs,
   });
 
   try {
-    await _runSync(storage, config, startTime);
+    ticket = await beginSourceOutputRun(storage);
+    ticket = await prepareImportOnlyRun(storage, config, ticket);
+    await _runSync(storage, config, startTime, ticket, value => { round = value; });
   } catch (error: unknown) {
+    failed = true;
     const msg = error instanceof Error ? error.message : String(error);
     const stack = error instanceof Error ? error.stack : '';
     logger.error('sync', `FATAL ERROR: ${msg}`);
     logger.error('sync', `Stack: ${stack}`);
     // 写入错误信息方便调试
-    await storage.put(LAST_UPDATE, `ERROR @ ${new Date().toISOString()}: ${msg}`);
+    if (ticket) await recordAggregateFailure(storage, ticket, msg);
     // D-06: 同步失败删除临时目录，确保现有缓存不受影响
     try {
       cleanStaleTempDir();
     } catch (cleanupErr) {
       logger.warn('sync', `Failed to clean temp directory after sync failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
     }
+  } finally {
+    await round?.finish(failed ? 'failed' : 'no_configs');
   }
 }
 
-async function _runSync(storage: Storage, config: AppConfig, startTime: number): Promise<void> {
+async function _runSync(storage: Storage, config: AppConfig, startTime: number, ticket: OutputRunTicket, registerRound: (round: SourceFallbackRound) => void): Promise<void> {
 
   // Step 0: 自动抓取源（需配置 SCRAPE_SOURCE_URL 环境变量）
   if (config.scrapeSourceUrl && config.scrapeSourceReferer) {
@@ -60,33 +70,35 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
       const scrapeCfg: ScrapeSourceConfig = { url: config.scrapeSourceUrl, referer: config.scrapeSourceReferer };
       const scraped = await scrapeSourceList(scrapeCfg);
       if (scraped.length > 0) {
-        const existingRaw = await storage.get(MANUAL_SOURCES);
-        const existingSources: SourceEntry[] = existingRaw ? JSON.parse(existingRaw) : [];
-        const existingUrls = new Set(existingSources.map(s => s.url));
+        await withSourceGate(storage, async () => {
+          const existingRaw = await storage.get(MANUAL_SOURCES);
+          const existingSources: SourceEntry[] = existingRaw ? JSON.parse(existingRaw) : [];
+          const existingUrls = new Set(existingSources.map(s => s.url));
 
-        let added = 0;
-        const addedSources: SourceEntry[] = [];
-        for (const source of scraped) {
-          if (!existingUrls.has(source.url)) {
-            existingSources.push(source);
-            existingUrls.add(source.url);
-            added++;
-            addedSources.push(source);
+          let added = 0;
+          const addedSources: SourceEntry[] = [];
+          for (const source of scraped) {
+            if (!existingUrls.has(source.url)) {
+              existingSources.push(source);
+              existingUrls.add(source.url);
+              added++;
+              addedSources.push(source);
+            }
           }
-        }
 
-        if (added > 0) {
-          await storage.put(MANUAL_SOURCES, JSON.stringify(existingSources));
-          logger.infoFields('sync', 'auto-scrape-added', { added, total: existingSources.length });
-          addedSources.forEach((source, index) => logger.infoFields('sync', 'auto-scrape-source', {
-            index: index + 1,
-            name: source.name,
-            url: source.url,
-            added: true,
-          }));
-        } else {
-          logger.infoFields('sync', 'auto-scrape-none-added', { scraped: scraped.length, reason: 'all_exist' });
-        }
+          if (added > 0) {
+            await saveSourceRoots(storage, existingSources);
+            logger.infoFields('sync', 'auto-scrape-added', { added, total: existingSources.length });
+            addedSources.forEach((source, index) => logger.infoFields('sync', 'auto-scrape-source', {
+              index: index + 1,
+              name: source.name,
+              url: source.url,
+              added: true,
+            }));
+          } else {
+            logger.infoFields('sync', 'auto-scrape-none-added', { scraped: scraped.length, reason: 'all_exist' });
+          }
+        });
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -118,8 +130,9 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   // Step 1: 读取手动配置的源（含自动抓取合并后的）
   logger.info('sync', 'Step 1: Loading sources...');
-  const raw = await storage.get(MANUAL_SOURCES);
-  const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
+  const fallback = await SourceFallbackRound.begin(storage);
+  registerRound(fallback);
+  const sources = fallback.sourceEntries();
 
   // 检查是否有 MacCMS 源（即使没有 config 源也可以继续）
   const macCMSRaw = await storage.get(MACCMS_SOURCES);
@@ -140,7 +153,6 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
       key: source.configKey ? 'present' : 'none',
     });
   });
-  await storage.put(SOURCE_URLS, JSON.stringify(sources));
 
   // Step 1.5: 处理 MacCMS 源
   logger.info('sync', 'Step 1.5: Processing MacCMS sources...');
@@ -159,29 +171,18 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   for (const src of inlineSources) {
     const kvKey = src.url.replace('inline://', '');
-    const raw = await storage.get(kvKey);
-    if (raw) {
-      const parsed = parseConfigJson(raw);
-      if (parsed.ok) {
-        inlineConfigs.push({ sourceUrl: src.url, sourceName: src.name || 'Inline', config: parsed.config! });
-        logger.infoFields('sync', 'inline-loaded', {
-          name: src.name || 'Inline',
-          key: kvKey,
-          sites: parsed.config!.sites?.length || 0,
-          parses: parsed.config!.parses?.length || 0,
-          lives: parsed.config!.lives?.length || 0,
-        });
-      } else {
-        logger.warnFields('sync', 'inline-parse-failed', {
-          name: src.name,
-          key: kvKey,
-          errorCategory: parsed.errorCategory,
-          message: parsed.message,
-        });
+    let current: TVBoxConfig | null = null;
+    let reason = 'Inline configuration missing';
+    try {
+      const raw = await storage.get(kvKey);
+      if (raw) {
+        const parsed = parseConfigJson(raw);
+        if (parsed.ok) current = parsed.config!;
+        else reason = parsed.message || 'Inline parse failed';
       }
-    } else {
-      logger.warnFields('sync', 'inline-missing', { name: src.name, key: kvKey });
-    }
+    } catch (error) { reason = error instanceof Error ? error.message : String(error); }
+    const resolved = fallback.resolve(src, current, { status: current ? 'ok' : 'local_unavailable', errorMessage: reason });
+    if (resolved) inlineConfigs.push({ sourceUrl: src.url, sourceName: src.name || 'Inline', ...resolved });
   }
 
   // Step 2: 批量 fetch 配置 JSON（本地模式可通过边缘代理回退）
@@ -199,7 +200,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
       logger.info('sync', `Edge proxies configured: ${urls.join(', ')}`);
     }
   }
-  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs, proxyConfig);
+  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs, proxyConfig, fallback);
   fetchResults.forEach((result) => {
     logger.infoFields('sync', 'fetch-result', {
       name: result.name,
@@ -223,61 +224,18 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   });
 
   // 更新源健康状态
-  await updateSourceHealth(storage, fetchResults);
+  await updateSourceHealth(storage, fetchResults, fallback.activeUrls());
 
   if (sourcedConfigs.length === 0 && inlineConfigs.length === 0 && macCMSConfigs.length === 0) {
     logger.warn('sync', 'No valid configs fetched and no MacCMS/inline sources, keeping previous cache');
     return;
   }
 
-  // Step 3: 用 fetch 耗时筛选配置源
-  let filteredConfigs: SourcedConfig[] = sourcedConfigs;
-
-  const configsWithSpeed = sourcedConfigs.filter((c) => c.speedMs != null);
-  if (configsWithSpeed.length > 0) {
-    logger.info('sync', 'Step 3: Filtering configs by fetch speed...');
-    filteredConfigs = sourcedConfigs.filter((c) => {
-      if (c.speedMs == null) {
-        logger.infoFields('sync', 'speed-filter-keep', {
-          name: c.sourceName,
-          url: c.sourceUrl,
-          reason: 'no_speed_data',
-        });
-        return true;
-      }
-      if (c.speedMs <= config.speedTimeoutMs) {
-        logger.infoFields('sync', 'speed-filter-keep', {
-          name: c.sourceName,
-          url: c.sourceUrl,
-          speedMs: c.speedMs,
-          thresholdMs: config.speedTimeoutMs,
-        });
-        return true;
-      }
-      logger.infoFields('sync', 'speed-filter-remove', {
-        name: c.sourceName,
-        url: c.sourceUrl,
-        speedMs: c.speedMs,
-        thresholdMs: config.speedTimeoutMs,
-      });
-      return false;
-    });
-
-    if (filteredConfigs.length === 0) {
-      logger.warn('sync', 'All configs failed speed filter, using all fetched configs');
-      filteredConfigs = sourcedConfigs;
-    } else {
-      logger.info('sync', `${filteredConfigs.length}/${sourcedConfigs.length} configs passed speed filter`);
-    }
-  } else {
-    logger.info('sync', 'Step 3: No speed data available, skipping filter');
-  }
-
   // Step 4: 合并（包含 MacCMS 源，投票制 spider 分配）
   logger.info('sync', 'Step 4: Merging configs...');
-  const allConfigs = [...filteredConfigs, ...inlineConfigs, ...macCMSConfigs];
+  const allConfigs = [...sourcedConfigs, ...inlineConfigs, ...macCMSConfigs];
   logger.infoFields('sync', 'merge-inputs', {
-    remote: filteredConfigs.length,
+    remote: sourcedConfigs.length,
     inline: inlineConfigs.length,
     maccms: macCMSConfigs.length,
     total: allConfigs.length,
@@ -306,8 +264,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
     overrides: blacklist.regexBlockOverrides.length,
   });
 
-  // 保存过滤前的完整配置（供配置编辑器显示已屏蔽项）
-  await storage.put(MERGED_CONFIG_FULL, JSON.stringify(merged));
+  // 暂存过滤前配置；与主配置、导出配置一起在最后发布。
+  const fullJson = JSON.stringify(merged);
 
   if (hasBlacklist) {
     // 自动清理黑名单中已不存在的条目（必须在过滤前比对，否则被屏蔽的条目会被误判为"过时"而清掉）
@@ -359,8 +317,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
   const liveDisabled465 = liveDisabledRaw465 !== 'false';
   const exportConfig = await generateExportConfig(merged, blacklist, liveDisabled465);
   delete (exportConfig as TVBoxConfig).pic; // D-05: 导出版本不含图片代理前缀（防御性，generateExportConfig 已删）
-  await storage.put(EXPORT_CONFIG, JSON.stringify(exportConfig));
-  logger.infoFields('sync', 'export-config-snapshot', {
+  const exportJson = JSON.stringify(exportConfig);
+  logger.infoFields('sync', 'export-config-staged', {
     sites: exportConfig.sites?.length || 0,
     parses: exportConfig.parses?.length || 0,
     lives: exportConfig.lives?.length || 0,
@@ -739,8 +697,9 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number):
 
   // Step 8: 存入存储
   const mergedJson = JSON.stringify(merged);
-  await storage.put(MERGED_CONFIG, mergedJson);
-  await storage.put(LAST_UPDATE, new Date().toISOString());
+  await fallback.commit(async savedAt => {
+    await publishAggregateOutputs(storage, ticket, { merged: mergedJson, full: fullJson, exported: exportJson }, savedAt);
+  });
   logger.infoFields('sync', 'storage-write-complete', {
     key: MERGED_CONFIG,
     bytes: Buffer.byteLength(mergedJson, 'utf8'),
@@ -817,7 +776,7 @@ async function processMacCMSSources(
 /**
  * 更新源健康状态：读取历史 → merge 本次 fetch 结果 → 写回
  */
-async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchResult[]): Promise<void> {
+async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchResult[], activeUrls: Set<string>): Promise<void> {
   if (fetchResults.length === 0) return;
 
   const now = new Date().toISOString();
@@ -878,10 +837,10 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
     }
   }
 
-  // 保留未参与本次 fetch 的历史记录（源可能被临时排除但还在列表中）
-  // 但已被用户删除的源不应保留——这由 fetchResults 只包含当前源列表来保证
-  // 如果老记录的 URL 不在本次 fetch 中，丢弃（源已被删除）
-  // 注：inline:// 源不经过 fetcher，不会出现在 fetchResults 中，也不需要追踪
+  // Retain existing health only for effective independent source identities.
+  for (const old of oldRecords) {
+    if (!fetchedUrls.has(old.url) && activeUrls.has(old.url)) newRecords.push(old);
+  }
 
   const failCount = newRecords.filter(r => r.consecutiveFailures > 0).length;
   if (failCount > 0) {

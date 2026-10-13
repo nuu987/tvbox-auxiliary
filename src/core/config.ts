@@ -1,7 +1,6 @@
 import type { SyncSchedule } from './types';
 
 // 默认阈值
-export const DEFAULT_SPEED_TIMEOUT_MS = 5000; // 配置 URL 超时（fetch 耗时筛选）
 export const DEFAULT_SITE_TIMEOUT_MS = 3000;  // 站点 API 超时
 export const DEFAULT_FETCH_TIMEOUT_MS = 30000; // fetch 配置 JSON 超时（30s，部分源响应较慢）
 
@@ -33,6 +32,11 @@ export const NAME_TRANSFORM = 'name_transform';
 
 // 源健康状态
 export const SOURCE_HEALTH = 'source_health';
+export const SOURCE_CONFIG_SNAPSHOTS = 'source_config_snapshots';
+export const SOURCE_IMPORT_POLICY_STATE = 'source_import_policy_state';
+export const SOURCE_IMPORT_POLICY = 'import-only-v1' as const;
+export const SOURCE_PROCESSING_REPORT = 'source_processing_report';
+export const SOURCE_OUTPUT_STATE = 'source_output_state';
 
 // 站点测速开关（默认启用）
 export const SPEED_TEST_ENABLED = 'speed_test_enabled';

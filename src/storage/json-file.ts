@@ -33,9 +33,14 @@ export class JsonFileStorage implements Storage {
   }
 
   async put(key: string, value: string): Promise<void> {
-    this.data[key] = value;
+    await this.putMany({ [key]: value });
+  }
+
+  async putMany(values: Record<string, string>): Promise<void> {
+    const next = { ...this.data, ...values };
     try {
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+      writeFileSync(this.filePath, JSON.stringify(next, null, 2));
+      this.data = next;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.error('storage', `Failed to write JSON file ${this.filePath}: ${msg}`);
@@ -45,9 +50,11 @@ export class JsonFileStorage implements Storage {
 
   async delete(key: string): Promise<void> {
     if (!(key in this.data)) return;
-    delete this.data[key];
+    const next = { ...this.data };
+    delete next[key];
     try {
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+      writeFileSync(this.filePath, JSON.stringify(next, null, 2));
+      this.data = next;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logger.error('storage', `Failed to write JSON file ${this.filePath}: ${msg}`);
