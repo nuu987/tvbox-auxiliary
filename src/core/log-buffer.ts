@@ -71,6 +71,11 @@ export function _resetForTest(): void {
   subscribers.clear();
 }
 
+// Test-only lifecycle observation; never used by production callers.
+export function _getSubscriberCountForTest(): number {
+  return subscribers.size;
+}
+
 // D-05: 模块加载时自动订阅 logger sink——与 logger 单例模式一致，
 // 避免显式 init 遗漏。log-buffer 模块被 import 即建立 sink→push 链。
 subscribeLogSink(push);

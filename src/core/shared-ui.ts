@@ -125,6 +125,11 @@ function streamSse(url, token, onMessage, onOpen, onError) {
   var controller = new AbortController();
   var decoder = new TextDecoder();
   var buf = '';
+  var reader = null;
+  function cancelReader() {
+    if (reader) reader.cancel().catch(function() {});
+  }
+  controller.signal.addEventListener('abort', cancelReader);
 
   (async function() {
     try {
@@ -132,20 +137,25 @@ function streamSse(url, token, onMessage, onOpen, onError) {
         headers: { Authorization: 'Bearer ' + token },
         signal: controller.signal,
       });
+      if (controller.signal.aborted) {
+        if (res.body) await res.body.cancel().catch(function() {});
+        return;
+      }
       if (!res.ok) {
         onError(new Error('HTTP ' + res.status));
         return;
       }
+      reader = res.body.getReader();
       if (onOpen) onOpen();
-      var reader = res.body.getReader();
-      while (true) {
+      while (!controller.signal.aborted) {
         var r = await reader.read();
+        if (controller.signal.aborted) return;
         if (r.done) break;
         // {stream:true} 处理跨 chunk 的多字节 UTF-8 字符（Pitfall 2，防中文乱码）
         buf += decoder.decode(r.value, { stream: true });
         // 按 '\\n\\n' 切完整帧，半帧留 buf（per WHATWG HTML §9.2）
         var idx;
-        while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+        while (!controller.signal.aborted && (idx = buf.indexOf('\\n\\n')) >= 0) {
           var frame = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
           // 解析帧：每行 'field: value'，跳过 ':' 注释行（heartbeat），合并多行 data
@@ -168,11 +178,17 @@ function streamSse(url, token, onMessage, onOpen, onError) {
         }
       }
       // 流正常结束（服务器关闭）——视为断开，触发重连
-      onError(new Error('stream ended'));
+      if (!controller.signal.aborted) onError(new Error('stream ended'));
     } catch (e) {
       // 主动 abort（AbortError）不触发 onError，避免断开时误触发重连
-      if (e && e.name === 'AbortError') return;
+      if (controller.signal.aborted || (e && e.name === 'AbortError')) return;
       onError(e);
+    } finally {
+      controller.signal.removeEventListener('abort', cancelReader);
+      if (reader) {
+        await reader.cancel().catch(function() {});
+        reader.releaseLock();
+      }
     }
   })();
 

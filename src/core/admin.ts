@@ -470,7 +470,7 @@ function switchTab(tab) {
   // Phase 6 VIEWER-03 (Plan 03): logs tab SSE 生命周期管理（D-17）
   // 切到 logs 时延迟初始化 SSE 连接，切走时主动 abort 释放（Pitfall 4 防泄漏）
   if (tab === 'logs') startLogStream();
-  else if (logSseHandle) stopLogStream();
+  else stopLogStream();
 }
 
 // --- Source health ---
@@ -1319,29 +1319,54 @@ async function triggerRefresh() {
 // D-13~D-18 锁定决策：不级别过滤 / DOM 500 / auto-scroll 底部跟随 / 持续实时流 / tab 集成 / 布局
 // 端点路径 /admin/logs 与 Plan 02 D-09 一致；token 走 Authorization 头（D-11）
 let logSseHandle = null;
+let logStreamGeneration = 0;
+let logRetryTimer = null;
 const LOG_DOM_MAX = 500;       // D-14: DOM 渲染上限
 
 function startLogStream() {
-  if (logSseHandle) return; // 防重复连接
+  if (logSseHandle || !$('panelLogs').classList.contains('active')) return;
+  if (logRetryTimer !== null) { clearTimeout(logRetryTimer); logRetryTimer = null; }
+  var generation = ++logStreamGeneration;
   var statusEl = $('logConnStatus');
   statusEl.textContent = '连接中...';
+  // Reserve ownership before opening; callbacks may run before the handle is returned.
+  logSseHandle = { abort: function() {} };
+  function isCurrent() {
+    return generation === logStreamGeneration && $('panelLogs').classList.contains('active');
+  }
   // D-11: streamSse 用 fetch + Authorization 头（不用 EventSource，无法设头）
-  logSseHandle = streamSse('/admin/logs', auth.getToken(),
-    function(data) { onLogEntry(data); },
-    function() { statusEl.textContent = '已连接'; },
-    function(err) {
+  var handle = streamSse('/admin/logs', auth.getToken(),
+    function(data) { if (isCurrent()) onLogEntry(data); },
+    function() {
+      if (!isCurrent()) return;
+      // Each connection replays full history. Replace only after a successful open.
+      var viewer = $('logViewer');
+      viewer.textContent = '';
+      viewer.scrollTop = 0;
+      statusEl.textContent = '已连接';
+    },
+    function() {
+      if (!isCurrent()) return;
+      stopLogStream();
       statusEl.textContent = '已断开';
-      logSseHandle = null;
-      // 固定 3s 重连（仅当 logs 面板仍激活——切走时 stopLogStream 已置 logSseHandle=null）
-      setTimeout(function() {
+      var retryGeneration = logStreamGeneration;
+      logRetryTimer = setTimeout(function() {
+        if (retryGeneration !== logStreamGeneration) return;
+        logRetryTimer = null;
         if ($('panelLogs').classList.contains('active')) startLogStream();
       }, 3000);
     }
   );
+  if (isCurrent()) logSseHandle = handle;
+  else handle.abort();
 }
 
 function stopLogStream() {
-  if (logSseHandle) { logSseHandle.abort(); logSseHandle = null; }
+  ++logStreamGeneration; // Invalidate callbacks before aborting the old transport.
+  if (logRetryTimer !== null) { clearTimeout(logRetryTimer); logRetryTimer = null; }
+  var handle = logSseHandle;
+  logSseHandle = null;
+  if (handle) handle.abort();
   $('logConnStatus').textContent = '未连接';
 }
 

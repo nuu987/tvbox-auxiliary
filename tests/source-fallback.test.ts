@@ -23,7 +23,12 @@ import { readAggregateOutputs, publishAggregatePatch } from '../src/core/aggrega
 import { beginSourceOutputRun, fingerprint, captureSourceBaseline } from '../src/core/source-fallback';
 import { prepareImportOnlyRun, sourceMigrationReport } from '../src/core/source-import-policy';
 import { patchMergedConfig } from '../src/core/blacklist';
-import { subscribeLogSink } from '../src/core/logger';
+import { logger, subscribeLogSink } from '../src/core/logger';
+import type { LogEntry } from '../src/core/logger';
+import { _resetForTest as resetLogBuffer, _getSubscriberCountForTest as logSubscriberCount,
+  getHistory as logHistory } from '../src/core/log-buffer';
+import { createLogViewerRouter } from '../src/routes/log-viewer';
+import { sharedUi } from '../src/core/shared-ui';
 import { adminHtml } from '../src/core/admin';
 import { dashboardHtml } from '../src/core/dashboard';
 import { configEditorHtml } from '../src/core/config-editor';
@@ -1978,4 +1983,310 @@ test('actual editor row scripts keep origins as escaped independent text in ever
     const missing = createContext({ input: { ...input, sourceNames: [] }, esc, escAttr: esc, typeSpan: () => '', SITE_TYPE_TIPS: {} });
     assert.doesNotMatch(new Script(selected + '\nsiteRow(input)').runInContext(missing), /item-source-name/);
   }
+});
+
+// Run actual generated Admin functions, including switchTab and the shared transport.
+class LogDomElement {
+  children: LogDomElement[] = [];
+  className = '';
+  scrollTop = 0;
+  clientHeight = 40;
+  checked = true;
+  private text = '';
+  private active = false;
+  dataset: { tab?: string } = {};
+  constructor(public id = '') {}
+  classList = {
+    contains: (name: string) => name === 'active' && this.active,
+    toggle: (_name: string, active: boolean) => { this.active = active; },
+  };
+  get scrollHeight() { return this.children.length * 20; }
+  get firstChild() { return this.children[0]; }
+  get textContent() { return this.children.length ? this.children.map(child => child.textContent).join('\n') : this.text; }
+  set textContent(value: string) { this.text = value; this.children = []; }
+  appendChild(child: LogDomElement) { this.children.push(child); }
+  removeChild(child: LogDomElement) { this.children.splice(this.children.indexOf(child), 1); }
+}
+type LogConnection = {
+  aborted: boolean;
+  abort(): void;
+  data(data: string): void;
+  open(): void;
+  error(error?: Error): void;
+};
+function logUi(transport?: { fetch: typeof fetch }) {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(text => text.includes('function switchTab(tab)'))!;
+  new Script(script);
+  const elements = Object.fromEntries(['panelLogs', 'panelSettings', 'panelSources', 'logConnStatus', 'logViewer', 'logAutoScroll']
+    .map(id => [id, new LogDomElement(id)]));
+  const panels = ['panelLogs', 'panelSettings', 'panelSources'].map(id => elements[id]);
+  const connections: LogConnection[] = [];
+  const timers = new Map<number, () => void>();
+  const allTimers = new Map<number, () => void>();
+  let timerId = 0;
+  const context = createContext({
+    $: (id: string) => elements[id],
+    auth: { getToken: () => 'test-token' },
+    document: { getElementById: (id: string) => elements[id],
+      querySelectorAll: (selector: string) => selector === '.tab-panel' ? panels : [],
+      createElement: () => new LogDomElement() },
+    setTimeout: (fn: () => void, ms: number) => {
+      assert.equal(ms, 3000);
+      timers.set(++timerId, fn); allTimers.set(timerId, fn); return timerId;
+    },
+    clearTimeout: (id: number) => { timers.delete(id); },
+    streamSse: (_url: string, token: string, data: LogConnection['data'], open: LogConnection['open'], error: LogConnection['error']) => {
+      assert.equal(token, 'test-token');
+      const connection: LogConnection = { aborted: false, abort() { this.aborted = true; }, data, open, error };
+      connections.push(connection); return connection;
+    },
+    ...(transport ? { fetch: transport.fetch, AbortController, TextDecoder } : {}),
+  });
+  const selected = script.slice(script.indexOf('function switchTab(tab)'), script.indexOf('// --- Source health ---'))
+    + script.slice(script.indexOf('let logSseHandle = null;'), script.indexOf('applyTheme(getTheme());', script.indexOf('let logSseHandle = null;')));
+  new Script((transport ? sharedUi : '') + selected).runInContext(context);
+  return { elements, connections, timers, allTimers,
+    tab: (tab: string) => new Script(`switchTab(${JSON.stringify(tab)})`).runInContext(context),
+    retry() { const [id, fn] = [...timers][0]; timers.delete(id); fn(); },
+    active: () => connections.filter(connection => !connection.aborted).length,
+  };
+}
+const logEntry = (message: string): LogEntry => ({ ts: '2026-10-13 17:24:52', level: 'info', scope: 'fixture', message });
+
+test('Admin tab cycles replace replayed history but preserve authentic identical entries', () => {
+  const ui = logUi();
+  const repeated = JSON.stringify(logEntry('同一秒真实产生的相同日志'));
+  for (let cycle = 0; cycle < 5; cycle++) {
+    ui.tab('logs');
+    const stream = ui.connections.at(-1)!;
+    ui.tab('logs'); assert.equal(ui.connections.length, cycle + 1);
+    stream.open(); assert.equal(ui.elements.logViewer.children.length, 0);
+    stream.data(repeated); stream.data(repeated); stream.data('malformed JSON');
+    assert.equal(ui.elements.logViewer.children.length, 2);
+    assert.equal(ui.elements.logViewer.children[0].textContent, ui.elements.logViewer.children[1].textContent);
+    ui.tab('settings');
+    assert.equal(ui.active(), 0); assert.equal(ui.timers.size, 0);
+    assert.equal(ui.elements.logViewer.children.length, 2);
+  }
+});
+
+test('Admin keeps logs on failure, has one retry, and cancels retries on leaving without a handle', () => {
+  const ui = logUi(); ui.tab('logs');
+  const first = ui.connections[0]; first.open(); first.data(JSON.stringify(logEntry('existing')));
+  first.error(new Error('disconnect'));
+  first.error(new Error('late second error'));
+  assert.equal(ui.timers.size, 1); assert.equal(ui.active(), 0);
+  ui.retry(); const second = ui.connections[1];
+  assert.equal(ui.elements.logViewer.children.length, 1);
+  second.error(new Error('HTTP 401'));
+  assert.equal(ui.elements.logViewer.children.length, 1);
+  const staleTimer = [...ui.timers.values()][0];
+  ui.tab('settings'); assert.equal(ui.timers.size, 0);
+  assert.equal(ui.elements.logConnStatus.textContent, '未连接');
+  ui.tab('logs'); ui.connections[2].open();
+  assert.equal(ui.elements.logViewer.children.length, 0);
+  staleTimer(); assert.equal(ui.connections.length, 3); assert.equal(ui.active(), 1);
+  ui.tab('settings');
+});
+
+test('Admin ignores old open/data/error callbacks while a newer connection is active', () => {
+  const ui = logUi(); ui.tab('logs'); const old = ui.connections[0];
+  old.open(); old.data(JSON.stringify(logEntry('old')));
+  ui.tab('settings'); ui.tab('logs'); const current = ui.connections[1];
+  current.open(); current.data(JSON.stringify(logEntry('current')));
+  old.open(); old.data(JSON.stringify(logEntry('stale'))); old.error(new Error('late error'));
+  assert.equal(ui.elements.logViewer.children.length, 1);
+  assert.match(ui.elements.logViewer.textContent, /current$/);
+  assert.equal(ui.elements.logConnStatus.textContent, '已连接');
+  assert.equal(ui.timers.size, 0); assert.equal(ui.active(), 1);
+  ui.tab('settings');
+});
+
+test('Admin keeps its 500-line cap and active-stream auto-scroll behavior', () => {
+  const ui = logUi(); ui.tab('logs'); const stream = ui.connections[0]; stream.open();
+  for (let i = 0; i < 510; i++) stream.data(JSON.stringify(logEntry('line-' + i)));
+  assert.equal(ui.elements.logViewer.children.length, 500);
+  assert.match(ui.elements.logViewer.firstChild.textContent, /line-10$/);
+  assert.equal(ui.elements.logViewer.scrollTop, ui.elements.logViewer.scrollHeight);
+  ui.elements.logViewer.scrollTop = 0;
+  stream.data(JSON.stringify(logEntry('scrolled-away')));
+  assert.equal(ui.elements.logViewer.scrollTop, 0);
+  ui.elements.logViewer.scrollTop = ui.elements.logViewer.scrollHeight;
+  ui.elements.logAutoScroll.checked = false;
+  stream.open();
+  stream.data(JSON.stringify(logEntry('auto-scroll-off')));
+  assert.equal(ui.elements.logViewer.scrollTop, 0);
+  assert.equal(ui.elements.logViewer.scrollHeight, 20);
+  ui.elements.logAutoScroll.checked = true;
+  stream.data(JSON.stringify(logEntry('auto-scroll-on')));
+  assert.equal(ui.elements.logViewer.scrollTop, 40);
+  ui.tab('settings');
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+function transportFixture(fetcher: typeof fetch) {
+  const messages: string[] = []; const errors: Error[] = []; let opens = 0;
+  const context = createContext({ fetch: fetcher, AbortController, TextDecoder,
+    onMessage: (data: string) => messages.push(data), onOpen: () => { opens++; }, onError: (error: Error) => errors.push(error) });
+  new Script(sharedUi + '\nvar handle = streamSse("/admin/logs", "test-token", onMessage, onOpen, onError);').runInContext(context);
+  return { messages, errors, opens: () => opens,
+    abort: () => new Script('handle.abort()').runInContext(context) };
+}
+
+test('shared SSE decodes split Chinese UTF-8 and frame boundaries, ignores heartbeats, and reports EOF once', async () => {
+  const encoder = new TextEncoder();
+  const body = encoder.encode(': ping\n\nid: unused\ndata: 中文第一行\ndata: 第二行\n\ndata: last\n\n');
+  const responseBody = new ReadableStream<Uint8Array>({ start(controller) {
+    // One-byte chunks split every multibyte character and every delimiter.
+    for (const byte of body) controller.enqueue(Uint8Array.of(byte)); controller.close();
+  } });
+  const fixture = transportFixture((async (_input: unknown, options?: RequestInit) => {
+    assert.equal((options!.headers as Record<string, string>).Authorization, 'Bearer test-token');
+    return new Response(responseBody);
+  }) as typeof fetch);
+  await tick();
+  assert.equal(fixture.opens(), 1);
+  assert.deepEqual(fixture.messages, ['中文第一行\n第二行', 'last']);
+  assert.equal(fixture.errors.length, 1); assert.match(fixture.errors[0].message, /stream ended/);
+  assert.equal(responseBody.locked, false);
+});
+
+test('shared SSE ignores responses delivered after abort and leaves failed connections unopened', async () => {
+  const request = deferred<Response>();
+  let cancelled = false;
+  const fixture = transportFixture((async () => request.promise) as typeof fetch);
+  const body = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+  fixture.abort(); request.resolve(new Response(body)); await tick();
+  assert.equal(fixture.opens(), 0); assert.deepEqual(fixture.messages, []); assert.deepEqual(fixture.errors, []);
+  assert.equal(cancelled, true);
+  const failed = transportFixture((async () => new Response('', { status: 401 })) as typeof fetch);
+  await tick(); assert.equal(failed.opens(), 0); assert.equal(failed.errors.length, 1);
+  assert.match(failed.errors[0].message, /HTTP 401/);
+  const missing = transportFixture((async () => new Response(null)) as typeof fetch);
+  await tick(); assert.equal(missing.opens(), 0); assert.equal(missing.errors.length, 1);
+});
+
+test('shared SSE cancels its reader and suppresses normally ended or failed reads after abort', async () => {
+  for (const failure of [false, true]) {
+    const read = deferred<{ done: boolean; value?: Uint8Array }>();
+    let cancels = 0; let releases = 0;
+    const fixture = transportFixture((async () => ({ ok: true, body: { getReader: () => ({
+      read: () => read.promise, cancel: async () => { cancels++; }, releaseLock: () => { releases++; },
+    }) } })) as unknown as typeof fetch);
+    await tick(); assert.equal(fixture.opens(), 1);
+    fixture.abort();
+    if (failure) read.reject(new Error('unrelated reader failure'));
+    else read.resolve({ done: false, value: new TextEncoder().encode('data: stale\n\n') });
+    await tick();
+    assert.ok(cancels >= 1); assert.equal(releases, 1);
+    assert.deepEqual(fixture.messages, []); assert.deepEqual(fixture.errors, []);
+  }
+});
+
+function resetLogsForCase() { resetLogBuffer(); restoreMocks.push(resetLogBuffer); }
+function observeLogHeartbeats() {
+  const originalSet = globalThis.setInterval; const originalClear = globalThis.clearInterval;
+  const timers = new Map<ReturnType<typeof setInterval>, () => void>();
+  globalThis.setInterval = ((fn: () => void, ms: number) => {
+    assert.equal(ms, 25_000); const timer = originalSet(() => {}, 60_000); timers.set(timer, fn); return timer;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => { timers.delete(timer); originalClear(timer); }) as typeof clearInterval;
+  restoreMocks.push(() => {
+    for (const timer of timers.keys()) originalClear(timer);
+    globalThis.setInterval = originalSet; globalThis.clearInterval = originalClear;
+  });
+  return timers;
+}
+function logStreamFrames(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  let buffer = ''; const decoder = new TextDecoder();
+  return async () => {
+    while (!buffer.includes('\n\n')) {
+      const next = await reader.read();
+      if (next.done) throw new Error('unexpected EOF');
+      buffer += decoder.decode(next.value, { stream: true });
+    }
+    const index = buffer.indexOf('\n\n'); const frame = buffer.slice(0, index); buffer = buffer.slice(index + 2);
+    return frame.startsWith(':') ? frame : JSON.parse(frame.slice('data: '.length)) as LogEntry;
+  };
+}
+
+test('log route subscribes before history replay, serializes live events, and keeps genuine repeats', async () => {
+  resetLogsForCase(); const heartbeats = observeLogHeartbeats();
+  for (let i = 0; i < 4; i++) logger.info('fixture', 'history-' + i);
+  const history = logHistory();
+  const route = createLogViewerRouter({ storage: new MemoryStorage(), config });
+  const res = await route.request('/admin/logs', { headers: adminHeaders });
+  assert.equal(res.status, 200); assert.match(res.headers.get('content-type')!, /text\/event-stream/);
+  assert.equal(logSubscriberCount(), 1); assert.equal(heartbeats.size, 1);
+  // Reader has not consumed history; these events arrive while replay is blocked.
+  logger.info('fixture', 'during-replay'); logger.info('fixture', 'during-replay');
+  const reader = res.body!.getReader(); const frame = logStreamFrames(reader);
+  try {
+    for (const entry of history) assert.deepEqual(await frame(), entry);
+    const first = await frame() as LogEntry; const second = await frame() as LogEntry;
+    assert.equal(first.message, 'during-replay'); assert.equal(second.message, 'during-replay');
+    const waiting = frame(); await tick(); logger.info('fixture', 'after-replay');
+    assert.equal((await waiting as LogEntry).message, 'after-replay');
+    [...heartbeats.values()][0](); assert.equal(await frame(), ': ping');
+  } finally { await reader.cancel(); }
+  await tick(); assert.equal(logSubscriberCount(), 0); assert.equal(heartbeats.size, 0);
+});
+
+test('log route cleans up cancellation during replay, including queued live data and request abort', async () => {
+  const heartbeats = observeLogHeartbeats();
+  for (const mode of ['reader', 'request', 'already-aborted']) {
+    resetLogsForCase();
+    for (let i = 0; i < 10; i++) logger.info('fixture', 'history-' + i);
+    const controller = new AbortController();
+    if (mode === 'already-aborted') controller.abort();
+    const res = await createLogViewerRouter({ storage: new MemoryStorage(), config })
+      .request('/admin/logs', { headers: adminHeaders, signal: controller.signal });
+    if (mode !== 'already-aborted') {
+      assert.equal(logSubscriberCount(), 1); logger.info('fixture', 'queued');
+    }
+    if (mode === 'reader') await res.body!.cancel(); else controller.abort();
+    await tick(); assert.equal(logSubscriberCount(), 0); assert.equal(heartbeats.size, 0);
+    if (mode !== 'reader') await res.body!.cancel();
+  }
+});
+
+test('log route cleans up idle cancellation and rejects unauthorized streams without subscriptions', async () => {
+  resetLogsForCase(); const heartbeats = observeLogHeartbeats();
+  const route = createLogViewerRouter({ storage: new MemoryStorage(), config });
+  assert.equal((await route.request('/admin/logs')).status, 401);
+  assert.equal(logSubscriberCount(), 0); assert.equal(heartbeats.size, 0);
+  const res = await route.request('/admin/logs', { headers: adminHeaders });
+  const reader = res.body!.getReader(); const frame = logStreamFrames(reader);
+  const count = logHistory().length; for (let i = 0; i < count; i++) await frame();
+  await tick(); await reader.cancel(); await tick();
+  assert.equal(logSubscriberCount(), 0); assert.equal(heartbeats.size, 0);
+});
+
+test('real Admin and shared transport rebuild the log window on EOF reconnect without extra streams', async () => {
+  let requests = 0; let active = 0; let maximumActive = 0;
+  const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+  const ui = logUi({ fetch: (async () => {
+    requests++; active++; maximumActive = Math.max(maximumActive, active);
+    let finished = false;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controllers.push(controller); },
+      cancel() { if (!finished) { finished = true; active--; } } });
+    return new Response(body);
+  }) as typeof fetch });
+  const encoded = new TextEncoder().encode('data: ' + JSON.stringify(logEntry('startup')) + '\n\n');
+  ui.tab('logs'); await tick(); controllers[0].enqueue(encoded); await tick();
+  assert.equal(ui.elements.logViewer.children.length, 1);
+  controllers[0].close(); await tick();
+  // Closing a mock source normally does not invoke its cancel hook.
+  active = 0;
+  assert.equal(ui.timers.size, 1); ui.retry(); await tick();
+  controllers[1].enqueue(encoded); await tick();
+  assert.equal(ui.elements.logViewer.children.length, 1); assert.equal(requests, 2); assert.equal(maximumActive, 1);
+  ui.tab('settings'); await tick(); assert.equal(active, 0); assert.equal(ui.timers.size, 0);
 });

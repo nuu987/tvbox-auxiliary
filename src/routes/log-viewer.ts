@@ -2,13 +2,13 @@
 // D-01: 用 Hono streamSSE 助手实现 SSE 长连接
 // D-09: 端点路径 /admin/logs，模块 src/routes/log-viewer.ts，导出 createLogViewerRouter 工厂
 // D-10: 复用 adminAuthMiddleware，Bearer Token 走 Authorization 头
-// D-12: 连接打开时先 flush log-buffer.getHistory() 历史快照，再 subscribe 实时推送
+// Snapshot and subscribe synchronously, then serialize history and queued live logs.
 
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { adminAuthMiddleware } from './admin-auth';
 import { getHistory, subscribe } from '../core/log-buffer';
-import { logger } from '../core/logger';
+import type { LogEntry } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 
@@ -27,33 +27,49 @@ export function createLogViewerRouter(deps: LogViewerRouteDeps): Hono {
   // D-09/D-12: GET /admin/logs SSE 端点，连接时回放历史 + 订阅实时
   router.get('/admin/logs', (c) => {
     return streamSSE(c, async (stream) => {
-      // D-12 Step 1: 先 flush 历史快照（按 getHistory 顺序，最旧→最新）
-      for (const entry of getHistory()) {
-        await stream.writeSSE({ data: JSON.stringify(entry) });
-      }
-
-      // D-12 Step 2: 订阅实时新日志——fire-and-forget（不 await writeSSE，防阻塞 logger 调用方，Anti-pattern 5）
-      // Pitfall 5: 可选 if (stream.closed) return 提前退出避免无谓 JSON.stringify
+      // No await between the snapshot and subscription: live logs cannot fall in a gap.
+      const pending: (LogEntry | null)[] = getHistory();
+      let stopped = false;
+      let wake: (() => void) | undefined;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const signal = c.req.raw.signal;
+      const notify = () => { const resolve = wake; wake = undefined; resolve?.(); };
       const unsubscribe = subscribe((entry) => {
-        if (stream.closed) return;
-        stream.writeSSE({ data: JSON.stringify(entry) }).catch(() => {});
+        if (stopped || stream.closed || stream.aborted) return;
+        pending.push(entry); // Never wait for network I/O inside the logger sink.
+        notify();
       });
-
-      // D-15: keep-alive 心跳——25s 间隔 : ping 注释帧，防中间代理断连
-      const heartbeat = setInterval(() => {
-        if (stream.closed) return;
-        stream.write(': ping\n\n').catch(() => {});
-      }, 25_000);
-
-      try {
-        // Step 4: 阻塞直到连接关闭（onAbort 或 stream.close）
-        await new Promise<void>((resolve) => {
-          stream.onAbort(() => resolve());
-        });
-      } finally {
-        // Step 5: 清理——确保订阅释放，防连接泄漏（T-06-conn-leak）
-        clearInterval(heartbeat);
+      const abort = () => stream.abort();
+      const cleanup = () => {
+        if (stopped) return;
+        stopped = true;
         unsubscribe();
+        if (heartbeat !== undefined) clearInterval(heartbeat);
+        signal.removeEventListener('abort', abort);
+        pending.length = 0;
+        notify();
+      };
+      // Cleanup is registered before replay, including disconnect during a blocked write.
+      stream.onAbort(cleanup);
+      signal.addEventListener('abort', abort);
+      try {
+        if (signal.aborted || stream.aborted || stream.closed) { abort(); return; }
+        heartbeat = setInterval(() => {
+          if (stopped || stream.closed || stream.aborted) return;
+          pending.push(null); // Heartbeats share the writer so data frames stay ordered.
+          notify();
+        }, 25_000);
+        while (!stopped && !stream.closed && !stream.aborted) {
+          if (pending.length === 0) {
+            await new Promise<void>((resolve) => { wake = resolve; });
+            continue;
+          }
+          const entry = pending.shift()!;
+          if (entry === null) await stream.write(': ping\n\n');
+          else await stream.writeSSE({ data: JSON.stringify(entry) });
+        }
+      } finally {
+        cleanup();
       }
     });
   });
