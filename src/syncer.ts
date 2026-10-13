@@ -667,7 +667,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   // Step 8: 存入存储
   const mergedJson = JSON.stringify(merged);
   await fallback.commit(async savedAt => {
-    await publishAggregateOutputs(storage, ticket, { merged: mergedJson, full: fullJson, exported: exportJson }, savedAt);
+    await publishAggregateOutputs(storage, ticket,
+      { merged: mergedJson, full: fullJson, exported: exportJson, siteSourceNames: mergeResult.siteSourceNames }, savedAt);
   });
   logger.infoFields('sync', 'storage-write-complete', {
     key: MERGED_CONFIG,
@@ -735,11 +736,12 @@ async function processMacCMSSources(
   const sites = macCMSToTVBoxSites(validEntries, BASE_URL_PLACEHOLDER, speedMap);
   logger.infoFields('sync', 'maccms-converted', { sites: sites.length });
 
-  return [{
+  return sites.map((site, index) => ({
     sourceUrl: 'maccms://builtin',
-    sourceName: 'MacCMS Sources',
-    config: { sites },
-  }];
+    sourceName: validEntries[index].name,
+    sourceIdentity: `maccms:${validEntries[index].key}`,
+    config: { sites: [site] },
+  }));
 }
 
 /**

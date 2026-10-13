@@ -2,6 +2,10 @@
 
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxDoh, TVBoxRule } from './types';
 
+export function siteDedupKey(site: TVBoxSite): string {
+  return `${site.key}|${site.api}`;
+}
+
 /**
  * 站点去重
  * 去重键: key + api（所有类型统一，JAR 差异不作为区分维度）
@@ -9,23 +13,20 @@ import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxDoh, TVBoxRule } from './ty
  */
 export function deduplicateSites(sites: TVBoxSite[]): TVBoxSite[] {
   const keyMap = new Map<string, TVBoxSite>(); // key → first site
-  const dedupKey = (site: TVBoxSite): string => {
-    return `${site.key}|${site.api}`;
-  };
 
   const result: TVBoxSite[] = [];
   const seen = new Set<string>();
   const usedKeys = new Map<string, number>(); // key → count, for suffix
 
   for (const site of sites) {
-    const dk = dedupKey(site);
+    const dk = siteDedupKey(site);
     if (seen.has(dk)) continue;
     seen.add(dk);
 
     // 处理 key 冲突：同 key 不同内容
     if (keyMap.has(site.key)) {
       const existing = keyMap.get(site.key)!;
-      if (dedupKey(existing) !== dk) {
+      if (siteDedupKey(existing) !== dk) {
         // key 冲突，加后缀
         const count = (usedKeys.get(site.key) || 1) + 1;
         usedKeys.set(site.key, count);

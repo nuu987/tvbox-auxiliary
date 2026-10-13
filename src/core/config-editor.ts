@@ -45,6 +45,34 @@ ${sharedStyles}
   color:var(--text-dim);
 }
 
+.item-title{
+  display:flex;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:4px 8px;
+  flex:1;
+  min-width:0;
+}
+
+.item-source-name{
+  font-family:var(--mono);
+  font-size:0.7rem;
+  font-weight:400;
+  color:var(--text-dim);
+  min-width:0;
+  max-width:100%;
+  white-space:normal;
+  overflow-wrap:anywhere;
+}
+
+/* Keep source attribution readable while blocked controls retain their dimming. */
+.item.blocked.has-source{opacity:1}
+.item.blocked.has-source .item-name,
+.item.blocked.has-source .item-check,
+.item.blocked.has-source .item-type,
+.item.blocked.has-source .item-api,
+.item.blocked.has-source .item-actions{opacity:0.4}
+
 .item-type{
   position:relative;
   font-size:0.6rem;
@@ -317,6 +345,10 @@ ${sharedStyles}
 .regex-badge.whitelisted{background:var(--green-dim);color:var(--green)}
 
 @media(max-width:560px){
+  .item.has-source{flex-wrap:wrap;gap:8px}
+  .item.has-source .item-label,
+  .item.has-source > .item-title{flex-basis:100%}
+  .item.has-source .item-api{flex:1;min-width:0}
   .apply-bar,.batch-bar{font-size:0.65rem;padding:8px 12px;gap:8px}
   .apply-bar .btn,.batch-bar .btn{font-size:0.6rem;padding:4px 8px}
 }
@@ -368,7 +400,7 @@ ${sharedStyles}
   <!-- Regex toggle button (collapsible, below search) -->
   <div class="regex-toggle-bar" onclick="toggleRegexPanel()">
     <span class="regex-toggle-arrow">&#9654;</span>
-    <span>正则表达式</span>
+    <span>高级屏蔽</span>
   </div>
 
   <!-- Regex panel (collapsible) -->
@@ -647,6 +679,14 @@ function renderSites() {
   container.innerHTML = html;
 }
 
+function siteTitle(s, badge) {
+  const sources = Array.isArray(s.sourceNames) ? s.sourceNames : [];
+  return '<span class="item-title">'
+    + '<span class="item-name" title="' + esc(s.key) + '">' + esc(s.name || s.key) + badge + '</span>'
+    + (sources.length ? '<span class="item-source-name">' + esc(sources.join('、')) + '</span>' : '')
+    + '</span>';
+}
+
 function siteRow(s) {
   let cls = 'item';
   let check = '';
@@ -670,12 +710,13 @@ function siteRow(s) {
     btn = '<button class="btn sm danger" onclick="block(\\'sites\\',\\'' + escAttr(s.fingerprint) + '\\')">' + "屏蔽" + '</button>';
   }
 
+  if (Array.isArray(s.sourceNames) && s.sourceNames.length) cls += ' has-source';
   const blockType = (s.isOverridden || s.regexBlocked) ? ' data-block-type="regex"' : s.blocked ? ' data-block-type="manual"' : '';
   if (check) {
     return '<div class="' + cls + '" data-id="' + esc(s.fingerprint) + '" data-type="sites"' + blockType + ' data-search="' + esc((s.name||'') + ' ' + s.key + ' ' + s.api) + '">'
       + '<label class="item-label">'
       + check
-      + '<span class="item-name" title="' + esc(s.key) + '">' + esc(s.name || s.key) + badge + '</span>'
+      + siteTitle(s, badge)
       + '</label>'
       + (s.errSource
         ? '<span class="item-type terr">ERR<span class="tooltip">' + esc(s.errReason || '接口源验证失败') + '</span></span>'
@@ -685,7 +726,7 @@ function siteRow(s) {
       + '</div>';
   } else {
     return '<div class="' + cls + '" data-id="' + esc(s.fingerprint) + '" data-type="sites"' + blockType + ' data-search="' + esc((s.name||'') + ' ' + s.key + ' ' + s.api) + '">'
-      + '<span class="item-name" style="flex:1" title="' + esc(s.key) + '">' + esc(s.name || s.key) + badge + '</span>'
+      + siteTitle(s, badge)
       + (s.errSource
         ? '<span class="item-type terr">ERR<span class="tooltip">' + esc(s.errReason || '接口源验证失败') + '</span></span>'
         : typeSpan(s.type, SITE_TYPE_TIPS))

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'crypto';
 import type { Storage } from '../storage/interface';
-import { EXPORT_CONFIG, LAST_UPDATE, MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY } from './config';
+import { EXPORT_CONFIG, LAST_UPDATE, MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY, SITE_SOURCE_ATTRIBUTION } from './config';
 import { withSourceGate } from './source-gate';
+import { encodeSiteSourceAttribution, readSiteSourceNames } from './site-source-attribution';
 
 interface OutputState {
   version: 1;
@@ -13,10 +14,16 @@ interface OutputState {
   published?: { runId: string; savedAt: string; epoch: string };
 }
 export interface OutputRunTicket { runId: string; epoch: string }
-export interface AggregateOutputs {
+interface AggregatePayloads {
   merged: string | null;
   full: string | null;
   exported: string | null;
+}
+export interface AggregatePublication extends AggregatePayloads {
+  siteSourceNames: string[][];
+}
+export interface AggregateOutputs extends AggregatePayloads {
+  siteSourceNames: string[][] | null;
   /** Private comparison token; never return it through an API. */
   token: string;
 }
@@ -100,7 +107,7 @@ export async function migrationOutputState(storage: Storage, ticket: OutputRunTi
 }
 
 /** Caller holds the source gate and has checked source membership revision. */
-export async function publishAggregateOutputs(storage: Storage, ticket: OutputRunTicket, outputs: Omit<AggregateOutputs, 'token'>, savedAt: string): Promise<void> {
+export async function publishAggregateOutputs(storage: Storage, ticket: OutputRunTicket, outputs: AggregatePublication, savedAt: string): Promise<void> {
   const state = decode(await storage.get(SOURCE_OUTPUT_STATE));
   if (activationFailures.has(storage) || !state || state.pending || state.epoch !== ticket.epoch || state.activeRun !== ticket.runId) {
     throw new Error('Aggregate output run superseded or sources revoked; run again');
@@ -109,6 +116,7 @@ export async function publishAggregateOutputs(storage: Storage, ticket: OutputRu
   await storage.putMany({
     [MERGED_CONFIG]: outputs.merged, [MERGED_CONFIG_FULL]: outputs.full, [EXPORT_CONFIG]: outputs.exported,
     [LAST_UPDATE]: savedAt,
+    [SITE_SOURCE_ATTRIBUTION]: encodeSiteSourceAttribution(ticket.runId, outputs.full, outputs.siteSourceNames),
     [SOURCE_OUTPUT_STATE]: JSON.stringify({ ...state, pending: false, blocked: false,
       published: { runId: ticket.runId, epoch: ticket.epoch, savedAt } }),
   });
@@ -118,13 +126,17 @@ async function readUnlocked(storage: Storage): Promise<AggregateOutputs | null> 
   if (activationFailures.has(storage)) return null;
   try {
     const raw = await storage.get(SOURCE_OUTPUT_STATE);
-    if (decode(raw)?.blocked) return null;
+    const state = decode(raw);
+    if (state?.blocked) return null;
     const merged = await storage.get(MERGED_CONFIG);
     const full = await storage.get(MERGED_CONFIG_FULL);
     const exported = await storage.get(EXPORT_CONFIG);
+    let attribution: string | null = null;
+    try { attribution = await storage.get(SITE_SOURCE_ATTRIBUTION); } catch { /* Optional editor metadata. */ }
+    const siteSourceNames = readSiteSourceNames(attribution, full || merged, state?.published?.runId);
     // Include payloads: two legacy/instant patches may have identical state metadata.
-    const token = createHash('sha256').update(JSON.stringify([raw, merged, full, exported])).digest('hex');
-    return { merged, full, exported, token };
+    const token = createHash('sha256').update(JSON.stringify([raw, merged, full, exported, attribution])).digest('hex');
+    return { merged, full, exported, siteSourceNames, token };
   } catch { return null; }
 }
 export async function readAggregateOutputs(storage: Storage): Promise<AggregateOutputs | null> {

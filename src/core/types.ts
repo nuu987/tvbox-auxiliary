@@ -106,6 +106,7 @@ export interface SourceEntry {
 export interface SourcedConfig {
   sourceUrl: string;
   sourceName: string;
+  sourceIdentity?: string; // Internal attribution identity; does not change URL normalization
   config: TVBoxConfig;
   speedMs?: number; // 配置 URL 响应时间
   prepared?: boolean; // Internal: already normalized once; no extra field-type validation

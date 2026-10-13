@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import type { Storage } from '../src/storage/interface';
-import type { SourceEntry, TVBoxConfig, AppConfig } from '../src/core/types';
+import type { SourceEntry, TVBoxConfig, TVBoxSite, AppConfig } from '../src/core/types';
 import { SourceFallbackRound, withSourceGate, saveSourceRoots, sourceAggregationStatuses } from '../src/core/source-fallback';
 import { fetchConfigs, parseConfigJson } from '../src/core/fetcher';
 import { decodeConfigResponse } from '../src/core/decoder';
@@ -26,10 +26,13 @@ import { patchMergedConfig } from '../src/core/blacklist';
 import { subscribeLogSink } from '../src/core/logger';
 import { adminHtml } from '../src/core/admin';
 import { dashboardHtml } from '../src/core/dashboard';
+import { configEditorHtml } from '../src/core/config-editor';
+import { encodeSiteSourceAttribution } from '../src/core/site-source-attribution';
 import { Script, createContext } from 'node:vm';
 import { BLACKLIST, MANUAL_SOURCES, MERGED_CONFIG, LAST_UPDATE, SOURCE_CONFIG_SNAPSHOTS,
   SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, MACCMS_SOURCES,
-  MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS } from '../src/core/config';
+  MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS,
+  SITE_SOURCE_ATTRIBUTION, EDGE_PROXIES } from '../src/core/config';
 
 class MemoryStorage implements Storage {
   data = new Map<string, string>();
@@ -1206,14 +1209,16 @@ test('JsonFileStorage commits batches in one persisted image and failed batches 
 });
 
 test('all final output keys publish together and injected batch failures preserve prior views and snapshot claims', async () => {
-  for (const failedKey of [MERGED_CONFIG, MERGED_CONFIG_FULL, EXPORT_CONFIG, LAST_UPDATE, SOURCE_OUTPUT_STATE]) {
+  for (const failedKey of [MERGED_CONFIG, MERGED_CONFIG_FULL, EXPORT_CONFIG, LAST_UPDATE, SOURCE_OUTPUT_STATE, SITE_SOURCE_ATTRIBUTION]) {
     const storage = new MemoryStorage(); await roots(storage, [A]); let key = 'A1';
     mockFetch(() => response(leaf(key))); await runSync(storage, config);
     const oldOutputs = await rawOutputs(storage); const oldSnapshot = await snapshot(storage);
+    const oldAttribution = await storage.get(SITE_SOURCE_ATTRIBUTION);
     const oldPublished = (await outputState(storage)).published;
     storage.failBatch = values => MERGED_CONFIG in values && failedKey in values;
     key = 'A2'; await runSync(storage, config);
     assert.deepEqual(await rawOutputs(storage), oldOutputs);
+    assert.equal(await storage.get(SITE_SOURCE_ATTRIBUTION), oldAttribution);
     assert.deepEqual(await snapshot(storage), oldSnapshot);
     assert.deepEqual((await outputState(storage)).published, oldPublished);
     assert.equal((await outputState(storage)).blocked, false);
@@ -1257,10 +1262,12 @@ test('timed-out late aggregation cannot overwrite newer outputs even when the ne
   assert.equal((await outputState(storage)).activeRun, firstRun);
   assert.equal((await guard()).ran, true);
   const newestOutputs = await rawOutputs(storage); const newestTime = await storage.get(LAST_UPDATE);
+  const newestAttribution = await storage.get(SITE_SOURCE_ATTRIBUTION);
   assert.ok(newestOutputs.every(raw => raw!.includes('newest')));
   assert.equal((await snapshot(storage)).config.sites[0].key, 'baseline');
   storage.failPut = undefined; resume(); await runs[0];
   assert.deepEqual(await rawOutputs(storage), newestOutputs);
+  assert.equal(await storage.get(SITE_SOURCE_ATTRIBUTION), newestAttribution);
   assert.equal(await storage.get(LAST_UPDATE), newestTime);
   assert.equal((await readAggregateOutputs(storage))!.full!.includes('late-old'), false);
 });
@@ -1787,5 +1794,188 @@ test('corrupt policy completion cannot skip legacy migration or expose malformed
     await runSync(storage, config);
     assert.equal(requests, 1); assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!), []);
     assert.equal((await sourceMigrationReport(storage))!.removed[0].url, M.url);
+  }
+});
+
+async function editorSites(storage: Storage, editorConfig = config) {
+  const res = await createConfigEditorRouter({ storage, config: editorConfig })
+    .request('/admin/config-data', { headers: adminHeaders });
+  assert.equal(res.status, 200);
+  const data: { sites: (TVBoxSite & { sourceNames: string[]; fingerprint: string; blocked: boolean })[] } = JSON.parse(await res.text());
+  return data.sites;
+}
+
+test('merge attributes all duplicate contributors without changing first content, suffix collisions or input configs', () => {
+  const site = (key: string, api: string, name: string): TVBoxSite => ({ key, api, name, type: 3 });
+  const sources = [
+    { sourceUrl: A.url, sourceName: 'Same name', config: { sites: [
+      site('shared', 'csp_common', 'Winner'), site('shared', 'csp_common', 'Discarded same-source'),
+      site('conflict', 'csp_a', 'First'), site('other-key', 'csp_common', 'Other key'),
+    ] } },
+    { sourceUrl: B.url, sourceName: 'B', config: { sites: [
+      site('shared', 'csp_common', 'Discarded other-source'), site('conflict', 'csp_b', 'Second'),
+    ] } },
+    { sourceUrl: N.url, sourceName: 'Same name', config: { sites: [
+      site('shared', 'csp_common', 'Discarded same-name'), site('conflict_2', 'csp_b', 'Original suffix'),
+    ] } },
+  ];
+  const before = JSON.stringify(sources); const merged = mergeConfigs(sources);
+  assert.deepEqual(merged.config.sites!.map(s => [s.key, s.api, s.name]), [
+    ['shared', 'csp_common', 'Winner'], ['conflict', 'csp_a', 'First'], ['other-key', 'csp_common', 'Other key'],
+    ['conflict_2', 'csp_b', 'Second(2)'], ['conflict_2', 'csp_b', 'Original suffix'],
+  ]);
+  assert.deepEqual(merged.siteSourceNames, [['Same name', 'B', 'Same name'], ['Same name'], ['Same name'], ['B'], ['Same name']]);
+  assert.equal(JSON.stringify(sources), before);
+  assert.doesNotMatch(JSON.stringify(merged.config), /siteSourceNames|sourceIdentity|sourceNames/);
+  const normalized = mergeConfigs([
+    { sourceUrl: 'https://same.test/folder/config', sourceName: 'Relative', config: { sites: [{ key: 'api', type: 1, api: '../api' }] } },
+    { sourceUrl: 'https://same.test/config', sourceName: 'Absolute', config: { sites: [{ key: 'api', type: 1, api: 'https://same.test/api' }] } },
+  ]);
+  assert.equal(normalized.config.sites!.length, 1);
+  assert.deepEqual(normalized.siteSourceNames, [['Relative', 'Absolute']]);
+});
+
+test('full aggregation publishes fresh restored and inline origins without polluting config, snapshots or health', async () => {
+  const storage = new MemoryStorage(); const local = { url: 'inline://inline_config_origins', name: 'Local interface' };
+  await roots(storage, [A, B, local]); await storage.put('inline_config_origins', JSON.stringify(leaf('shared')));
+  let failingA = false;
+  mockFetch(url => url === A.url && failingA ? new Response('', { status: 404 }) : response(leaf('shared')));
+  await runSync(storage, config); const original = await snapshot(storage); const localOriginal = await snapshot(storage, local);
+  let sites = await editorSites(storage);
+  assert.deepEqual(sites.map(s => s.sourceNames), [['A', 'B', 'Local interface']]);
+  const fingerprint = sites[0].fingerprint;
+  for (const raw of await rawOutputs(storage)) assert.doesNotMatch(raw!, /sourceNames|sourceIdentity|siteSourceNames/);
+  const savedMetadata = JSON.parse((await storage.get(SITE_SOURCE_ATTRIBUTION))!);
+  assert.equal(savedMetadata.runId, (await outputState(storage)).published.runId);
+  assert.doesNotMatch(JSON.stringify(savedMetadata), /https:|inline:|configKey|generation/);
+  failingA = true; await storage.delete('inline_config_origins'); await runSync(storage, config);
+  sites = await editorSites(storage);
+  assert.deepEqual(sites[0].sourceNames, ['A', 'B', 'Local interface']);
+  assert.equal(sites[0].name, 'shared'); assert.equal(sites[0].fingerprint, fingerprint);
+  assert.deepEqual(await snapshot(storage), original); assert.deepEqual(await snapshot(storage, local), localOriginal);
+  const a = (await status(storage)).records.find((r: { url: string }) => r.url === A.url);
+  assert.equal(a.fetchStatus, 'http_404'); assert.equal(a.consecutiveFailures, 1);
+  assert.equal(a.aggregation.lastSuccessful.snapshotTime, original.savedAt);
+  // An active newer run must not hide the attribution belonging to still-readable prior output.
+  await beginSourceOutputRun(storage);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, ['A', 'B', 'Local interface']);
+  const app = createApp({ storage, config, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  assert.equal((await app.request('/admin/config-data')).status, 401);
+});
+
+test('independent MacCMS rows retain their entry origins, validation filtering, proxy path and latency names', async () => {
+  for (const edge of [false, true]) {
+    const storage = new MemoryStorage(); await roots(storage, [A]);
+    await storage.put(MACCMS_SOURCES, JSON.stringify([
+      { key: 'one', name: 'CMS One', api: 'https://cms-one.test/api' },
+      { key: 'two', name: 'CMS Two', api: 'https://cms-two.test/api' },
+    ]));
+    if (edge) await storage.put(EDGE_PROXIES, JSON.stringify({ vercel: 'https://edge.test' }));
+    let failingTwo = false; const calls: string[] = [];
+    mockFetch(url => {
+      calls.push(url);
+      if (url === A.url) return response(leaf('vod'));
+      return new Response(JSON.stringify({ list: [] }), { status: failingTwo && url.includes('cms-two') ? 404 : 200 });
+    });
+    await runSync(storage, config); let sites = await editorSites(storage);
+    assert.deepEqual(sites.map(s => s.sourceNames), [['A'], ['CMS One'], ['CMS Two']]);
+    assert.match(sites[1].name!, edge ? /^CMS One$/ : /^CMS One \[\d+\.\ds\]$/);
+    assert.ok(sites[1].api.includes('/api/one'));
+    assert.deepEqual(Object.keys((await registry(storage)).nodes), [A.url]);
+    assert.equal(calls.filter(url => url.includes('cms-one.test')).length, edge ? 0 : 1);
+    failingTwo = true; await runSync(storage, config); sites = await editorSites(storage);
+    assert.deepEqual(sites.map(s => s.sourceNames), edge ? [['A'], ['CMS One'], ['CMS Two']] : [['A'], ['CMS One']]);
+  }
+});
+
+test('missing damaged or mismatched attribution never invents sources or disables ordinary output', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  mockFetch(() => response(leaf('known'))); await runSync(storage, config);
+  const raw = (await storage.get(SITE_SOURCE_ATTRIBUTION))!;
+  const envelope: { version: number; runId: string; fullHash: string; rows: unknown[] } = JSON.parse(raw);
+  for (const corrupt of [null, '{broken', JSON.stringify([]),
+    JSON.stringify({ ...envelope, version: 2 }), JSON.stringify({ ...envelope, runId: 'old-publication' }),
+    JSON.stringify({ ...envelope, fullHash: 'wrong' }), JSON.stringify({ ...envelope, rows: [] }),
+    JSON.stringify({ ...envelope, rows: [[123]] }), JSON.stringify({ ...envelope, rows: [['']] })]) {
+    if (corrupt === null) await storage.delete(SITE_SOURCE_ATTRIBUTION);
+    else await storage.put(SITE_SOURCE_ATTRIBUTION, corrupt);
+    assert.deepEqual((await editorSites(storage))[0].sourceNames, []);
+    assert.ok((await readAggregateOutputs(storage))!.merged!.includes('known'));
+  }
+  await storage.put(SITE_SOURCE_ATTRIBUTION, raw);
+  storage.failGet = SITE_SOURCE_ATTRIBUTION;
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, []); storage.failGet = undefined;
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, ['A']);
+  const full = (await storage.get(MERGED_CONFIG_FULL))!;
+  await storage.put(MERGED_CONFIG_FULL, full + ' ');
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, []);
+  await storage.delete(MERGED_CONFIG_FULL);
+  const merged = (await storage.get(MERGED_CONFIG))!;
+  await storage.put(SITE_SOURCE_ATTRIBUTION, encodeSiteSourceAttribution(envelope.runId, merged, [['Fallback view']]));
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, ['Fallback view']);
+  // Untracked legacy data and user-supplied fields cannot fabricate authoritative provenance.
+  const legacy = new MemoryStorage(); const forged = JSON.stringify({ sites: [{ ...leaf('forged').sites![0], sourceNames: ['Untrusted'] }] });
+  await legacy.put(MERGED_CONFIG_FULL, forged); await legacy.put(MERGED_CONFIG, forged);
+  await legacy.put(SITE_SOURCE_ATTRIBUTION, encodeSiteSourceAttribution('untracked', forged, [['Untrusted']]));
+  assert.deepEqual((await editorSites(legacy))[0].sourceNames, []);
+  // Identical FULL bytes can represent different successful source-name publications.
+  await roots(storage, [{ ...A, name: 'Renamed interface' }]); await runSync(storage, config);
+  assert.equal(await storage.get(MERGED_CONFIG_FULL), full);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, ['Renamed interface']);
+  const newMetadata = (await storage.get(SITE_SOURCE_ATTRIBUTION))!;
+  await storage.put(SITE_SOURCE_ATTRIBUTION, raw);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, []);
+  await storage.put(SITE_SOURCE_ATTRIBUTION, newMetadata);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, ['Renamed interface']);
+});
+
+test('editor attributes the raw published view before host substitution and preserves current sources through patches and deletion', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]);
+  mockFetch(url => response(leaf(url === A.url ? 'A1' : 'B1'))); await runSync(storage, config);
+  const captured = (await readAggregateOutputs(storage))!;
+  await storage.put(SITE_SOURCE_ATTRIBUTION, (await storage.get(SITE_SOURCE_ATTRIBUTION))! + ' ');
+  assert.equal(await publishAggregatePatch(storage, captured.token, captured.merged!, captured.exported!), false);
+  const oldMetadata = await storage.get(SITE_SOURCE_ATTRIBUTION);
+  const fp = (await editorSites(storage))[0].fingerprint;
+  await storage.put(BLACKLIST, JSON.stringify({ sites: [fp], parses: [], lives: [], regexRules: [], regexBlockOverrides: [] }));
+  assert.equal((await patchMergedConfig(storage)).patched, true);
+  assert.equal(await storage.get(SITE_SOURCE_ATTRIBUTION), oldMetadata);
+  assert.equal((await editorSites(storage))[0].blocked, true);
+  assert.deepEqual((await editorSites(storage)).map(s => s.sourceNames), [['A'], ['B']]);
+  await roots(storage, [B]); assert.deepEqual((await editorSites(storage)).map(s => s.sourceNames), [['A'], ['B']]);
+  mockFetch(() => new Response('', { status: 404 })); await runSync(storage, config);
+  assert.deepEqual((await editorSites(storage)).map(s => s.sourceNames), [['B']]);
+  await roots(storage, []); await runSync(storage, config); assert.deepEqual(await editorSites(storage), []);
+  const host = new MemoryStorage(); await roots(host, [A]);
+  await host.put(MACCMS_SOURCES, JSON.stringify([{ key: 'host', name: 'Host source', api: 'https://host.test/api' }]));
+  mockFetch(url => url === A.url ? response(leaf('vod')) : new Response(JSON.stringify({ list: [] })));
+  await runSync(host, config);
+  const one = await editorSites(host, { ...config, localBaseUrl: 'https://first.test' });
+  const two = await editorSites(host, { ...config, localBaseUrl: 'https://second.test' });
+  assert.deepEqual(one.map(s => s.sourceNames), [['A'], ['Host source']]);
+  assert.deepEqual(two.map(s => s.sourceNames), one.map(s => s.sourceNames));
+  assert.ok(one[1].api.includes('first.test')); assert.ok(two[1].api.includes('second.test'));
+});
+
+test('actual editor row scripts keep origins as escaped independent text in every blocking state', () => {
+  const scripts = [...configEditorHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
+  for (const script of scripts) new Script(script);
+  const script = scripts.find(text => text.includes('function siteRow(s)'))!;
+  const selected = script.slice(script.indexOf('function siteTitle(s, badge)'), script.indexOf('function renderParses()'));
+  const source = '<source & "quoted"> 🎬 ' + 'long-interface-name'.repeat(200);
+  const esc = (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  for (const flags of [{}, { blocked: true }, { blocked: true, regexBlocked: true }, { isOverridden: true }]) {
+    const input = { ...leaf('site').sites![0], fingerprint: 'fp', sourceNames: [source, 'Other interface'], ...flags };
+    const before = JSON.stringify(input);
+    const context = createContext({ input, esc, escAttr: esc, typeSpan: () => '', SITE_TYPE_TIPS: {} });
+    const rendered: string = new Script(selected + '\nsiteRow(input)').runInContext(context);
+    assert.match(rendered, /class="item-source-name"/);
+    assert.ok(rendered.includes(esc(source) + '、Other interface'));
+    assert.ok(!rendered.includes(source)); assert.doesNotMatch(rendered, /source-url/);
+    assert.match(rendered, /data-search="site site csp_site"/);
+    assert.ok(!rendered.slice(rendered.indexOf('data-search='), rendered.indexOf('data-search=') + 45).includes('source'));
+    assert.equal(JSON.stringify(input), before);
+    const missing = createContext({ input: { ...input, sourceNames: [] }, esc, escAttr: esc, typeSpan: () => '', SITE_TYPE_TIPS: {} });
+    assert.doesNotMatch(new Script(selected + '\nsiteRow(input)').runInContext(missing), /item-source-name/);
   }
 });

@@ -52,7 +52,7 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
 
     // Build sites with fingerprint + blocked status + group
     const sites = [];
-    for (const site of parsed.sites || []) {
+    for (const [index, site] of (parsed.sites || []).entries()) {
       const fp = await siteFingerprint(site);
       const api = site.api || '';
       let group = '其他';
@@ -66,7 +66,8 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
       const overridden = !fingerprintBlocked && overrideSet.has(name);
       const regexBlocked = !fingerprintBlocked && !overridden && compiledRegex.some(re => re.test(name));
       const isOverridden = overridden && compiledRegex.some(re => re.test(name));
-      sites.push({ ...site, fingerprint: fp, blocked: fingerprintBlocked || regexBlocked, regexBlocked, isOverridden, group });
+      sites.push({ ...site, sourceNames: outputs?.siteSourceNames?.[index] || [],
+        fingerprint: fp, blocked: fingerprintBlocked || regexBlocked, regexBlocked, isOverridden, group });
     }
 
     const parses = (parsed.parses || []).map(p => ({

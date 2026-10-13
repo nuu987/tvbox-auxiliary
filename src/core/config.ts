@@ -37,6 +37,7 @@ export const SOURCE_IMPORT_POLICY_STATE = 'source_import_policy_state';
 export const SOURCE_IMPORT_POLICY = 'import-only-v1' as const;
 export const SOURCE_PROCESSING_REPORT = 'source_processing_report';
 export const SOURCE_OUTPUT_STATE = 'source_output_state';
+export const SITE_SOURCE_ATTRIBUTION = 'site_source_attribution';
 
 // 智能 JAR 地址开关（默认关闭）— 启用时输出路由按请求 host 替换 BASE_URL_PLACEHOLDER
 export const SMART_JAR_URL_ENABLED = 'smart_jar_url_enabled';

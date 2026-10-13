@@ -4,6 +4,7 @@ import type { TVBoxConfig, TVBoxSite, SourcedConfig } from './types';
 import { normalizeConfig, extractSpiderJarUrl } from './parser';
 import {
   deduplicateSites,
+  siteDedupKey,
   deduplicateParses,
   deduplicateLives,
   deduplicateDoh,
@@ -22,6 +23,7 @@ import { logger } from './logger';
  */
 export interface MergeResult {
   config: TVBoxConfig;
+  siteSourceNames: string[][];
 }
 
 export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
@@ -34,6 +36,8 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
 
   // Step 3: 收集并合并所有字段
   const allSites: TVBoxSite[] = [];
+  const siteGroups = new WeakMap<TVBoxSite, Map<string, string>>();
+  const sourceGroups = new Map<string, Map<string, string>>();
   const allParses: TVBoxConfig['parses'] = [];
   const allLives: TVBoxConfig['lives'] = [];
   const allHosts: string[] = [];
@@ -57,6 +61,18 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
           }
         }
 
+        // Capture duplicate groups before dedup mutates conflicting keys/names.
+        const groupKey = siteDedupKey(siteCopy);
+        let origins = sourceGroups.get(groupKey);
+        if (!origins) {
+          origins = new Map();
+          sourceGroups.set(groupKey, origins);
+        }
+        const identity = sourced.sourceIdentity || sourced.sourceUrl;
+        if (typeof sourced.sourceName === 'string' && sourced.sourceName && !origins.has(identity)) {
+          origins.set(identity, sourced.sourceName);
+        }
+        siteGroups.set(siteCopy, origins);
         allSites.push(siteCopy);
       }
     }
@@ -88,7 +104,7 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
 
   logger.info('merger', `Merged: ${merged.sites?.length} sites, ${merged.parses?.length} parses, ${merged.lives?.length} lives`);
 
-  return { config: merged };
+  return { config: merged, siteSourceNames: dedupedSites.map(site => Array.from(siteGroups.get(site)?.values() || [])) };
 }
 
 /**
