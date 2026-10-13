@@ -10,6 +10,7 @@ data/
 dev-log/
 .ace-tool/
 CLAUDE.md
+AGENTS.md
 tmp/
 
 tests/

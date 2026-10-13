@@ -3,20 +3,20 @@
     "version": "1.1.0",
     "private": true,
     "scripts": {
-      "build:node": "node scripts/build.js",
-      "start": "node scripts/start.js",
-      "test:source-fallback": "node scripts/test-source-fallback.js"
+        "build:node": "node scripts/build.js",
+        "start": "node scripts/start.js",
+        "test:source-fallback": "node scripts/test-source-fallback.js"
     },
     "dependencies": {
-      "@hono/node-server": "^1.13.0",
-      "dotenv": "^16.4.0",
-      "hono": "^4.7.0",
-      "node-cron": "^3.0.3"
+        "@hono/node-server": "^1.13.0",
+        "dotenv": "^16.4.0",
+        "hono": "^4.7.0",
+        "node-cron": "^3.0.3"
     },
     "devDependencies": {
-      "@types/node": "^22.0.0",
-      "@types/node-cron": "^3.0.11",
-      "esbuild": "^0.24.0",
-      "typescript": "^5.7.0"
+        "@types/node": "^22.0.0",
+        "@types/node-cron": "^3.0.11",
+        "esbuild": "^0.24.0",
+        "typescript": "^5.7.0"
     }
-  }
+}

@@ -38,7 +38,10 @@ export async function decodeConfigResponse(
   }
 
   // 非 JSON → 用 Latin-1 解码保留所有字节（用于二进制标记检测）
-  const text = new TextDecoder('latin1').decode(buffer);
+  // 注：'latin1' 不在 WHATWG TextDecoder 必选集（仅 utf-8/utf-16le/utf-16be 强制），
+  // 规范严格的运行时（浏览器/polyfill/部分 Node 构建）会抛 RangeError。
+  // 改用 Buffer.toString('latin1')：Node 核心 API 全版本支持，与字节级标记检测语义等价。
+  const text = Buffer.from(buffer).toString('latin1');
 
   // 格式 1：图片伪装 + Base64（[A-Za-z0]{8}** 标记）
   const imageDecoded = decodeImageWrapped(text);
