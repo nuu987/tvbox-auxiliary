@@ -22,7 +22,6 @@ services:
       # - MACCMS_API_URL=${MACCMS_API_URL:-}
       # - MACCMS_AES_KEY=${MACCMS_AES_KEY:-}
       # - MACCMS_AES_IV=${MACCMS_AES_IV:-}
-      # - ZBAPE_API_KEY=${ZBAPE_API_KEY:-}
       # - FETCH_TIMEOUT_MS=${FETCH_TIMEOUT_MS:-5000}
       # - SITE_TIMEOUT_MS=${SITE_TIMEOUT_MS:-3000}
     restart: unless-stopped

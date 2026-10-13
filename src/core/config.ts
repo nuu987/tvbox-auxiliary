@@ -38,9 +38,6 @@ export const SOURCE_IMPORT_POLICY = 'import-only-v1' as const;
 export const SOURCE_PROCESSING_REPORT = 'source_processing_report';
 export const SOURCE_OUTPUT_STATE = 'source_output_state';
 
-// 站点测速开关（默认启用）
-export const SPEED_TEST_ENABLED = 'speed_test_enabled';
-
 // 智能 JAR 地址开关（默认关闭）— 启用时输出路由按请求 host 替换 BASE_URL_PLACEHOLDER
 export const SMART_JAR_URL_ENABLED = 'smart_jar_url_enabled';
 

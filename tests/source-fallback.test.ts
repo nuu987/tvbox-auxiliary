@@ -9,9 +9,9 @@ import { SourceFallbackRound, withSourceGate, saveSourceRoots, sourceAggregation
 import { fetchConfigs, parseConfigJson } from '../src/core/fetcher';
 import { decodeConfigResponse } from '../src/core/decoder';
 import { mergeConfigs } from '../src/core/merger';
-import { filterUnreachableSites } from '../src/core/speedtest';
 import { JsonFileStorage } from '../src/storage/json-file';
 import { runSync } from '../src/syncer';
+import { createApp } from '../src/routes';
 import { createSourceMgmtRouter } from '../src/routes/source-management';
 import { createDashboardRouter } from '../src/routes/dashboard';
 import { createConfigOutputRouter } from '../src/routes/config-output';
@@ -28,7 +28,7 @@ import { adminHtml } from '../src/core/admin';
 import { dashboardHtml } from '../src/core/dashboard';
 import { Script, createContext } from 'node:vm';
 import { BLACKLIST, MANUAL_SOURCES, MERGED_CONFIG, LAST_UPDATE, SOURCE_CONFIG_SNAPSHOTS,
-  SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, SPEED_TEST_ENABLED, MACCMS_SOURCES,
+  SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, MACCMS_SOURCES,
   MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS } from '../src/core/config';
 
 class MemoryStorage implements Storage {
@@ -80,7 +80,6 @@ afterEach(() => {
 
 async function roots(storage: Storage, sources: SourceEntry[]) {
   await withSourceGate(storage, () => saveSourceRoots(storage, sources));
-  await storage.put(SPEED_TEST_ENABLED, 'false');
 }
 async function registry(storage: Storage) { return JSON.parse((await storage.get(SOURCE_CONFIG_SNAPSHOTS))!); }
 async function snapshot(storage: Storage, source = A) { return (await registry(storage)).nodes[source.url]?.snapshot; }
@@ -589,14 +588,6 @@ test('policy filtering cannot restore excluded content; snapshots stay raw befor
   fail = true; await runSync(storage, config);
   assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.map((s: any) => s.key), ['B1']);
   assert.deepEqual(await snapshot(storage), before);
-  const sites = [
-    { key: 'a', type: 1, api: 'https://a.test', name: 'a' },
-    { key: 'b', type: 1, api: 'https://b.test', name: 'b' },
-    { key: 'local', type: 3, api: 'csp_local' },
-  ];
-  assert.deepEqual(filterUnreachableSites(sites, new Map([['a', null], ['b', 5]])).sites.map(s => s.key), ['b', 'local']);
-  assert.equal(filterUnreachableSites(sites, new Map([['a', null], ['b', null]])).sites.length, 3);
-  assert.equal(filterUnreachableSites(sites, new Map()).sites.length, 3);
   const round = await SourceFallbackRound.begin(storage);
   const a = round.resolve(A, null, failed)!;
   const merged = mergeConfigs([{ sourceUrl: A.url, sourceName: A.name, ...a }, { sourceUrl: B.url, sourceName: B.name, config: leaf('A1') }]);
@@ -670,27 +661,117 @@ test('real request timeout and parse failures preserve retry health while using 
   assert.deepEqual(await snapshot(storage), before);
 });
 
-test('restored sites obey enabled probing, untestable retention, safety valve and disabled probing', async () => {
-  const storage = new MemoryStorage(); await roots(storage, [A]);
+test('fresh and restored sites are not probed, filtered or tagged regardless of an obsolete saved toggle', async () => {
   const payload: TVBoxConfig = { sites: [
     { key: 'good', type: 1, api: 'https://good.test/api', name: 'Good' },
     { key: 'bad', type: 1, api: 'https://bad.test/api', name: 'Bad' },
-    { key: 'untestable', type: 3, api: 'csp_local' },
+    { key: 'xml', type: 0, api: 'https://xml.test/api', name: 'XML' },
+    { key: 'http', type: 3, api: 'https://http.test/api', name: 'HTTP [source text]' },
+    { key: 'local', type: 3, api: 'csp_local', name: 'Local [0.4s]' },
   ] };
-  let failingSource = false; let goodReachable = true;
-  mockFetch(url => {
-    if (url === A.url) return failingSource ? new Response('', { status: 404 }) : response(payload);
-    return new Response('{}', { status: goodReachable && url.startsWith('https://good.test') ? 200 : 404 });
+  for (const legacyValue of [undefined, 'true', 'false']) {
+    const storage = new MemoryStorage(); await roots(storage, [A]);
+    if (legacyValue !== undefined) await storage.put('speed_test_enabled', legacyValue);
+    // A persisted obsolete key must not even be read by the running pipeline.
+    storage.failGet = 'speed_test_enabled';
+    let failingSource = false;
+    const calls: string[] = [];
+    mockFetch(url => {
+      calls.push(url);
+      if (url === A.url) return failingSource ? new Response('', { status: 404 }) : response(payload);
+      // A single successful probe among failures would formerly bypass the safety valve.
+      return new Response('{}', { status: url.startsWith('https://good.test') ? 200 : 404 });
+    });
+    await runSync(storage, config); const before = await snapshot(storage);
+    const assertSites = async () => {
+      const output: TVBoxConfig = JSON.parse((await storage.get(MERGED_CONFIG))!);
+      assert.deepEqual(output.sites!.map(({ key, name, api }) => ({ key, name, api })),
+        payload.sites!.map(({ key, name, api }) => ({ key, name, api })));
+      assert.ok(calls.length > 0); assert.ok(calls.every(url => url === A.url));
+    };
+    await assertSites();
+    assert.deepEqual(before.config, payload);
+    calls.length = 0; failingSource = true; await runSync(storage, config);
+    await assertSites();
+    assert.deepEqual(await snapshot(storage), before);
+    const record = (await status(storage)).records.find((entry: { url: string }) => entry.url === A.url);
+    assert.equal(record.fetchStatus, 'http_404'); assert.equal(record.consecutiveFailures, 1);
+    assert.equal(record.aggregation.latest.mode, 'restored');
+    assert.equal(record.aggregation.lastSuccessful.snapshotTime, before.savedAt);
+    assert.equal(storage.data.get('speed_test_enabled'), legacyValue);
+  }
+});
+
+test('retired setting routes return 404 while other settings, MacCMS validation and live probes remain available', async () => {
+  const storage = new MemoryStorage(); await storage.put('speed_test_enabled', 'true');
+  const app = createApp({ storage, config: { ...config, siteTimeoutMs: 5 }, runtime: idleRuntime,
+    triggerRefresh: async () => ({ ran: false }), enableChannelProbe: true });
+  for (const method of ['GET', 'PUT']) {
+    const res = await app.request('/admin/speed-test', { method, headers: adminHeaders,
+      ...(method === 'PUT' ? { body: JSON.stringify({ enabled: false }) } : {}) });
+    assert.equal(res.status, 404);
+  }
+  assert.equal(await storage.get('speed_test_enabled'), 'true');
+  assert.equal((await app.request('/admin/name-transform')).status, 401);
+  const settings = await app.request('/admin/name-transform', { method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({ prefix: 'kept' }) });
+  assert.equal(settings.status, 200);
+  assert.deepEqual(await (await app.request('/admin/name-transform', { headers: adminHeaders })).json(), { prefix: 'kept' });
+  assert.equal((await app.request('/admin/channel-probe/status', { headers: adminHeaders })).status, 200);
+  const toggle = await app.request('/admin/channel-probe/toggle', { method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({ enabled: false }) });
+  assert.equal(toggle.status, 200);
+  const probeState = await (await app.request('/admin/channel-probe/status', { headers: adminHeaders })).json();
+  assert.ok(probeState && typeof probeState === 'object' && 'enabled' in probeState);
+  assert.equal(probeState.enabled, false);
+  const calls: string[] = []; let timedOut = false;
+  mockFetch((url, options) => {
+    calls.push(url);
+    if (url.includes('timeout.test')) return new Promise<Response>((_resolve, reject) => {
+      options!.signal!.addEventListener('abort', () => {
+        timedOut = true; reject(new DOMException('Timed out', 'AbortError'));
+      }, { once: true });
+    });
+    return new Response(JSON.stringify({ list: [] }));
   });
-  await runSync(storage, config); const before = await snapshot(storage);
-  failingSource = true; await storage.put(SPEED_TEST_ENABLED, 'true'); await runSync(storage, config);
-  assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.map((s: any) => s.key), ['good', 'untestable']);
-  assert.deepEqual(await snapshot(storage), before);
-  goodReachable = false; await runSync(storage, config);
-  assert.equal(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.length, 3);
-  await storage.put(SPEED_TEST_ENABLED, 'false'); await runSync(storage, config);
-  assert.equal(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.length, 3);
-  assert.deepEqual(await snapshot(storage), before);
+  const validate = (api: string, headers = adminHeaders) => app.request('/admin/maccms/validate', {
+    method: 'POST', headers, body: JSON.stringify({ api }) });
+  assert.equal((await validate('https://cms.test/api', { Authorization: 'Bearer wrong-token' })).status, 401);
+  assert.equal(calls.length, 0);
+  assert.equal((await validate('https://cms.test/api')).status, 200);
+  assert.equal((await validate('https://timeout.test/api')).status, 200);
+  assert.equal(timedOut, true); // The shared siteTimeoutMs still controls independent validation.
+  assert.deepEqual(calls, ['https://cms.test/api?ac=list', 'https://timeout.test/api?ac=list']);
+});
+
+test('generated Admin initializes without the retired setting and still renders and invokes MacCMS tests', async () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(text => text.includes('async function loadAll()'))!;
+  new Script(script);
+  assert.doesNotMatch(adminHtml, /speedTestCheck|speedTestStatus|loadSpeedTest|saveSpeedTest|\/admin\/speed-test|启用站点测速与不可达剔除/);
+  const loaders = ['loadSourceHealth', 'loadSources', 'loadMacCMS', 'loadLives', 'loadNameTransform',
+    'loadSyncSchedule', 'loadSmartJarUrl', 'loadLiveDisabled', 'loadEdgeProxies', 'loadSearchQuota', 'loadChannelProbe'];
+  const initialized: string[] = [];
+  const initContext = createContext(Object.fromEntries(loaders.map(name => [name, () => { initialized.push(name); }])));
+  await new Script(script.slice(script.indexOf('async function loadAll()'), script.indexOf('async function loadSources()'))
+    + '\nloadAll()').runInContext(initContext);
+  assert.deepEqual(initialized, loaders);
+  const elements: Record<string, { innerHTML: string; textContent?: unknown }> = {};
+  const calls: { url: string; options?: RequestInit }[] = [];
+  const context = createContext({ $: (id: string) => elements[id] ||= { innerHTML: '' }, esc: String,
+    toast() {}, auth: { authFetch: async (url: string, options?: RequestInit) => {
+      calls.push({ url, options });
+      return { json: async () => url === '/admin/maccms'
+        ? [{ key: 'cms', name: 'CMS', api: 'https://cms.test/api' }] : { valid: true } };
+    } } });
+  const mac = script.slice(script.indexOf('async function loadMacCMS()'), script.indexOf('async function addMacCMS()'));
+  const validate = script.slice(script.indexOf('async function validateMC(api)'), script.indexOf('async function batchImportMacCMS()'));
+  await new Script(mac + validate + '\nloadMacCMS()').runInContext(context);
+  assert.match(elements.mcList.innerHTML, /onclick="validateMC\('https:\/\/cms.test\/api'\)">测试/);
+  await new Script("validateMC('https://cms.test/api')").runInContext(context);
+  assert.deepEqual(calls.map(call => call.url), ['/admin/maccms', '/admin/maccms/validate']);
+  assert.equal(calls[1].options!.method, 'POST');
+  assert.deepEqual(JSON.parse(calls[1].options!.body as string), { api: 'https://cms.test/api' });
 });
 
 test('shared whole-merge/global-policy and final-marker errors cannot publish new snapshots or applied claims', async () => {
@@ -742,10 +823,16 @@ test('source import routes establish membership but eligibility waits for a save
 test('MacCMS-only aggregation still saves output and mixed rounds do not give MacCMS VOD fallback snapshots', async () => {
   const storage = new MemoryStorage(); await roots(storage, []);
   await storage.put(MACCMS_SOURCES, JSON.stringify([{ key: 'cms', name: 'CMS', api: 'https://cms.test/api' }]));
-  let failingCMS = false;
-  mockFetch(url => url === B.url ? response(leaf('B1')) : new Response(JSON.stringify({ list: [] }), { status: failingCMS ? 404 : 200 }));
+  let failingCMS = false; const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url);
+    return url === B.url ? response(leaf('B1')) : new Response(JSON.stringify({ list: [] }), { status: failingCMS ? 404 : 200 });
+  });
   await runSync(storage, config);
-  assert.equal(JSON.parse((await storage.get(MERGED_CONFIG))!).sites[0].key, 'cms');
+  const output: TVBoxConfig = JSON.parse((await storage.get(MERGED_CONFIG))!);
+  assert.equal(output.sites![0].key, 'cms');
+  assert.match(output.sites![0].name!, /^CMS \[\d+\.\ds\]$/);
+  assert.deepEqual(calls, ['https://cms.test/api?ac=list']);
   assert.deepEqual((await registry(storage)).nodes, {});
   await roots(storage, [B]); failingCMS = true; await runSync(storage, config);
   assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.map((s: any) => s.key), ['B1']);
@@ -788,7 +875,7 @@ test('sources and health details render truthful acquisition plus escaped round-
       assert.equal((rendered.match(/class="source-url"/g) || []).length, 1);
       assert.doesNotMatch(rendered, /previous-round|2026-10-01|获取：|本轮不可用：|保留旧聚合结果|data-tooltip|已尝试回填/);
     } else {
-      assert.match(rendered, /本轮不可用：&lt;failure &amp; reason&gt; · 已缓存/);
+      assert.match(rendered, /<div>&lt;failure &amp; reason&gt; · 已缓存<\/div>/);
       assert.doesNotMatch(rendered, /previous-round|已保存|已尝试回填|本轮失败|保留旧聚合结果|最近成功聚合已回填/);
     }
     assert.match(rendered, /HTTP 404/); assert.match(rendered, /6/);

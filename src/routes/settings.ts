@@ -1,4 +1,4 @@
-// 设置管理：名称定制、同步频率、测速开关、智能 JAR、直播禁用、边缘代理
+// 设置管理：名称定制、同步频率、智能 JAR、直播禁用、边缘代理
 // 按 D-02 合并所有小设置区段为一个模块
 
 import { Hono } from 'hono';
@@ -8,7 +8,6 @@ import {
   NAME_TRANSFORM,
   CRON_INTERVAL,
   DEFAULT_SYNC_SCHEDULE,
-  SPEED_TEST_ENABLED,
   SMART_JAR_URL_ENABLED,
   LIVE_DISABLED,
   EDGE_PROXIES,
@@ -115,28 +114,6 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Hono {
     }
 
     return c.json({ success: true, schedule });
-  });
-
-  // ─── 站点测速开关 ──────────────────────────────────────
-  router.get('/admin/speed-test', async (c) => {
-    const raw = await storage.get(SPEED_TEST_ENABLED);
-    return c.json({ enabled: raw !== 'false' });
-  });
-
-  router.put('/admin/speed-test', async (c) => {
-    let body: { enabled?: boolean };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    if (typeof body.enabled !== 'boolean') {
-      return c.json({ error: 'enabled must be a boolean' }, 400);
-    }
-
-    await storage.put(SPEED_TEST_ENABLED, String(body.enabled));
-    return c.json({ success: true, enabled: body.enabled });
   });
 
   // ─── 智能 JAR 地址开关 ──────────────────────────────────

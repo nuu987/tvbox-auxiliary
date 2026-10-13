@@ -5,12 +5,11 @@ import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFe
 import { fetchConfigs } from './core/fetcher';
 import { classifyStatus } from './core/status-classifier';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
-import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from './core/speedtest';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
 import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, SPEED_TEST_ENABLED, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
+import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
@@ -377,36 +376,6 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     });
   } else {
     logger.info('sync', 'Step 5.7: No cloud credentials configured, skipping');
-  }
-
-  // Step 6: 站点测速 + 不可达过滤 + name 标记
-  const speedTestRaw = await storage.get(SPEED_TEST_ENABLED);
-  const speedTestEnabled = speedTestRaw !== 'false'; // 默认启用
-
-  if (!speedTestEnabled) {
-    logger.info('sync', 'Step 6: Speed test disabled, skipping');
-  } else if (merged.sites && merged.sites.length > 0) {
-    logger.infoFields('sync', 'site-speed-start', {
-      sites: merged.sites.length,
-      timeoutMs: config.siteTimeoutMs,
-    });
-    const speedMap = await batchSiteSpeedTest(merged.sites, config.siteTimeoutMs);
-
-    if (speedMap.size > 0) {
-      // 过滤不可达站点（含安全阀）
-      const { sites: filteredSites, filtered } = filterUnreachableSites(merged.sites, speedMap);
-      merged.sites = filteredSites;
-      logger.infoFields('sync', 'site-speed-filter-complete', {
-        tested: speedMap.size,
-        filtered,
-        remaining: merged.sites.length,
-      });
-
-      // 追加延迟标签到站点名称
-      merged.sites = appendSpeedToName(merged.sites, speedMap);
-    }
-  } else {
-    logger.info('sync', 'Step 6: No sites to test');
   }
 
   // Step 6.5: 直播源频道级合并（方案 D+）

@@ -673,7 +673,7 @@ function renderHealthTable(records) {
         })
       : "--";
 
-    const processing = reason ? '<div>本轮不可用：' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
+    const processing = reason ? '<div>' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
 
     return '<tr class="row-' + level + '">' +
       '<td><span class="health-dot ' + level + '"></span></td>' +

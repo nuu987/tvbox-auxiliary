@@ -366,18 +366,6 @@ ${sharedStyles}
     </div>
 
     <div class="section">
-      <div class="section-title">站点测速</div>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input type="checkbox" id="speedTestCheck" onchange="saveSpeedTest()" checked>
-          <span>启用站点测速与不可达剔除</span>
-        </label>
-        <span class="status-text" id="speedTestStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
-      </div>
-      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">关闭后保留所有站点，不进行可达性检测</div>
-    </div>
-
-    <div class="section">
       <div class="section-title">高级设置</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -508,7 +496,6 @@ async function loadAll() {
   loadLives();
   loadNameTransform();
   loadSyncSchedule();
-  loadSpeedTest();
   loadSmartJarUrl();
   loadLiveDisabled();
   loadEdgeProxies();
@@ -956,44 +943,6 @@ async function saveSyncSchedule() {
 
   btn.textContent = "保存";
   btn.className = 'btn btn-sm';
-  setTimeout(() => { status.textContent = ''; }, 3000);
-}
-
-// --- Speed Test Toggle ---
-async function loadSpeedTest() {
-  try {
-    const res = await auth.authFetch('/admin/speed-test');
-    if (res.ok) {
-      const d = await res.json();
-      $('speedTestCheck').checked = d.enabled;
-    }
-  } catch {}
-}
-
-async function saveSpeedTest() {
-  const status = $('speedTestStatus');
-  const enabled = $('speedTestCheck').checked;
-  status.textContent = '';
-
-  try {
-    const res = await auth.authFetch('/admin/speed-test', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled })
-    });
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      const d = await res.json();
-      status.textContent = d.error || "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-  }
-
   setTimeout(() => { status.textContent = ''; }, 3000);
 }
 
