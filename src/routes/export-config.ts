@@ -7,6 +7,7 @@ import type { RuntimeState } from './admin-auth';
 import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
+import { projectLiveJson } from '../core/live-policy';
 
 export interface ExportConfigRouteDeps {
   storage: Storage;
@@ -28,8 +29,9 @@ export function createExportConfigRouter(deps: ExportConfigRouteDeps): Hono {
     }
 
     // D-12: EXPORT_CONFIG KV 不存在 → 提示先同步
-    const cached = (await readAggregateOutputs(storage))?.exported;
-    if (!cached) {
+    const outputs = await readAggregateOutputs(storage);
+    const cached = outputs?.exported;
+    if (!outputs || !cached) {
       return c.json({ error: '请先同步' }, 503);
     }
 
@@ -45,9 +47,11 @@ export function createExportConfigRouter(deps: ExportConfigRouteDeps): Hono {
       bytes: Buffer.byteLength(cached, 'utf8'),
     });
 
-    // D-01: 快照已含原始 URL，不做 BASE_URL_PLACEHOLDER 替换
-    // D-04/D-05: LIVE_DISABLED / pic 删除已在 sync/patch 时应用，路由不重复处理
-    return c.body(cached, 200, {
+    // Original resource URLs stay unchanged; manual lives reflect current declarations.
+    let body: string;
+    try { body = projectLiveJson(cached, outputs.livePolicy); }
+    catch { return c.json({ error: 'Config parse error' }, 500); }
+    return c.body(body, 200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}"`,
       'Cache-Control': 'no-store',

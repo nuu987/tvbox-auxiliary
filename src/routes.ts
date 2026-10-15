@@ -21,7 +21,7 @@ import { createLogViewerRouter } from './routes/log-viewer';
 import { createMaccmsProxyRouter } from './routes/maccms-proxy';
 import { createJarProxyRouter } from './routes/jar-proxy';
 import { createRefreshRouter } from './routes/refresh';
-import { createChannelProbeRouter } from './routes/channel-probe-admin';
+import { createLiveCacheRouter } from './routes/live-cache';
 
 export interface AppDeps {
   storage: Storage;
@@ -29,7 +29,6 @@ export interface AppDeps {
   triggerRefresh: (opts?: { source?: 'cron' | 'manual' }) => Promise<{ ran: boolean }>;
   onCronScheduleChange?: (schedule: SyncSchedule) => void;
   cronEnvSchedule?: SyncSchedule | null;
-  enableChannelProbe?: boolean;
   runtime: RuntimeState;
 }
 
@@ -62,6 +61,7 @@ export function createApp(deps: AppDeps): Hono {
   // ─── Conditional proxy routes ─────────────────────────────
   if (config.localBaseUrl) {
     app.route('/', createMaccmsProxyRouter({ storage, config }));
+    app.route('/', createLiveCacheRouter({ storage, config }));
     app.route('/', createJarProxyRouter({ storage, config }));
   }
 
@@ -70,11 +70,6 @@ export function createApp(deps: AppDeps): Hono {
     storage, config, runtime,
     triggerRefresh: deps.triggerRefresh,
   }));
-
-  // ─── Channel probe (conditional) ──────────────────────────
-  if (deps.enableChannelProbe) {
-    app.route('/', createChannelProbeRouter({ storage, config }));
-  }
 
   return app;
 }

@@ -121,7 +121,7 @@ body::before{
 .container{
   max-width:960px;
   margin:0 auto;
-  padding:40px 24px 80px;
+  padding:10px 24px 80px;
   position:relative;
   z-index:1;
 }
@@ -136,31 +136,11 @@ body::before{
   display:flex;
   align-items:center;
   justify-content:space-between;
-}
-
-.header-label{
-  font-family:var(--mono);
-  font-size:0.7rem;
-  letter-spacing:0.2em;
-  text-transform:uppercase;
-  color:var(--green);
-  opacity:0.7;
-  margin-bottom:8px;
-  display:flex;
-  align-items:center;
-  gap:8px;
-}
-
-.header-label::before{
-  content:'';
-  display:inline-block;
-  width:8px;height:8px;
-  background:var(--green);
-  border-radius:50%;
-  animation:pulse 2s ease-in-out infinite;
+  gap:12px;
 }
 
 .header-title{
+  min-width:0;
   font-family:var(--sans);
   font-size:2rem;
   font-weight:700;
@@ -209,6 +189,7 @@ body::before{
 }
 
 .theme-toggle{
+  flex-shrink:0;
   font-family:var(--mono);
   font-size:0.65rem;
   font-weight:500;
@@ -561,6 +542,7 @@ body::before{
 .add-form .name-input{max-width:160px}
 
 @media(max-width:560px){
+  .header-title{font-size:1.5rem}
   .add-form{flex-wrap:wrap}
   .add-form .name-input{max-width:100%}
   .header-nav a{padding:12px 14px;font-size:0.65rem}
@@ -683,11 +665,6 @@ body::before{
 @keyframes fadeSlideUp{
   from{opacity:0;transform:translateY(12px)}
   to{opacity:1;transform:translateY(0)}
-}
-
-@keyframes pulse{
-  0%,100%{opacity:1}
-  50%{opacity:0.4}
 }
 
 @keyframes loading{

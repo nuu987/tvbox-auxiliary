@@ -183,7 +183,7 @@ export function cleanEmptyEntries(config: TVBoxConfig): TVBoxConfig {
 }
 
 /**
- * 清洗本地引用（127.0.0.1 / localhost）
+ * 清洗点播站点的本地引用（127.0.0.1 / localhost）
  * 这些地址依赖用户本地 TVBox 代理服务，聚合后对其他用户是死链
  */
 export function cleanLocalRefs(config: TVBoxConfig): TVBoxConfig {
@@ -204,19 +204,11 @@ export function cleanLocalRefs(config: TVBoxConfig): TVBoxConfig {
     return true;
   });
 
-  const lives = (config.lives || []).filter((live) => {
-    if (live.url && isLocal(live.url)) {
-      logger.info('cleaner', `Removed live ${live.name || 'unnamed'}: local url ${live.url}`);
-      return false;
-    }
-    return true;
-  });
-
   const removedSites = (config.sites?.length || 0) - sites.length;
-  const removedLives = (config.lives?.length || 0) - lives.length;
-  if (removedSites > 0 || removedLives > 0) {
-    logger.info('cleaner', `Removed ${removedSites} sites, ${removedLives} lives with local refs`);
+  if (removedSites > 0) {
+    logger.info('cleaner', `Removed ${removedSites} sites with local refs`);
   }
 
-  return { ...config, sites, lives };
+  // Live lists can be hosted locally and fetched by the managed playlist cache.
+  return { ...config, sites };
 }

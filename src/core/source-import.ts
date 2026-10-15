@@ -3,6 +3,7 @@ import type { ImportResult, ImportSkip, SourceEntry, TVBoxConfig } from './types
 import { INLINE_PREFIX } from './config';
 import { extractMultiRepoEntries, inspectSourceOnce, isMultiRepoConfig, parseConfigJson } from './fetcher';
 import { prepareSourceLeaf } from './source-leaf';
+import { sourceCapacity, sourceLimit, sourceLimitMessage } from './source-capacity';
 
 export class SourceImportError extends Error {
   constructor(message: string, readonly status: 400 | 409 | 500 | 502 | 504) { super(message); }
@@ -11,6 +12,7 @@ export interface InspectionContext {
   sources: SourceEntry[];
   knownLeaves: Set<string>;
   timeoutMs: number;
+  maxDataSources?: number;
 }
 export interface SourceImportInput { source?: SourceEntry; text?: string; config?: TVBoxConfig }
 export interface SourceImportPlan {
@@ -41,6 +43,9 @@ export async function planSourceImport(input: SourceImportInput, context: Inspec
   const result: ImportResult = { success: false, type: 'single', outcome: 'none', checked: 0,
     added: 0, duplicates: 0, sources: [], skipped: [] };
   const plan: SourceImportPlan = { entries: [], result, usable: 0 };
+  const limit = sourceLimit(context);
+  const available = sourceCapacity(context.sources.length, limit).remaining;
+  if (available === 0 && !input.config) throw new SourceImportError(sourceLimitMessage(limit), 409);
   const source = input.source ? importSourceEntry(input.source) : undefined;
   let config = input.config;
   if (!config && source) {
@@ -65,6 +70,7 @@ export async function planSourceImport(input: SourceImportInput, context: Inspec
     catch (error) { throw new SourceImportError(message(error), 400); }
     plan.usable = 1;
     if (existing.has(entry.url)) result.duplicates++;
+    else if (available === 0) result.skipped.push({ url: entry.url, name: entry.name, reason: sourceLimitMessage(limit), stage: 'capacity' });
     else {
       plan.entries.push(entry);
       if (!source) plan.inline = { key: entry.url.slice('inline://'.length), text: input.text! };
@@ -92,21 +98,30 @@ export async function planSourceImport(input: SourceImportInput, context: Inspec
       queued.push({ entry: existing.get(entry.url) || entry, index });
     });
     let cursor = 0;
-    await Promise.all(Array.from({ length: Math.min(4, queued.length) }, async () => {
-      while (cursor < queued.length) {
-        const { entry, index } = queued[cursor++];
+    let accepted = 0;
+    while (cursor < queued.length) {
+      const slots = available === null ? 4 : available - accepted;
+      if (slots <= 0) {
+        for (const { entry, index } of queued.slice(cursor)) outcomes[index] = existing.has(entry.url)
+          ? { duplicate: true } : { skip: { url: entry.url, name: entry.name, reason: sourceLimitMessage(limit), stage: 'capacity' } };
+        break;
+      }
+      const batch = queued.slice(cursor, cursor + Math.min(4, slots));
+      cursor += batch.length;
+      await Promise.all(batch.map(async ({ entry, index }) => {
         result.checked++;
         const acquired = await inspectSourceOnce(entry, context.timeoutMs);
-        if (!acquired.config) { outcomes[index] = { skip: fetchFailure(acquired.fetchResult) }; continue; }
+        if (!acquired.config) { outcomes[index] = { skip: fetchFailure(acquired.fetchResult) }; return; }
         if (isMultiRepoConfig(acquired.config)) {
-          outcomes[index] = { skip: { url: entry.url, name: entry.name, reason: '不支持嵌套多仓，已跳过', stage: 'directory' } }; continue;
+          outcomes[index] = { skip: { url: entry.url, name: entry.name, reason: '不支持嵌套多仓，已跳过', stage: 'directory' } }; return;
         }
         try {
           prepareSourceLeaf(entry, acquired.config);
           outcomes[index] = existing.has(entry.url) ? { duplicate: true, usable: true } : { entry, usable: true };
         } catch (error) { outcomes[index] = { skip: { url: entry.url, name: entry.name, reason: message(error), stage: 'preparation' } }; }
-      }
-    }));
+      }));
+      accepted += batch.filter(({ index }) => !!outcomes[index].entry).length;
+    }
     for (const outcome of outcomes) {
       if (outcome.entry) plan.entries.push(outcome.entry);
       if (outcome.duplicate) result.duplicates++;
@@ -117,6 +132,7 @@ export async function planSourceImport(input: SourceImportInput, context: Inspec
   result.added = plan.entries.length;
   result.sources = plan.entries.map(entry => entry.url);
   result.success = result.added > 0;
+  result.capacity = sourceCapacity(context.sources.length + result.added, limit, result.skipped.filter(item => item.stage === 'capacity').length);
   result.outcome = result.added ? result.skipped.length ? 'partial' : 'added'
     : result.duplicates && !result.skipped.length ? 'duplicates_only' : 'none';
   return plan;

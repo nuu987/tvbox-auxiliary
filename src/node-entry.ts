@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as dns from 'dns';
 import { createApp } from './routes';
 import { runSync } from './syncer';
-import { runChannelProbe, isProbeEnabled } from './core/channel-probe';
+import { parseMaxDataSources } from './core/source-capacity';
 import { logger } from './core/logger';
 import {
   DEFAULT_SITE_TIMEOUT_MS,
@@ -19,7 +19,6 @@ import {
   syncScheduleToCron,
   parseCronSchedule,
   scheduleLabel,
-  CHANNEL_PROBE_CRON,
 } from './core/config';
 import { JsonFileStorage } from './storage/json-file';
 import type { Storage } from './storage/interface';
@@ -62,6 +61,7 @@ async function buildConfig(port: number): Promise<AppConfig> {
 
   const baseUrl = process.env.BASE_URL || `http://${lanIp || 'localhost'}:${port}`;
   return {
+    maxDataSources: parseMaxDataSources(process.env.MAX_DATA_SOURCES),
     adminToken: process.env.ADMIN_TOKEN,
     refreshToken: process.env.REFRESH_TOKEN,
     siteTimeoutMs: parseInt(process.env.SITE_TIMEOUT_MS || '') || DEFAULT_SITE_TIMEOUT_MS,
@@ -177,23 +177,11 @@ async function main() {
   // 应用初始调度（静默，避免与上方警告重复）
   scheduleCron(currentSyncSchedule, true);
 
-  // 频道测速独立 cron（每 12 小时，默认关闭）
-  cron.schedule(CHANNEL_PROBE_CRON, async () => {
-    try {
-      if (!(await isProbeEnabled(storage))) return;
-      logger.info('channel-probe-cron', `Triggered at ${new Date().toISOString()}`);
-      await runChannelProbe(storage);
-    } catch (err) {
-      logger.error('channel-probe-cron', `Error: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
-
   const app = createApp({
     storage,
     config,
     runtime,
     triggerRefresh: runWithGuard,
-    enableChannelProbe: true,
     onCronScheduleChange: (schedule: SyncSchedule) => {
       scheduleCron(schedule);
     },
@@ -223,7 +211,6 @@ async function main() {
     }
     console.log('');
     logger.info('storage', `JSON file storage: ${jsonPath}`);
-    logger.info('channel-probe', `频道测速定时器已注册: ${CHANNEL_PROBE_CRON}（仅在开启时执行）`);
   });
 }
 

@@ -6,7 +6,8 @@ import { adminAuthMiddleware } from './admin-auth';
 import { siteFingerprint, loadBlacklist } from '../core/blacklist';
 import { applyBaseUrlPlaceholder } from '../core/base-url';
 import { classifyStatus } from '../core/status-classifier';
-import { LIVE_DISABLED, SOURCE_HEALTH } from '../core/config';
+import { SOURCE_HEALTH } from '../core/config';
+import { supportedLives } from '../core/live-source';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceHealthRecord, TVBoxConfig } from '../core/types';
 
@@ -26,7 +27,7 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     // 读取过滤前的完整配置（含被屏蔽的项），降级到已过滤配置
     const outputs = await readAggregateOutputs(storage);
     const cached = outputs?.full || outputs?.merged;
-    if (!cached) {
+    if (!outputs || !cached) {
       return c.json({ sites: [], parses: [], lives: [] });
     }
 
@@ -75,13 +76,12 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
       blocked: parseSet.has(p.url),
     }));
 
-    const lives = (parsed.lives || []).map(l => ({
+    const lives = supportedLives(parsed.lives || []).map(l => ({
       ...l,
       blocked: liveSet.has(l.url || l.api || ''),
     }));
 
-    const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    const liveDisabled = liveDisabledRaw !== 'false';
+    const liveDisabled = outputs.livePolicy.disabled;
 
     // Build validation errors from source health records
     const healthRaw = await storage.get(SOURCE_HEALTH);

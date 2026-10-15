@@ -24,7 +24,7 @@ export function readImportPolicy(raw: string | null): ImportPolicyState | null {
       || !Number.isInteger(value.report.duplicates) || Number(value.report.duplicates) < 0
       || !Array.isArray(value.report.skipped) || !value.report.skipped.every(s => object(s) && typeof s.reason === 'string'
         && (s.url === undefined || typeof s.url === 'string') && (s.name === undefined || typeof s.name === 'string')
-        && ['input', 'acquisition', 'decode', 'parse', 'preparation', 'directory'].includes(String(s.stage)))
+        && ['input', 'acquisition', 'decode', 'parse', 'preparation', 'directory', 'capacity'].includes(String(s.stage)))
       || !Array.isArray(value.report.removed) || !value.report.removed.every(s => object(s) && typeof s.url === 'string'
         && typeof s.name === 'string' && typeof s.reason === 'string')) return null;
     if (value.completedAt && value.remaining.length) return null;

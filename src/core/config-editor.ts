@@ -373,12 +373,9 @@ ${sharedStyles}
 <div class="container" id="mainContent" style="display:none">
   <header class="header">
     <div class="header-top">
-      <div class="header-label">配置编辑器</div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
-        </div>
+      <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
     </div>
-    <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
     <nav class="header-nav">
       <a href="/status">首页</a>
       <a href="/admin">接口管理</a>
@@ -771,7 +768,7 @@ function renderLives() {
   let html = '';
   if (liveDisabled) {
     html += '<div style="padding:10px 14px;margin-bottom:8px;background:var(--amber-dim);border-left:3px solid var(--amber);border-radius:4px;font-size:0.85rem;color:var(--text-bright)">'
-      + '直播功能已禁用'
+      + '已禁用接口提供的直播源'
       + '</div>';
   }
   html += '<div class="flat-list' + (_syncing ? ' syncing' : '') + '">';

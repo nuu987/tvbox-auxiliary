@@ -29,11 +29,6 @@ export interface TVBoxLiveChannel {
   urls: string[];
 }
 
-export interface TVBoxLiveGroup {
-  group: string;
-  channels: TVBoxLiveChannel[];
-}
-
 export interface TVBoxLive {
   name?: string;
   type?: number; // 0=M3U/TXT, 3=JAR/Python
@@ -45,7 +40,7 @@ export interface TVBoxLive {
   header?: Record<string, string>;
   playerType?: number;
   ext?: string | Record<string, unknown>;
-  // Native 格式（live-merger 产物）— 与 FongMi 共用同一数组元素类型
+  // 旧 Native 内嵌格式（仅输入兼容，不参与输出）— 与 FongMi 共用同一数组元素类型
   group?: string;
   channels?: TVBoxLiveChannel[];
 }
@@ -73,7 +68,7 @@ export interface TVBoxConfig {
   parses?: TVBoxParse[];
   // lives 兼容两种 TVBox 格式（同一数组类型，字段可选）：
   //   FongMi 格式（含 type/url）— 来自各源 config 的原始 lives
-  //   Native 格式（含 group/channels）— live-merger 合并后产物
+  //   旧 Native 内嵌格式（含 group/channels）— 聚合输出不支持
   lives?: TVBoxLive[];
   hosts?: string[];
   rules?: TVBoxRule[];
@@ -120,6 +115,7 @@ export interface NameTransformConfig {
 
 // JSON 导入结果
 export interface ImportResult {
+  capacity?: SourceCapacity;
   success: boolean;
   type: 'multi' | 'single';
   outcome: 'added' | 'partial' | 'duplicates_only' | 'none';
@@ -134,7 +130,13 @@ export interface ImportSkip {
   url?: string;
   name?: string;
   reason: string;
-  stage: 'input' | 'acquisition' | 'decode' | 'parse' | 'preparation' | 'directory';
+  stage: 'input' | 'acquisition' | 'decode' | 'parse' | 'preparation' | 'directory' | 'capacity';
+}
+export interface SourceCapacity {
+  limit: number;
+  current: number;
+  remaining: number | null;
+  rejected: number;
 }
 export interface FlatMigrationReport {
   savedAt: string;
@@ -218,6 +220,7 @@ export interface SyncSchedule {
 
 // 平台无关的应用配置
 export interface AppConfig {
+  maxDataSources?: number; // 0 disables the VOD declaration limit; omitted defaults to 6.
   adminToken?: string;
   refreshToken?: string;
   siteTimeoutMs: number;
@@ -314,33 +317,6 @@ export interface SyncLog {
   blacklistRemovedSites: number;
   blacklistRemovedParses: number;
   blacklistRemovedLives: number;
-}
-
-// ═══ 直播频道级测速（方案 D+）══════════════════════════
-
-// URL → 延迟 ms 的映射（持久化到 CHANNEL_SPEED_MAP）
-export interface ChannelSpeedEntry {
-  speedMs: number;          // TTFB 或连通耗时
-  probedAt: string;         // ISO 时间
-  kind: 'm3u8' | 'ts' | 'tcp' | 'fail';
-}
-export type ChannelSpeedMap = Record<string, ChannelSpeedEntry>;
-
-// 频道测速任务状态
-export type ChannelProbeState = 'idle' | 'running' | 'done' | 'error';
-
-export interface ChannelProbeStatus {
-  state: ChannelProbeState;
-  startedAt?: string;
-  finishedAt?: string;
-  durationMs?: number;
-  totalUrls: number;
-  probed: number;            // 当前已测完数
-  success: number;           // 成功
-  failed: number;            // 超时/失败
-  totalChannels: number;     // 合并后频道数
-  coverage: number;          // 覆盖率（success/totalUrls，百分比）
-  error?: string;
 }
 
 // 正则屏蔽规则

@@ -7,9 +7,10 @@ import { classifyStatus } from './core/status-classifier';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
-import { mergeLivesToNative, type LiveSourceInput } from './core/live-merger';
-import { loadSpeedMap as loadChannelSpeedMap } from './core/channel-probe';
-import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, LIVE_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, EDGE_PROXIES, SEARCH_QUOTA_REPORT, CHANNEL_MERGED_TREE, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './core/config';
+import { refreshLiveCache, pruneLiveCache, liveCacheProviders } from './core/live-cache';
+import { supportedLives, liveAddress } from './core/live-source';
+import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, EDGE_PROXIES, SEARCH_QUOTA_REPORT, BASE_URL_PLACEHOLDER } from './core/config';
+import { loadLivePolicy } from './core/live-policy';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
@@ -24,7 +25,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { NameTransformConfig, EdgeProxyConfig } from './core/types';
 import { SourceFallbackRound, withSourceGate, saveSourceRoots, beginSourceOutputRun } from './core/source-fallback';
-import { publishAggregateOutputs, recordAggregateFailure, type OutputRunTicket } from './core/aggregate-output';
+import { selectDataSources, sourceCapacity, sourceLimit } from './core/source-capacity';
+import { publishAggregateOutputs, isCurrentAggregateRun, recordAggregateFailure, type OutputRunTicket } from './core/aggregate-output';
 import { prepareImportOnlyRun } from './core/source-import-policy';
 
 export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
@@ -61,9 +63,11 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
 }
 
 async function _runSync(storage: Storage, config: AppConfig, startTime: number, ticket: OutputRunTicket, registerRound: (round: SourceFallbackRound) => void): Promise<void> {
+  const limit = sourceLimit(config);
 
   // Step 0: 自动抓取源（需配置 SCRAPE_SOURCE_URL 环境变量）
-  if (config.scrapeSourceUrl && config.scrapeSourceReferer) {
+  const scrapeFull = config.scrapeSourceUrl && sourceCapacity(JSON.parse(await storage.get(MANUAL_SOURCES) || '[]').length, limit).remaining === 0;
+  if (config.scrapeSourceUrl && config.scrapeSourceReferer && !scrapeFull) {
     logger.info('sync', 'Step 0: Auto-scraping sources...');
     try {
       const scrapeCfg: ScrapeSourceConfig = { url: config.scrapeSourceUrl, referer: config.scrapeSourceReferer };
@@ -77,6 +81,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
           let added = 0;
           const addedSources: SourceEntry[] = [];
           for (const source of scraped) {
+            if (sourceCapacity(existingSources.length, limit).remaining === 0) break;
             if (!existingUrls.has(source.url)) {
               existingSources.push(source);
               existingUrls.add(source.url);
@@ -131,7 +136,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   logger.info('sync', 'Step 1: Loading sources...');
   const fallback = await SourceFallbackRound.begin(storage);
   registerRound(fallback);
-  const sources = fallback.sourceEntries();
+  const sources = selectDataSources(fallback.sourceEntries(), limit);
 
   // 检查是否有 MacCMS 源（即使没有 config 源也可以继续）
   const macCMSRaw = await storage.get(MACCMS_SOURCES);
@@ -312,16 +317,15 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   // Step 4.6.5: 生成 EXPORT_CONFIG 快照（含原始 URL，供 /admin/export-config 下载，D-01/D-02）
   // 必须在 Step 7 JAR URL 重写之前 — 此时 site.jar/api/ext 等仍是远程原始 URL
   logger.info('sync', 'Step 4.6.5: Generating EXPORT_CONFIG snapshot...');
-  const liveDisabledRaw465 = await storage.get(LIVE_DISABLED);
-  const liveDisabled465 = liveDisabledRaw465 !== 'false';
-  const exportConfig = await generateExportConfig(merged, blacklist, liveDisabled465);
+  const livePolicy = await withSourceGate(storage, () => loadLivePolicy(storage));
+  const exportConfig = await generateExportConfig(merged, blacklist, livePolicy);
   delete (exportConfig as TVBoxConfig).pic; // D-05: 导出版本不含图片代理前缀（防御性，generateExportConfig 已删）
   const exportJson = JSON.stringify(exportConfig);
   logger.infoFields('sync', 'export-config-staged', {
     sites: exportConfig.sites?.length || 0,
     parses: exportConfig.parses?.length || 0,
     lives: exportConfig.lives?.length || 0,
-    liveDisabled: liveDisabled465,
+    liveDisabled: livePolicy.disabled,
   });
 
   // Step 4.7: 搜索配额（JS 排除 + 置顶排序 + 可选截断）
@@ -378,87 +382,13 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     logger.info('sync', 'Step 5.7: No cloud credentials configured, skipping');
   }
 
-  // Step 6.5: 直播源频道级合并（方案 D+）
-  logger.info('sync', 'Step 6.5: Channel-level live merging...');
-  {
-    // 检查直播功能禁用开关
-    const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    const liveDisabled = liveDisabledRaw !== 'false';
-    if (liveDisabled) {
-      logger.info('sync', 'Step 6.5: live_disabled=true, skipping live merge and clearing lives');
-      merged.lives = [];
-    } else {
-    const liveInputs: LiveSourceInput[] = [];
-
-    // 配置源合并来的 lives（FongMi 格式）
-    for (const l of (merged.lives || []) as Array<{ name?: string; url?: string; api?: string; ua?: string; header?: Record<string, string>; group?: string }>) {
-      // 跳过已经是 Native 格式的（含 group 字段无 url）
-      if (l.group && !l.url && !l.api) continue;
-      const u = l.url || l.api;
-      if (!u || !/^https?:\/\//i.test(u)) continue;
-      if (u.includes('127.0.0.1') || u.includes('localhost')) continue;
-      liveInputs.push({
-        name: l.name || 'source',
-        url: u,
-        ua: l.ua,
-        header: l.header,
-      });
-    }
-
-    // admin 手动源
-    const liveRaw = await storage.get(LIVE_SOURCES);
-    if (liveRaw) {
-      try {
-        const manual: Array<{ name: string; url: string }> = JSON.parse(liveRaw);
-        for (const m of manual) {
-          if (!m.url || !/^https?:\/\//i.test(m.url)) continue;
-          if (m.url.includes('127.0.0.1') || m.url.includes('localhost')) continue;
-          liveInputs.push({ name: m.name || 'manual', url: m.url });
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // URL 去重
-    const seen = new Set<string>();
-    const uniqueInputs = liveInputs.filter((i) => {
-      if (seen.has(i.url)) return false;
-      seen.add(i.url);
-      return true;
-    });
-
-    if (uniqueInputs.length === 0) {
-      logger.info('sync', 'Step 6.5: No live sources to merge');
-      merged.lives = [];
-    } else {
-      logger.infoFields('sync', 'live-merge-inputs', { unique: uniqueInputs.length });
-      uniqueInputs.forEach((input, index) => logger.infoFields('sync', 'live-source', {
-        index: index + 1,
-        name: input.name,
-        url: input.url,
-        ua: input.ua ? 'present' : 'none',
-        header: input.header ? 'present' : 'none',
-      }));
-
-      // 加载频道级测速缓存（仅 Node/Docker 有）
-      const channelSpeedMap = await loadChannelSpeedMap(storage);
-
-      const mergeResult = await mergeLivesToNative(uniqueInputs, config.fetchTimeoutMs, channelSpeedMap);
-      merged.lives = mergeResult.groups;
-
-      // 保存合并树供 channel-probe 使用
-      await storage.put(CHANNEL_MERGED_TREE, JSON.stringify(mergeResult.groups));
-
-      logger.infoFields('sync', 'live-merge-complete', {
-        sourcesDownloaded: mergeResult.sourcesDownloaded,
-        sourcesTotal: uniqueInputs.length,
-        groups: mergeResult.groups.length,
-        channels: mergeResult.totalChannels,
-        urls: mergeResult.totalUrls,
-      });
-    }
-    } // end of else (liveDisabled=false)
+  // Step 6.5: Cache playlist files; client config contains only address objects.
+  merged.lives = livePolicy.disabled ? [] : supportedLives(merged.lives || []);
+  const manualUrls = new Set(livePolicy.manualLives.map(liveAddress));
+  const liveInputs = [...merged.lives.filter(entry => !manualUrls.has(liveAddress(entry))), ...livePolicy.manualLives];
+  if (config.localBaseUrl) {
+    const providers = await withSourceGate(storage, () => liveCacheProviders(storage, allConfigs));
+    await refreshLiveCache(storage, liveInputs, config.fetchTimeoutMs, () => isCurrentAggregateRun(storage, ticket), providers);
   }
 
   // Step 6.8: Build JAR URL → source index map
@@ -668,8 +598,10 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   const mergedJson = JSON.stringify(merged);
   await fallback.commit(async savedAt => {
     await publishAggregateOutputs(storage, ticket,
-      { merged: mergedJson, full: fullJson, exported: exportJson, siteSourceNames: mergeResult.siteSourceNames }, savedAt);
+      { merged: mergedJson, full: fullJson, exported: exportJson, siteSourceNames: mergeResult.siteSourceNames,
+        liveDisabled: livePolicy.disabled }, savedAt);
   });
+  try { await pruneLiveCache(storage); } catch (error) { logger.warn('live-cache', `缓存清理失败: ${error instanceof Error ? error.message : String(error)}`); }
   logger.infoFields('sync', 'storage-write-complete', {
     key: MERGED_CONFIG,
     bytes: Buffer.byteLength(mergedJson, 'utf8'),

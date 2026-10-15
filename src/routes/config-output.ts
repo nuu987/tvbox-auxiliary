@@ -3,7 +3,8 @@
 import { Hono } from 'hono';
 import { readAggregateOutputs } from '../core/aggregate-output';
 import { getRequestBaseUrl, applyBaseUrlPlaceholder, assertHostAllowed } from '../core/base-url';
-import { SMART_JAR_URL_ENABLED, LIVE_DISABLED } from '../core/config';
+import { SMART_JAR_URL_ENABLED } from '../core/config';
+import { projectLiveJson } from '../core/live-policy';
 import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
@@ -19,9 +20,10 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
 
   // ─── 主配置 ────────────────────────────────────────────
   router.get('/', async (c) => {
-    const cached = (await readAggregateOutputs(storage))?.merged;
+    const outputs = await readAggregateOutputs(storage);
+    const cached = outputs?.merged;
 
-    if (!cached) {
+    if (!outputs || !cached) {
       return c.json(
         { error: 'No config available yet. Add sources in /admin and trigger a refresh.' },
         503,
@@ -53,43 +55,28 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
       }
     }
 
-    // LIVE_DISABLED 防御性检查：同步管道中若已禁用直播，lives 字段已被清空；
-    // 但为防御性保险，在主输出路由再次检查
-    const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    let outputData = cached;
-    if (liveDisabledRaw !== 'false') {
-      try {
-        const parsed = JSON.parse(cached);
-        parsed.lives = [];
-        outputData = JSON.stringify(parsed);
-      } catch { /* 解析失败就继续用原始 cached */ }
+    let body: string;
+    try {
+      // Insert declared URLs after host substitution so their literal values stay intact.
+      body = projectLiveJson(cached, outputs.livePolicy, base => applyBaseUrlPlaceholder(base, actualBase, fallback), actualBase);
+    } catch {
+      return c.json({ error: 'Config parse error' }, 500);
     }
-
-    const body = applyBaseUrlPlaceholder(outputData, actualBase, fallback);
 
     return c.body(body, 200, {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'public, max-age=1800',
+      'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
     });
   });
 
   // ─── 纯直播配置 ────────────────────────────────────────
   router.get('/live-config', async (c) => {
-    const cached = (await readAggregateOutputs(storage))?.merged;
+    const outputs = await readAggregateOutputs(storage);
+    const cached = outputs?.merged;
 
-    if (!cached) {
+    if (!outputs || !cached) {
       return c.json({ error: 'No config available yet.' }, 503);
-    }
-
-    // 直播功能禁用开关：直接返回空 lives，跳过 smart JAR 处理
-    const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-    if (liveDisabledRaw !== 'false') {
-      return c.body(JSON.stringify({ lives: [] }), 200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
-      });
     }
 
     // WR-01: 先做 smart-jar/host 校验（与 / 路由顺序一致），避免无谓的 JSON.parse/
@@ -120,12 +107,13 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
     }
 
     try {
-      const full = JSON.parse(cached);
+      const full = JSON.parse(projectLiveJson(cached, outputs.livePolicy,
+        base => applyBaseUrlPlaceholder(base, actualBaseEarly, fallbackEarly), actualBaseEarly));
       const liveConfig = { lives: full.lives || [] };
       const liveBody = JSON.stringify(liveConfig);
-      return c.body(applyBaseUrlPlaceholder(liveBody, actualBaseEarly, fallbackEarly), 200, {
+      return c.body(liveBody, 200, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': 'public, max-age=1800',
+        'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
       });
     } catch {

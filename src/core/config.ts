@@ -1,6 +1,7 @@
 import type { SyncSchedule } from './types';
 
 // 默认阈值
+export const DEFAULT_MAX_DATA_SOURCES = 6;
 export const DEFAULT_SITE_TIMEOUT_MS = 3000;  // 站点 API 超时
 export const DEFAULT_FETCH_TIMEOUT_MS = 30000; // fetch 配置 JSON 超时（30s，部分源响应较慢）
 
@@ -13,10 +14,7 @@ export const LAST_UPDATE = 'last_update';
 export const MANUAL_SOURCES = 'manual_sources';
 export const MACCMS_SOURCES = 'maccms_sources';
 export const LIVE_SOURCES = 'live_sources';
-export const LIVE_SCRAPED = 'live_scraped';
-
-// 直播源代理缓存 TTL（秒）
-export const LIVE_PROXY_TTL = 7200; // 2 小时
+export const LIVE_CACHE_STATE = 'live_cache_state';
 
 // 图片代理缓存 TTL（秒）
 export const IMG_PROXY_TTL = 604800; // 7 天
@@ -42,7 +40,7 @@ export const SITE_SOURCE_ATTRIBUTION = 'site_source_attribution';
 // 智能 JAR 地址开关（默认关闭）— 启用时输出路由按请求 host 替换 BASE_URL_PLACEHOLDER
 export const SMART_JAR_URL_ENABLED = 'smart_jar_url_enabled';
 
-// 直播功能禁用开关（默认开启）— 禁用时跳过直播源合并、清空输出 lives、锁定直播源编辑 UI
+// 默认禁用接口自带直播；手动直播地址仍可管理并直接输出，配置编辑页直播操作锁定。
 export const LIVE_DISABLED = 'live_disabled';
 
 // JAR/MacCMS/凭证 URL 占位符：聚合时写入，输出时替换为实际 host
@@ -113,12 +111,6 @@ export const CREDENTIAL_ENCRYPTION_KEY = 'credential_encryption_key';
 export const SEARCH_QUOTA = 'search_quota';
 export const SEARCH_QUOTA_REPORT = 'search_quota_report';
 
-// ═══ 直播频道级测速（方案 D+）══════════════════════════
-export const CHANNEL_SPEED_MAP = 'channel_speed_map';
-export const CHANNEL_PROBE_ENABLED = 'channel_probe_enabled';
-export const CHANNEL_PROBE_STATUS = 'channel_probe_status';
-export const CHANNEL_MERGED_TREE = 'channel_merged_tree'; // 最近一次合并的频道树（供 probe 使用）
-
 // 聚合日志
 export const KV_AGG_LOGS = 'agg_logs';
 export const AGG_LOGS_MAX = 50;
@@ -132,11 +124,3 @@ export const KV_GROUP_ORDER = 'group_order';
 
 // 高级去重配置
 export const KV_DEDUP_CONFIG = 'dedup_config';
-
-// 频道测速 cron：每 12 小时
-export const CHANNEL_PROBE_CRON = '0 */12 * * *';
-// 并发与超时
-export const CHANNEL_PROBE_CONCURRENCY = 50;
-export const CHANNEL_PROBE_TIMEOUT_MS = 5000;
-// 缓存过期（7 天）
-export const CHANNEL_SPEED_TTL_MS = 7 * 24 * 60 * 60 * 1000;

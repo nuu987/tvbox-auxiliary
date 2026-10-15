@@ -16,6 +16,7 @@ import { patchMergedConfig } from '../core/blacklist';
 import { adminAuthMiddleware } from './admin-auth';
 import type { RuntimeState } from './admin-auth';
 import { logger } from '../core/logger';
+import { withSourceGate } from '../core/source-gate';
 
 export interface SettingsRouteDeps {
   storage: Storage;
@@ -156,8 +157,8 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Hono {
       return c.json({ error: 'disabled must be a boolean' }, 400);
     }
 
-    await storage.put(LIVE_DISABLED, String(body.disabled));
-    // 立即应用：调用 patchMergedConfig 同步清空/恢复 lives
+    await withSourceGate(storage, () => storage.put(LIVE_DISABLED, String(body.disabled)));
+    // Release the gate before the guarded patch; readers already use the saved policy.
     let patched = false;
     try {
       const result = await patchMergedConfig(storage);

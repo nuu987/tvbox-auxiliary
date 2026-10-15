@@ -331,12 +331,9 @@ ${sharedStyles}
 <div class="container" id="mainContent" style="display:none">
   <header class="header">
     <div class="header-top">
-      <div class="header-label">系统监控</div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
-        </div>
+      <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
     </div>
-    <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
     <nav class="header-nav">
       <a href="/status" class="active">首页</a>
       <a href="/admin">接口管理</a>

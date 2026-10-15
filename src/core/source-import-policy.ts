@@ -6,6 +6,7 @@ import { migrationOutputState, type OutputRunTicket } from './aggregate-output';
 import { inspectSourceOnce, isMultiRepoConfig, parseConfigJson } from './fetcher';
 import { planSourceImport } from './source-import';
 import { readImportPolicy, type ImportPolicyState, type PendingIdentity } from './source-import-state';
+import { selectDataSources, sourceLimit } from './source-capacity';
 
 function object(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value); }
 
@@ -29,6 +30,8 @@ export async function prepareImportOnlyRun(storage: Storage, config: AppConfig, 
   });
   if (!capture) return ticket;
   const { baseline, policy, policyRaw } = capture;
+  const limit = sourceLimit(config);
+  const eligible = new Set(selectDataSources(baseline.sources, limit).map(source => source.url));
   const initial = baseline.sources.filter(source => !baseline.knownLeaves.has(source.url));
   const pending = policy ? policy.remaining.filter(identity => {
     const node = baseline.registry.nodes[identity.url];
@@ -47,6 +50,10 @@ export async function prepareImportOnlyRun(storage: Storage, config: AppConfig, 
   const pendingUrls = new Set(work.map(source => source.url));
   report.skipped.push(...(policy?.report.skipped || []).filter(skip => !skip.url || !pendingUrls.has(skip.url)));
   for (const source of work) {
+    if (!eligible.has(source.url)) {
+      remaining.push({ url: source.url, fingerprint: fingerprint(source), generation: baseline.registry.nodes[source.url].generation });
+      continue;
+    }
     let current: TVBoxConfig | null = null;
     let failure: ImportSkip | undefined;
     if (source.url.startsWith('inline://')) {
@@ -71,13 +78,14 @@ export async function prepareImportOnlyRun(storage: Storage, config: AppConfig, 
       continue;
     }
     let reason = failure?.reason || '已转换为独立单仓';
+    effective.delete(source.url); // A confirmed old parent releases its slot before children are admitted.
     if (current && isMultiRepoConfig(current)) {
       const plan = await planSourceImport(source.url.startsWith('inline://') ? { config: current } : { source, config: current },
-        { sources: [...effective.values()], knownLeaves: checkedLeaves, timeoutMs: config.fetchTimeoutMs });
+        { sources: [...effective.values()], knownLeaves: checkedLeaves, timeoutMs: config.fetchTimeoutMs, maxDataSources: limit });
       for (const entry of plan.entries) { effective.set(entry.url, entry); checkedLeaves.add(entry.url); }
       report.added += plan.result.added; report.duplicates += plan.result.duplicates;
       report.skipped.push(...plan.result.skipped);
-      if (!plan.usable) reason = '没有可用的直接单仓，已移除旧多仓';
+      if (!plan.usable) reason = plan.result.capacity?.rejected ? '容量已满，子接口未检查，已移除旧多仓' : '没有可用的直接单仓，已移除旧多仓';
     } else if (current) reason = '旧多仓当前内容不是目录，已移除';
     else if (failure) report.skipped.push(failure);
     effective.delete(source.url);

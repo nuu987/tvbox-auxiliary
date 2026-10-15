@@ -9,6 +9,7 @@ import type { RuntimeState } from './admin-auth';
 import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceFetchStatus, SourceHealthRecord } from '../core/types';
 import { sourceAggregationStatuses, type SourceAggregationStatus } from '../core/source-fallback';
+import { projectLiveJson } from '../core/live-policy';
 
 export interface DashboardRouteDeps {
   storage: Storage;
@@ -26,14 +27,15 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
     const sources = await storage.get(MANUAL_SOURCES);
     const macCMSSources = await storage.get(MACCMS_SOURCES);
     const liveSources = await storage.get(LIVE_SOURCES);
-    const cached = (await readAggregateOutputs(storage))?.merged;
+    const outputs = await readAggregateOutputs(storage);
+    const cached = outputs?.merged;
 
     let siteCount = 0;
     let parseCount = 0;
     let liveCount = 0;
-    if (cached) {
+    if (outputs && cached) {
       try {
-        const parsed = JSON.parse(cached);
+        const parsed = JSON.parse(projectLiveJson(cached, outputs.livePolicy));
         siteCount = parsed.sites?.length || 0;
         parseCount = parsed.parses?.length || 0;
         liveCount = parsed.lives?.length || 0;

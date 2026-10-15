@@ -19,6 +19,8 @@ import { createConfigEditorRouter } from '../src/routes/config-editor';
 import { createExportConfigRouter } from '../src/routes/export-config';
 import { createCloudCredRouter } from '../src/routes/cloud-credentials';
 import { createRefreshRouter } from '../src/routes/refresh';
+import { createLiveSourcesRouter } from '../src/routes/live-sources';
+import { createSettingsRouter } from '../src/routes/settings';
 import { readAggregateOutputs, publishAggregatePatch } from '../src/core/aggregate-output';
 import { beginSourceOutputRun, fingerprint, captureSourceBaseline } from '../src/core/source-fallback';
 import { prepareImportOnlyRun, sourceMigrationReport } from '../src/core/source-import-policy';
@@ -29,6 +31,12 @@ import { _resetForTest as resetLogBuffer, _getSubscriberCountForTest as logSubsc
   getHistory as logHistory } from '../src/core/log-buffer';
 import { createLogViewerRouter } from '../src/routes/log-viewer';
 import { sharedUi } from '../src/core/shared-ui';
+import { liveCacheKey, projectLiveAddress, loadLiveCache, liveCacheView, refreshLiveCache } from '../src/core/live-cache';
+import { createLiveCacheRouter } from '../src/routes/live-cache';
+import { normalizePlaylist } from '../src/core/live-playlist';
+import { loadLivePolicy } from '../src/core/live-policy';
+import { cacheableLive } from '../src/core/live-source';
+import { parseMaxDataSources, sourceLimit } from '../src/core/source-capacity';
 import { adminHtml } from '../src/core/admin';
 import { dashboardHtml } from '../src/core/dashboard';
 import { configEditorHtml } from '../src/core/config-editor';
@@ -37,7 +45,8 @@ import { Script, createContext } from 'node:vm';
 import { BLACKLIST, MANUAL_SOURCES, MERGED_CONFIG, LAST_UPDATE, SOURCE_CONFIG_SNAPSHOTS,
   SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, MACCMS_SOURCES,
   MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS,
-  SITE_SOURCE_ATTRIBUTION, EDGE_PROXIES } from '../src/core/config';
+  SITE_SOURCE_ATTRIBUTION, EDGE_PROXIES, LIVE_DISABLED, LIVE_SOURCES, SMART_JAR_URL_ENABLED,
+  LIVE_CACHE_STATE, NAME_TRANSFORM } from '../src/core/config';
 
 class MemoryStorage implements Storage {
   data = new Map<string, string>();
@@ -127,8 +136,8 @@ async function assertUnavailableViews(storage: Storage) {
   assert.equal(await readAggregateOutputs(storage), null);
 }
 const response = (body: TVBoxConfig) => new Response(JSON.stringify(body), { status: 200 });
-async function sourceRequest(storage: Storage, input: unknown, path = '/admin/sources/import') {
-  return createSourceMgmtRouter({ storage, config }).request(path, { method: 'POST',
+async function sourceRequest(storage: Storage, input: unknown, path = '/admin/sources/import', requestConfig: AppConfig = config) {
+  return createSourceMgmtRouter({ storage, config: requestConfig }).request(path, { method: 'POST',
     headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
 }
 /** Real v1 envelopes, including qualified children that are not yet direct roots. */
@@ -710,10 +719,10 @@ test('fresh and restored sites are not probed, filtered or tagged regardless of 
   }
 });
 
-test('retired setting routes return 404 while other settings, MacCMS validation and live probes remain available', async () => {
+test('retired setting routes return 404 while other settings, MacCMS validation and retired channel probes stay unavailable', async () => {
   const storage = new MemoryStorage(); await storage.put('speed_test_enabled', 'true');
   const app = createApp({ storage, config: { ...config, siteTimeoutMs: 5 }, runtime: idleRuntime,
-    triggerRefresh: async () => ({ ran: false }), enableChannelProbe: true });
+    triggerRefresh: async () => ({ ran: false }) });
   for (const method of ['GET', 'PUT']) {
     const res = await app.request('/admin/speed-test', { method, headers: adminHeaders,
       ...(method === 'PUT' ? { body: JSON.stringify({ enabled: false }) } : {}) });
@@ -725,13 +734,9 @@ test('retired setting routes return 404 while other settings, MacCMS validation 
     body: JSON.stringify({ prefix: 'kept' }) });
   assert.equal(settings.status, 200);
   assert.deepEqual(await (await app.request('/admin/name-transform', { headers: adminHeaders })).json(), { prefix: 'kept' });
-  assert.equal((await app.request('/admin/channel-probe/status', { headers: adminHeaders })).status, 200);
-  const toggle = await app.request('/admin/channel-probe/toggle', { method: 'PUT', headers: adminHeaders,
-    body: JSON.stringify({ enabled: false }) });
-  assert.equal(toggle.status, 200);
-  const probeState = await (await app.request('/admin/channel-probe/status', { headers: adminHeaders })).json();
-  assert.ok(probeState && typeof probeState === 'object' && 'enabled' in probeState);
-  assert.equal(probeState.enabled, false);
+  for (const route of ['/admin/channel-probe/status', '/admin/channel-probe/toggle', '/admin/channel-probe/trigger']) {
+    assert.equal((await app.request(route, { headers: adminHeaders })).status, 404);
+  }
   const calls: string[] = []; let timedOut = false;
   mockFetch((url, options) => {
     calls.push(url);
@@ -758,7 +763,7 @@ test('generated Admin initializes without the retired setting and still renders 
   new Script(script);
   assert.doesNotMatch(adminHtml, /speedTestCheck|speedTestStatus|loadSpeedTest|saveSpeedTest|\/admin\/speed-test|启用站点测速与不可达剔除/);
   const loaders = ['loadSourceHealth', 'loadSources', 'loadMacCMS', 'loadLives', 'loadNameTransform',
-    'loadSyncSchedule', 'loadSmartJarUrl', 'loadLiveDisabled', 'loadEdgeProxies', 'loadSearchQuota', 'loadChannelProbe'];
+    'loadSyncSchedule', 'loadSmartJarUrl', 'loadLiveDisabled', 'loadEdgeProxies', 'loadSearchQuota'];
   const initialized: string[] = [];
   const initContext = createContext(Object.fromEntries(loaders.map(name => [name, () => { initialized.push(name); }])));
   await new Script(script.slice(script.indexOf('async function loadAll()'), script.indexOf('async function loadSources()'))
@@ -869,9 +874,9 @@ test('sources and health details render truthful acquisition plus escaped round-
     const context = createContext({ input: record, healthMap: {},
       $: (id: string) => elements[id] ||= { innerHTML: '' },
       esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
-      auth: { authFetch: async () => ({ json: async () => [A] }) },
+      auth: { authFetch: async () => ({ ok: true, headers: new Headers({ 'X-Max-Data-Sources': '6' }), json: async () => [A] }) },
     });
-    const selected = element === 'sourceList' ? script.slice(start, end) : script.slice(tableStart, tableEnd);
+    const selected = element === 'sourceList' ? capacityScript(script) + script.slice(start, end) : script.slice(tableStart, tableEnd);
     await new Script(selected + '\n(async () => { ' + call + ' })()').runInContext(context);
     const rendered = elements[element].innerHTML;
     if (element === 'sourceList') {
@@ -891,6 +896,10 @@ test('sources and health details render truthful acquisition plus escaped round-
   }
 });
 
+function capacityScript(script: string): string {
+  return script.slice(script.indexOf('let sourceListRequest'), script.indexOf('async function loadSourceHealth'));
+}
+
 async function renderSourceRow(record?: object, source: SourceEntry = A) {
   const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)]
     .map(match => match[1]).find(text => text.includes('async function loadSources()'))!;
@@ -901,9 +910,9 @@ async function renderSourceRow(record?: object, source: SourceEntry = A) {
     $: (id: string) => elements[id] ||= { innerHTML: '' },
     esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
-    auth: { authFetch: async () => ({ json: async () => [source] }) },
+    auth: { authFetch: async () => ({ ok: true, headers: new Headers({ 'X-Max-Data-Sources': '6' }), json: async () => [source] }) },
   });
-  await new Script(script.slice(start, end) + '\nloadSources()').runInContext(context);
+  await new Script(capacityScript(script) + script.slice(start, end) + '\nloadSources()').runInContext(context);
   return elements.sourceList.innerHTML;
 }
 
@@ -1536,7 +1545,7 @@ test('inspection uses at most four requests at once, preserves declaration order
     await new Promise(resolve => realTimeout(resolve, 5)); active--;
     return url === entries[5].url ? new Response('', { status: 404 }) : response(leaf(url));
   });
-  const res = await sourceRequest(storage, { input: JSON.stringify(index(...entries)) }); const result = await res.json() as any;
+  const res = await sourceRequest(storage, { input: JSON.stringify(index(...entries)) }, '/admin/sources/import', { ...config, maxDataSources: 0 }); const result = await res.json() as any;
   assert.equal(requests, 11); assert.equal(maxActive, 4);
   assert.deepEqual(result.sources, entries.filter((_, n) => n !== 5).map(entry => entry.url));
 });
@@ -1720,14 +1729,14 @@ test('generated Admin actions wait once, render full inert text, retain partial 
     .find(text => text.includes('async function addSource()'))!;
   new Script(script); // Check the actual whole generated script, including template escaping.
   assert.doesNotMatch(adminHtml, /migrationResult|loadMigrationResult|\/admin\/sources\/migration-result/);
-  const selected = script.slice(script.indexOf('// --- Final operation results ---'), script.indexOf('// --- Remove source ---'))
+  const selected = capacityScript(script) + '\nsourceLimitValue = 6;\n' + script.slice(script.indexOf('// --- Final operation results ---'), script.indexOf('// --- Remove source ---'))
     + script.slice(script.indexOf('// --- Import Config ---'), script.indexOf('// --- Name Transform ---'));
   const reason = '<img src=x onerror=alert(1)> & ' + 'very-long-reason'.repeat(600);
   const partial = { type: 'multi', success: true, outcome: 'partial', added: 1, duplicates: 2,
     skipped: [{ name: '<nested>', url: N.url, reason }] };
   for (const action of ['addSource', 'importConfig']) {
     const elements: Record<string, any> = {};
-    for (const id of ['addBtn', 'addResult', 'addUrl', 'addName', 'addConfigKey', 'importBtn', 'importResult', 'importInput']) {
+    for (const id of ['addBtn', 'addResult', 'addUrl', 'addName', 'addConfigKey', 'importBtn', 'importResult', 'importInput', 'sourceCapacityHint']) {
       elements[id] = { value: id === 'addUrl' ? M.url : 'original input', textContent: '', innerHTML: '', disabled: false, focus() {} };
     }
     let resolve!: (value: unknown) => void; let calls = 0;
@@ -2025,7 +2034,7 @@ function logUi(transport?: { fetch: typeof fetch }) {
   const timers = new Map<number, () => void>();
   const allTimers = new Map<number, () => void>();
   let timerId = 0;
-  const context = createContext({
+  const context = createContext({ loadLives() {},
     $: (id: string) => elements[id],
     auth: { getToken: () => 'test-token' },
     document: { getElementById: (id: string) => elements[id],
@@ -2289,4 +2298,1083 @@ test('real Admin and shared transport rebuild the log window on EOF reconnect wi
   controllers[1].enqueue(encoded); await tick();
   assert.equal(ui.elements.logViewer.children.length, 1); assert.equal(requests, 2); assert.equal(maximumActive, 1);
   ui.tab('settings'); await tick(); assert.equal(active, 0); assert.equal(ui.timers.size, 0);
+});
+
+const manualOne = { name: '我的直播 <&> 🎬', url: 'https://manual.test/list.m3u?marker=__TVBOX_BASE_URL__&q=%22' };
+const manualTwo = { name: '', url: 'http://192.168.1.9/live.txt' };
+const automaticLive = { name: 'upstream live', type: 0, url: 'https://upstream.test/live.m3u' };
+const directLives = (...entries: { name: string; url: string }[]) => entries.map(entry => ({ ...entry, type: 0 }));
+async function seedLegacyLives(storage: Storage) {
+  const raw = JSON.stringify({ ...leaf('legacy-vod'), lives: [automaticLive] });
+  await storage.putMany({ [MERGED_CONFIG]: raw, [MERGED_CONFIG_FULL]: raw, [EXPORT_CONFIG]: raw, [LAST_UPDATE]: 'old-success' });
+}
+async function liveMutation(storage: Storage, entry: { name?: string; url: string }, method = 'POST') {
+  return createLiveSourcesRouter({ storage, config }).request('/admin/lives', { method,
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify(entry) });
+}
+async function manualLiveViews(storage: Storage, appConfig = config) {
+  const main = createConfigOutputRouter({ storage, config: appConfig });
+  const exported = createExportConfigRouter({ storage, config: appConfig, runtime: idleRuntime });
+  const routes = [await main.request('/'), await main.request('/live-config'),
+    await exported.request('/admin/export-config', { headers: adminHeaders })];
+  for (const route of routes) assert.equal(route.status, 200);
+  const results = await Promise.all(routes.map(route => route.json() as Promise<TVBoxConfig>));
+  return { results, routes };
+}
+async function assertManualViews(storage: Storage, expected: ReturnType<typeof directLives>, appConfig = config) {
+  const views = await manualLiveViews(storage, appConfig);
+  for (const [index, result] of views.results.entries()) {
+    const policy = await loadLivePolicy(storage);
+    assert.deepEqual(result.lives, index < 2 ? expected.map(entry => projectLiveAddress(entry, policy.cacheState, appConfig.localBaseUrl || '')) : expected);
+    assert.equal(views.routes[index].headers.get('cache-control'), 'no-store');
+  }
+}
+async function setLiveDisabled(storage: Storage, disabled: boolean) {
+  return createSettingsRouter({ storage, config, runtime: idleRuntime }).request('/admin/live-disabled', {
+    method: 'PUT', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ disabled }),
+  });
+}
+
+test('disabled manual lives update every response immediately without aggregation, fetch or success-time mutation', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage);
+  const originals = await rawOutputs(storage); const stamp = await storage.get(LAST_UPDATE);
+  mockFetch(() => { throw new Error('Manual policy must not fetch a URL'); });
+  await assertManualViews(storage, []); // Missing setting defaults to disabled; empty is intentional.
+  assert.equal((await liveMutation(storage, manualOne)).status, 200);
+  assert.equal((await liveMutation(storage, manualTwo)).status, 200);
+  await assertManualViews(storage, directLives(manualOne, manualTwo), { ...config, localBaseUrl: 'http://192.168.1.5:8787' });
+  const stats = await (await createDashboardRouter({ storage, config, runtime: idleRuntime }).request('/status-data')).json() as { lives: number };
+  assert.equal(stats.lives, 2);
+  const editor = await (await createConfigEditorRouter({ storage, config }).request('/admin/config-data', { headers: adminHeaders })).json() as any;
+  assert.equal(editor.liveDisabled, true); assert.equal(editor.lives[0].url, automaticLive.url);
+  assert.equal((await liveMutation(storage, manualOne, 'DELETE')).status, 200);
+  await assertManualViews(storage, directLives(manualTwo));
+  assert.equal((await liveMutation(storage, manualTwo, 'DELETE')).status, 200);
+  await assertManualViews(storage, []);
+  assert.deepEqual(await rawOutputs(storage), originals);
+  assert.equal(await storage.get(LAST_UPDATE), stamp);
+  assert.equal(await storage.get(SOURCE_OUTPUT_STATE), null);
+  assert.equal(await storage.get(SOURCE_CONFIG_SNAPSHOTS), null);
+});
+
+test('disabled aggregation and VOD cache reuse publish direct manual lives while FULL and source snapshots retain upstream data', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  await liveMutation(storage, manualOne);
+  await storage.put(BLACKLIST, JSON.stringify({ sites: [], parses: [], lives: [manualOne.url, automaticLive.url], regexRules: [] }));
+  let fail = false; const calls: string[] = [];
+  const upstream = { ...leaf('vod'), lives: [automaticLive] };
+  mockFetch(url => { calls.push(url); assert.equal(url, A.url); return fail ? new Response('', { status: 503 }) : response(upstream); });
+  await runSync(storage, config);
+  const raw = await rawOutputs(storage);
+  assert.deepEqual(JSON.parse(raw[0]!).lives, []); // Stored base excludes independent manual declarations.
+  assert.deepEqual(JSON.parse(raw[1]!).lives, [automaticLive]);
+  assert.deepEqual(JSON.parse(raw[2]!).lives, []);
+  assert.deepEqual((await snapshot(storage)).config.lives, [automaticLive]);
+  const saved = (await snapshot(storage)).savedAt;
+  fail = true; await runSync(storage, config);
+  await assertManualViews(storage, directLives(manualOne));
+  assert.equal((await snapshot(storage)).savedAt, saved);
+  assert.ok(calls.every(url => url === A.url));
+  assert.equal(await storage.get('channel_merged_tree'), null);
+  assert.equal((await status(storage)).records[0].aggregation.latest.mode, 'restored');
+  assert.equal((await patchMergedConfig(storage)).patched, true);
+  await assertManualViews(storage, directLives(manualOne));
+  assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG_FULL))!).lives, [automaticLive]);
+});
+
+test('manual declarations never establish or revive unavailable VOD output and remain saved across failed writes', async () => {
+  const storage = new MemoryStorage(); await liveMutation(storage, manualOne);
+  const absent = createConfigOutputRouter({ storage, config });
+  assert.equal((await absent.request('/')).status, 503);
+  assert.equal((await absent.request('/live-config')).status, 503);
+  const absentExport = createExportConfigRouter({ storage, config, runtime: idleRuntime });
+  assert.equal((await absentExport.request('/admin/export-config', { headers: adminHeaders })).status, 503);
+  assert.equal((await readAggregateOutputs(storage))?.merged, null);
+  await seedLegacyLives(storage); await assertManualViews(storage, directLives(manualOne));
+  storage.failPut = LIVE_SOURCES;
+  const prior = await storage.get(LIVE_SOURCES); const stamp = await storage.get(LAST_UPDATE);
+  const router = createLiveSourcesRouter({ storage, config }); router.onError(() => new Response('write failed', { status: 500 }));
+  const failedAdd = await router.request('/admin/lives', { method: 'POST', headers: adminHeaders, body: JSON.stringify(manualTwo) });
+  assert.equal(failedAdd.status, 500); assert.equal(await storage.get(LIVE_SOURCES), prior);
+  const failedDelete = await router.request('/admin/lives', { method: 'DELETE', headers: adminHeaders, body: JSON.stringify(manualOne) });
+  assert.equal(failedDelete.status, 500); assert.equal(await storage.get(LIVE_SOURCES), prior);
+  await assertManualViews(storage, directLives(manualOne)); assert.equal(await storage.get(LAST_UPDATE), stamp);
+  storage.failPut = undefined;
+  await roots(storage, [A]); await beginSourceOutputRun(storage); await assertUnavailableViews(storage);
+  assert.equal((await liveMutation(storage, manualTwo)).status, 200); await assertUnavailableViews(storage);
+});
+
+test('manual live CRUD stays authenticated and serializes concurrent additions and deletions without lost entries', async () => {
+  const storage = new MemoryStorage(); const router = createLiveSourcesRouter({ storage, config });
+  assert.equal((await router.request('/admin/lives')).status, 401);
+  assert.equal((await router.request('/admin/lives', { method: 'POST', body: JSON.stringify(manualOne) })).status, 401);
+  assert.equal(await storage.get(LIVE_SOURCES), null);
+  for (const input of [null, { url: 123 }, { url: 'not a URL' }, { url: manualOne.url, name: 123 }]) {
+    assert.equal((await router.request('/admin/lives', { method: 'POST', headers: adminHeaders, body: JSON.stringify(input) })).status, 400);
+  }
+  const added = await Promise.all([liveMutation(storage, manualOne), liveMutation(storage, manualTwo)]);
+  assert.deepEqual(added.map(result => result.status), [200, 200]);
+  assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), [manualOne, manualTwo]);
+  const duplicates = await Promise.all([liveMutation(storage, manualOne), liveMutation(storage, manualOne)]);
+  assert.deepEqual(duplicates.map(result => result.status), [409, 409]);
+  await Promise.all([liveMutation(storage, manualOne, 'DELETE'), liveMutation(storage, manualTwo, 'DELETE')]);
+  assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), []);
+});
+
+test('setting changes apply immediately, enabled sources retain address objects, and legacy probe data remains inert', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, manualTwo);
+  assert.equal((await setLiveDisabled(storage, false)).status, 200);
+  const enabled = await manualLiveViews(storage);
+  assert.deepEqual(enabled.results[0].lives, [automaticLive, ...directLives(manualTwo)]);
+  assert.equal(enabled.routes[0].headers.get('cache-control'), 'no-store');
+  assert.equal(enabled.routes[1].headers.get('cache-control'), 'no-store');
+  const prior = await rawOutputs(storage);
+  await liveMutation(storage, manualOne); assert.deepEqual(await rawOutputs(storage), prior);
+  await assertManualViews(storage, [automaticLive, ...directLives(manualTwo, manualOne)]);
+  await roots(storage, [A]); const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url);
+    if (url === A.url) return response({ ...leaf('vod'), lives: [automaticLive] });
+    return new Response('#EXTM3U\n#EXTINF:-1 group-title="测试",CCTV1\nhttps://channel.test/' + calls.length + '.m3u8\n');
+  });
+  await runSync(storage, config);
+  assert.deepEqual(new Set(calls), new Set([A.url]));
+  const native = JSON.parse((await storage.get(MERGED_CONFIG))!).lives;
+  assert.deepEqual(native, [automaticLive]); assert.equal(await storage.get('channel_merged_tree'), null);
+  assert.equal((await setLiveDisabled(storage, true)).status, 200);
+  await assertManualViews(storage, directLives(manualTwo, manualOne));
+  await storage.put('channel_probe_enabled', 'true'); calls.length = 0;
+  assert.deepEqual(calls, []);
+  await storage.delete(LIVE_DISABLED); assert.deepEqual(calls, []);
+});
+
+test('manual-mode live-config retains smart host protection and preserves declared URL literals', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, manualOne);
+  await storage.put(SMART_JAR_URL_ENABLED, 'true');
+  const oldDmz = process.env.DMZ; process.env.DMZ = '1';
+  restoreMocks.push(() => { if (oldDmz === undefined) delete process.env.DMZ; else process.env.DMZ = oldDmz; });
+  const router = createConfigOutputRouter({ storage, config: { ...config, localBaseUrl: 'http://192.168.1.5:8787' } });
+  const awaitPolicy = await loadLivePolicy(storage);
+  for (const route of ['/', '/live-config']) {
+    assert.equal((await router.request('https://public.test' + route, { headers: { Host: 'public.test' } })).status, 403);
+    const res = await router.request('http://192.168.1.6:8787' + route, { headers: { Host: '192.168.1.6:8787' } });
+    assert.equal(res.status, 200); assert.deepEqual((await res.json() as TVBoxConfig).lives, directLives(manualOne).map(entry => projectLiveAddress(entry, awaitPolicy.cacheState, 'http://192.168.1.6:8787')));
+  }
+});
+
+test('damaged or unreadable manual declarations fail closed without upstream leakage and recover after repair', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage);
+  for (const raw of ['{', '{}', '[null]', '[{"url":123}]', '[{"url":"not a URL"}]']) {
+    await storage.put(LIVE_SOURCES, raw);
+    const router = createConfigOutputRouter({ storage, config });
+    assert.equal((await router.request('/')).status, 503); assert.equal((await router.request('/live-config')).status, 503);
+    assert.equal((await patchMergedConfig(storage)).patched, false);
+  }
+  await storage.put(LIVE_SOURCES, JSON.stringify([manualOne]));
+  storage.failGet = LIVE_SOURCES;
+  assert.equal(await readAggregateOutputs(storage), null);
+  storage.failGet = undefined; await assertManualViews(storage, directLives(manualOne));
+  await storage.put(LIVE_SOURCES, 'broken unused list'); await storage.put(LIVE_DISABLED, 'false');
+  assert.equal(await readAggregateOutputs(storage), null); // Manual declarations now participate in both output modes.
+  await storage.put(LIVE_DISABLED, 'true'); await storage.put(LIVE_SOURCES, JSON.stringify([manualOne]));
+  await storage.put(MERGED_CONFIG, '{'); await storage.put(EXPORT_CONFIG, '{');
+  const routes = createConfigOutputRouter({ storage, config });
+  assert.equal((await routes.request('/')).status, 500);
+  assert.equal((await routes.request('/live-config')).status, 500);
+  const exp = createExportConfigRouter({ storage, config, runtime: idleRuntime });
+  assert.equal((await exp.request('/admin/export-config', { headers: adminHeaders })).status, 500);
+  const nullLives = JSON.stringify({ ...leaf('legacy-null'), lives: null });
+  await storage.putMany({ [MERGED_CONFIG]: nullLives, [EXPORT_CONFIG]: nullLives });
+  await assertManualViews(storage, directLives(manualOne));
+  await storage.put(LIVE_DISABLED, 'false'); await assertManualViews(storage, directLives(manualOne));
+});
+
+test('manual edits reject captured patches and an in-flight real patch cannot restore a deleted address', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, manualOne);
+  const captured = (await readAggregateOutputs(storage))!; const before = await rawOutputs(storage);
+  await liveMutation(storage, manualTwo);
+  assert.equal(await publishAggregatePatch(storage, captured.token, captured.merged!, captured.exported!), false);
+  assert.deepEqual(await rawOutputs(storage), before);
+  const originalGet = storage.get.bind(storage); const held = deferred<void>(); const resume = deferred<void>(); let once = false;
+  storage.get = async key => {
+    if (key === BLACKLIST && !once) { once = true; held.resolve(); await resume.promise; }
+    return originalGet(key);
+  };
+  const patch = patchMergedConfig(storage); await held.promise;
+  await liveMutation(storage, manualOne, 'DELETE'); resume.resolve();
+  assert.equal((await patch).patched, false); await assertManualViews(storage, directLives(manualTwo));
+  assert.deepEqual(await rawOutputs(storage), before);
+});
+
+test('aggregation publication uses the newest manual list and rejects an incompatible live mode switch', async () => {
+  for (const changeMode of [false, true]) {
+    const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, manualOne);
+    mockFetch(() => response({ ...leaf('vod'), lives: [automaticLive] })); await runSync(storage, config);
+    const snapshotBefore = await snapshot(storage); const rawBefore = await rawOutputs(storage);
+    const held = deferred<void>(); const resume = deferred<void>(); const originalGet = storage.get.bind(storage); let once = false;
+    storage.get = async key => {
+      // Pipeline is past its policy capture but has not entered final publication.
+      if (key === NAME_TRANSFORM && !once) { once = true; held.resolve(); await resume.promise; }
+      return originalGet(key);
+    };
+    const sync = runSync(storage, config); await held.promise;
+    await liveMutation(storage, manualOne, 'DELETE'); await liveMutation(storage, manualTwo);
+    if (changeMode) await withSourceGate(storage, () => storage.put(LIVE_DISABLED, 'false'));
+    resume.resolve(); await sync;
+    if (changeMode) {
+      assert.deepEqual(await rawOutputs(storage), rawBefore);
+      assert.deepEqual(await snapshot(storage), snapshotBefore);
+      assert.match((await storage.get(LAST_UPDATE))!, /Live policy changed during aggregation/);
+    } else {
+      assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).lives, []);
+      assert.deepEqual(JSON.parse((await storage.get(EXPORT_CONFIG))!).lives, []);
+      await assertManualViews(storage, directLives(manualTwo));
+    }
+  }
+});
+
+test('Admin setting toggles save silently, prevent repeated writes and restore rejected changes', async () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(text => text.includes('async function saveSetting('))!;
+  new Script(script);
+  const actions = script.slice(script.indexOf('async function saveSetting('), script.indexOf('async function loadSearchQuotaReport()'));
+  for (const [action, control, route, field] of [
+    ['saveSmartJarUrl', 'smartJarUrlCheck', '/admin/smart-jar-url', 'enabled'],
+    ['saveLiveDisabled', 'liveDisabledCheck', '/admin/live-disabled', 'disabled'],
+  ]) for (const value of [false, true]) for (const outcome of ['ok', 'http-error', 'network-error']) {
+    const elements: Record<string, { checked: boolean; disabled: boolean }> = {
+      smartJarUrlCheck: { checked: false, disabled: false },
+      liveDisabledCheck: { checked: false, disabled: false },
+      channelProbeCheck: { checked: false, disabled: false },
+      channelProbeTriggerBtn: { checked: false, disabled: false },
+    };
+    elements[control].checked = value;
+    const result = deferred<{ ok: boolean }>(); const calls: string[] = [];
+    const context = createContext({
+      $: (id: string) => { assert.ok(elements[id], id); return elements[id]; },
+      document: { querySelector: () => ({ classList: { remove() {} } }) },
+      toast() { assert.fail('Setting save must be silent'); },
+      setTimeout() { assert.fail('Setting save must not schedule feedback'); },
+      auth: { authFetch: (url: string, options: { method: string; body: string }) => {
+        calls.push(url); assert.equal(url, route); assert.equal(options.method, 'PUT');
+        assert.deepEqual(JSON.parse(options.body), { [field]: value }); return result.promise;
+      } },
+    });
+    new Script(actions).runInContext(context);
+    const pending = new Script(action + '()').runInContext(context);
+    assert.equal(elements[control].disabled, true);
+    await new Script(action + '()').runInContext(context);
+    assert.equal(calls.length, 1);
+    if (outcome === 'network-error') result.reject(new Error('offline'));
+    else result.resolve({ ok: outcome === 'ok' });
+    await pending;
+    assert.equal(elements[control].disabled, false);
+    assert.equal(elements[control].checked, outcome === 'ok' ? value : !value);
+  }
+});
+
+test('Admin form settings keep their payloads and release save buttons without feedback on any outcome', async () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(text => text.includes('async function saveSetting('))!;
+  const actions = script.slice(script.indexOf('async function saveSetting('), script.indexOf('async function loadSearchQuotaReport()'));
+  for (const [action, button, route, payload] of [
+    ['saveNameTransform', 'ntSaveBtn', '/admin/name-transform', { prefix: 'before', suffix: 'after' }],
+    ['saveSyncSchedule', 'syncSaveBtn', '/admin/cron-interval', { schedule: { period: 'weekly', hour: 5, minute: 30, dayOfWeek: 2 } }],
+    ['saveEdgeProxies', 'edgeProxiesSaveBtn', '/admin/edge-proxies', { fetchProxy: 'https://proxy.test', vercel: '' }],
+    ['saveSearchQuota', 'searchQuotaSaveBtn', '/admin/search-quota', { maxSearchable: 12, pinnedKeys: ['site-a'] }],
+  ] as const) for (const outcome of ['ok', 'http-error', 'network-error']) {
+    const elements: Record<string, { value?: string; disabled?: boolean; textContent?: string }> = {
+      ntPrefix: { value: 'before' }, ntSuffix: { value: 'after' }, syncPeriod: { value: 'weekly' },
+      syncTime: { value: '05:30' }, syncDayOfWeek: { value: '2' },
+      edgeFetchProxyUrl: { value: ' https://proxy.test ' }, edgeVercelUrl: { value: '' },
+      maxSearchableInput: { value: '12' }, [button]: { disabled: false, textContent: '保存' },
+    };
+    const result = deferred<{ ok: boolean }>(); let calls = 0;
+    const context = createContext({
+      $: (id: string) => { assert.ok(elements[id], id); return elements[id]; },
+      toast() { assert.fail('Setting save must be silent'); },
+      setTimeout() { assert.fail('Setting save must not schedule feedback'); },
+      auth: { authFetch: (url: string, options: { method: string; body: string }) => {
+        calls++; assert.equal(url, route); assert.equal(options.method, 'PUT');
+        assert.deepEqual(JSON.parse(options.body), payload); return result.promise;
+      } },
+    });
+    new Script(actions + '\nsqPinnedKeys = new Set(["site-a"]);').runInContext(context);
+    const pending = new Script(action + '()').runInContext(context);
+    await new Script(action + '()').runInContext(context);
+    assert.equal(calls, 1); assert.equal(elements[button].disabled, true);
+    assert.equal(elements[button].textContent, '保存');
+    if (outcome === 'network-error') result.reject(new Error('offline'));
+    else result.resolve({ ok: outcome === 'ok' });
+    await pending;
+    assert.equal(elements[button].disabled, false);
+    assert.equal(elements[button].textContent, '保存');
+  }
+});
+
+test('generated Admin permits manual live editing while disabled, and editor retains its live control lock', async () => {
+  const admin = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(script => script.includes('function switchTab(tab)'))!;
+  new Script(admin);
+  const elements: Record<string, { checked?: boolean; disabled?: boolean; value?: string; textContent?: string; className?: string; innerHTML?: string }> = {
+    liveDisabledCheck: { checked: true }, channelProbeCheck: {}, channelProbeTriggerBtn: {},
+    liveUrl: { value: manualOne.url }, liveName: { value: manualOne.name }, liveAddBtn: { disabled: false }, liveList: {},
+  };
+  const states: string[] = []; const calls: string[] = []; const result = deferred<{ ok: boolean; json: () => Promise<object> }>();
+  const selected = admin.slice(admin.indexOf('function updateLiveTabState(disabled)'), admin.indexOf('async function saveLiveDisabled()'))
+    + admin.slice(admin.indexOf('async function addLive()'), admin.indexOf('// --- Import Config ---'));
+  const context = createContext({ $: (id: string) => elements[id], toast() {}, loadLives() {},
+    document: { querySelector: () => ({ classList: { remove: (name: string) => states.push(name) } }) },
+    auth: { authFetch: async (url: string) => { calls.push(url); return result.promise; } } });
+  new Script(selected + '\nupdateLiveTabState(true)').runInContext(context);
+  assert.deepEqual(states, ['disabled']);
+  const pending = new Script('addLive()').runInContext(context); await new Script('addLive()').runInContext(context);
+  assert.deepEqual(calls, ['/admin/lives']); assert.equal(elements.liveAddBtn.disabled, true);
+  result.resolve({ ok: true, json: async () => ({ success: true }) }); await pending;
+  assert.equal(elements.liveAddBtn.disabled, false); assert.equal(elements.liveUrl.value, '');
+  const tabUi = logUi(); tabUi.elements.liveDisabledCheck = { checked: true } as unknown as LogDomElement;
+  tabUi.tab('live'); // Original switchTab guard would keep logs active instead.
+  assert.equal(tabUi.elements.logConnStatus.textContent, '未连接');
+  assert.ok(!admin.slice(admin.indexOf('function switchTab(tab)'), admin.indexOf('// --- Source health ---')).includes('liveDisabledCheck'));
+  const editor = [...configEditorHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+    .find(script => script.includes('function liveRow(l, liveDisabled)'))!;
+  new Script(editor);
+  const row = editor.slice(editor.indexOf('function liveRow(l, liveDisabled)'), editor.indexOf('function doSearch()'));
+  const locked = createContext({ l: automaticLive, esc: String, typeSpan: () => '', LIVE_TYPE_TIPS: {} });
+  const rendered = new Script(row + '\nliveRow(l,true)').runInContext(locked) as string;
+  assert.doesNotMatch(rendered, /item-check|<button/);
+  let requests = 0;
+  const ctx = createContext({ DATA: { liveDisabled: true }, fetch: () => { requests++; }, automaticLive });
+  const actions = editor.slice(editor.indexOf('async function block(type, id)'), editor.indexOf('function updateItemDom('));
+  await new Script(actions + '\nPromise.all([block("lives",automaticLive.url),unblock("lives",automaticLive.url)])').runInContext(ctx);
+  assert.equal(requests, 0);
+});
+
+test('manual-only live addresses remain objects in both modes and update after aggregation without a download or stale declaration', async () => {
+  for (const disabled of [false, true]) {
+    const storage = new MemoryStorage(); await roots(storage, [A]);
+    await storage.put(LIVE_DISABLED, String(disabled)); await liveMutation(storage, manualOne);
+    await storage.put('channel_merged_tree', JSON.stringify([{ group: 'old-manual', channels: [{ name: 'old', urls: [manualOne.url] }] }]));
+    await storage.put('channel_probe_enabled', 'true');
+    const calls: string[] = [];
+    mockFetch(url => { calls.push(url); assert.equal(url, A.url, 'manual playlist must be client-loaded'); return response(leaf('vod')); });
+    await runSync(storage, config);
+    assert.ok(await storage.get('channel_merged_tree')); // Legacy data is inert, no probing or migration.
+    await assertManualViews(storage, directLives(manualOne));
+    assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).lives, []);
+    assert.deepEqual(JSON.parse((await storage.get(EXPORT_CONFIG))!).lives, []);
+    const stamp = await storage.get(LAST_UPDATE); const raw = await rawOutputs(storage);
+    await liveMutation(storage, manualTwo);
+    await assertManualViews(storage, directLives(manualOne, manualTwo));
+    await liveMutation(storage, manualOne, 'DELETE');
+    await assertManualViews(storage, directLives(manualTwo));
+    assert.deepEqual(await rawOutputs(storage), raw); assert.equal(await storage.get(LAST_UPDATE), stamp);
+    assert.equal((await patchMergedConfig(storage)).patched, true);
+    await assertManualViews(storage, directLives(manualTwo));
+    await runSync(storage, config); await assertManualViews(storage, directLives(manualTwo));
+    await liveMutation(storage, manualTwo, 'DELETE'); await assertManualViews(storage, []);
+    assert.ok(calls.every(url => url === A.url));
+  }
+});
+
+test('enabled upstream address objects coexist with current manual objects without a configured cache host', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  await liveMutation(storage, manualOne); let fail = false; const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url);
+    if (url === A.url) return response({ ...leaf('vod'), lives: [automaticLive] });
+    assert.equal(url, automaticLive.url);
+    return fail ? new Response('', { status: 503 }) : new Response('#EXTM3U\n#EXTINF:-1 group-title="自动频道",CCTV1\nhttps://channel.test/auto.m3u8\n');
+  });
+  await runSync(storage, config);
+  const views = await manualLiveViews(storage);
+  for (const result of views.results.slice(0, 2)) {
+    assert.deepEqual(result.lives!.at(-1), directLives(manualOne)[0]);
+    assert.deepEqual(result.lives![0], automaticLive);
+  }
+  assert.deepEqual(views.results[2].lives, [automaticLive, ...directLives(manualOne)]);
+  assert.ok(!JSON.stringify(await rawOutputs(storage)).includes(manualOne.url));
+  fail = true; await runSync(storage, config);
+  const degraded = await manualLiveViews(storage);
+  assert.deepEqual(degraded.results[0].lives, [automaticLive, ...directLives(manualOne)]);
+  assert.deepEqual(degraded.results[1].lives, [automaticLive, ...directLives(manualOne)]);
+  assert.ok(calls.every(url => url === A.url || url === automaticLive.url));
+});
+
+test('a manual address shared with an upstream declaration is not downloaded twice or duplicated in output', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  await liveMutation(storage, manualOne); const calls: string[] = [];
+  const legacy = JSON.stringify({ ...leaf('legacy-shared'), lives: [{ ...automaticLive, url: manualOne.url }] });
+  await storage.putMany({ [MERGED_CONFIG]: legacy, [MERGED_CONFIG_FULL]: legacy, [EXPORT_CONFIG]: legacy });
+  await assertManualViews(storage, directLives(manualOne), { ...config, localBaseUrl: 'http://192.168.1.5:8787' });
+  mockFetch(url => {
+    calls.push(url);
+    if (url === A.url) return response({ ...leaf('vod'), lives: [{ ...automaticLive, url: manualOne.url }] });
+    return new Response('#EXTM3U\n#EXTINF:-1 group-title="频道",CCTV1\nhttps://channel.test/live.m3u8\n');
+  });
+  await runSync(storage, config); await assertManualViews(storage, directLives(manualOne));
+  assert.ok(calls.every(url => url === A.url));
+  await liveMutation(storage, manualOne, 'DELETE'); await runSync(storage, config);
+  assert.ok(calls.every(url => url === A.url)); // No local proxy configured: ordinary addresses pass through.
+  const views = await manualLiveViews(storage);
+  assert.equal(views.results[0].lives![0].url, manualOne.url);
+});
+
+test('enabled manual edits reject old patch tokens and stale real patches without restoring deleted objects', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await storage.put(LIVE_DISABLED, 'false');
+  await liveMutation(storage, manualOne);
+  const captured = (await readAggregateOutputs(storage))!;
+  const held = deferred<void>(); const resume = deferred<void>(); const originalGet = storage.get.bind(storage); let once = false;
+  storage.get = async key => {
+    if (key === BLACKLIST && !once) { once = true; held.resolve(); await resume.promise; }
+    return originalGet(key);
+  };
+  const patch = patchMergedConfig(storage); await held.promise;
+  await liveMutation(storage, manualOne, 'DELETE'); await liveMutation(storage, manualTwo);
+  resume.resolve(); assert.equal((await patch).patched, false);
+  assert.equal(await publishAggregatePatch(storage, captured.token, captured.merged!, captured.exported!), false);
+  await assertManualViews(storage, [automaticLive, ...directLives(manualTwo)]);
+});
+
+
+const cacheConfig = { ...config, localBaseUrl: 'http://192.168.1.5:8787' };
+const cachedManual = { name: '手动列表', url: 'https://manual-cache.test/list.m3u' };
+const playlistText = (name = 'CCTV1') => '#EXTM3U\n#EXTINF:-1 group-title="央视",' + name + '\nhttps://channel.test/live.m3u8\n';
+const listRequest = (storage: Storage, entry = { ...cachedManual, type: 0 }, suffix = 'm3u') =>
+  createLiveCacheRouter({ storage, config: cacheConfig }).request('/live/' + liveCacheKey(entry) + '.' + suffix);
+async function liveStatusViews(storage: Storage) {
+  const result = await createLiveSourcesRouter({ storage, config: cacheConfig }).request('/admin/lives', { headers: adminHeaders });
+  assert.equal(result.status, 200);
+  return result.json() as Promise<Array<{ name: string; url: string; cacheStatus: ReturnType<typeof liveCacheView> }>>;
+}
+
+for (const dmz of [undefined, '0', '1']) {
+  test('live playlists cache local and public addresses regardless of DMZ=' + String(dmz), async () => {
+    const originalDmz = process.env.DMZ;
+    if (dmz === undefined) delete process.env.DMZ; else process.env.DMZ = dmz;
+    restoreMocks.push(() => { if (originalDmz === undefined) delete process.env.DMZ; else process.env.DMZ = originalDmz; });
+    const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+    const addresses = [
+      'http://192.168.31.120:8088/watch.txt', 'https://10.0.0.2/list.m3u', 'http://172.16.0.2/list.m3u',
+      'http://localhost/list.m3u', 'http://127.0.0.1/list.m3u', 'http://[::1]/list.m3u',
+      'http://169.254.1.2/list.m3u', 'http://[fe80::1]/list.m3u', 'http://[fd00::1]/list.m3u',
+      'http://playlist.local/list.m3u', 'http://playlist.internal/list.m3u', 'https://public-live.test/list.m3u',
+    ];
+    const entries = addresses.map((url, i) => ({ name: '列表' + i, url, type: 0 }));
+    const calls: string[] = [];
+    mockFetch(url => {
+      calls.push(url);
+      return url === A.url ? response({ ...leaf('vod'), lives: entries.slice(0, 6) }) : new Response(playlistText());
+    });
+    for (const entry of entries.slice(6)) await liveMutation(storage, entry);
+    assert.deepEqual(calls, []);
+    await runSync(storage, cacheConfig);
+    assert.deepEqual(new Set(calls), new Set([A.url, ...addresses]));
+    for (const url of addresses) assert.equal(calls.filter(call => call === url).length, 1);
+    const afterPrefetch = calls.length;
+    const views = await manualLiveViews(storage, cacheConfig);
+    assert.equal(views.results[0].lives!.length, entries.length);
+    assert.ok(views.results[0].lives!.every(entry => entry.url!.startsWith(cacheConfig.localBaseUrl + '/live/')));
+    assert.deepEqual(views.results[2].lives, entries);
+    for (const entry of entries) {
+      const cached = await listRequest(storage, entry);
+      assert.equal(cached.status, 200); assert.equal(await cached.text(), playlistText());
+    }
+    assert.equal(calls.length, afterPrefetch); // All reads use the published files.
+    assert.ok((await liveStatusViews(storage)).every(entry => entry.cacheStatus.level === 'ok'));
+
+    const added = { name: '新增局域网列表', url: 'http://192.168.31.121/first.m3u', type: 0 };
+    await liveMutation(storage, added); assert.equal(calls.length, afterPrefetch);
+    assert.equal((await listRequest(storage, added)).status, 200); // First access can also fill a LAN cache.
+    assert.equal((await listRequest(storage, added)).status, 200);
+    assert.equal(calls.filter(url => url === added.url).length, 1);
+  });
+}
+
+test('malformed live HTTP addresses fail before download without preventing valid LAN peers from caching', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const invalid = { name: '无效地址', url: 'http://[', type: 0 };
+  const valid = { name: '局域网', url: 'http://192.168.31.120/list.m3u', type: 0 };
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return url === A.url ? response({ ...leaf('vod'), lives: [invalid, valid] }) : new Response(playlistText()); });
+  await runSync(storage, cacheConfig);
+  assert.deepEqual(new Set(calls), new Set([A.url, valid.url]));
+  const state = (await loadLiveCache(storage)).state!;
+  assert.equal(liveCacheView(invalid, state).level, 'error');
+  assert.equal(liveCacheView(invalid, state).reason, '直播地址格式无效');
+  assert.equal(liveCacheView(valid, state).level, 'ok');
+  assert.equal((await listRequest(storage, valid)).status, 200);
+});
+
+test('live playlist cache prefetches both origins, keeps JSON compact, serves bytes and preserves original export', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return url === A.url ? response({ ...leaf('vod'), lives: [automaticLive] }) : new Response(playlistText()); });
+  await liveMutation(storage, cachedManual); assert.deepEqual(calls, []);
+  await runSync(storage, cacheConfig);
+  assert.deepEqual(new Set(calls), new Set([A.url, automaticLive.url, cachedManual.url]));
+  const views = await manualLiveViews(storage, cacheConfig);
+  assert.equal(views.results[0].lives!.length, 2);
+  assert.ok(views.results[0].lives!.every(entry => entry.url!.startsWith(cacheConfig.localBaseUrl + '/live/') && !entry.channels));
+  assert.deepEqual(views.results[2].lives, [automaticLive, ...directLives(cachedManual)]);
+  assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG))!).lives, [automaticLive]);
+  const before = calls.length; const res = await listRequest(storage);
+  assert.equal(res.status, 200); assert.equal(await res.text(), playlistText()); assert.equal(calls.length, before);
+  assert.equal(res.headers.get('cache-control'), 'no-cache'); assert.ok(res.headers.get('etag'));
+  const unchanged = await createLiveCacheRouter({ storage, config: cacheConfig }).request('/live/' + liveCacheKey({ ...cachedManual, type: 0 }) + '.m3u',
+    { headers: { 'If-None-Match': res.headers.get('etag')! } });
+  assert.equal(unchanged.status, 304); assert.equal(calls.length, before);
+  assert.deepEqual((await liveStatusViews(storage))[0].cacheStatus, { level: 'ok', label: 'OK' });
+});
+
+test('live refresh failure preserves old file/time, stays warning across failures and recovers only on the next aggregation', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, cachedManual);
+  let fail = false; let downloads = 0;
+  mockFetch(url => { if (url === A.url) return response(leaf('vod')); downloads++;
+    return fail ? new Response('unavailable', { status: 503 }) : new Response(playlistText('频道' + downloads)); });
+  await runSync(storage, cacheConfig);
+  const state = (await loadLiveCache(storage)).state!; const old = state.records[liveCacheKey({ ...cachedManual, type: 0 })];
+  const time = old.savedAt; const body = await (await listRequest(storage)).text();
+  fail = true;
+  for (let i = 0; i < 4; i++) await runSync(storage, cacheConfig);
+  assert.equal(downloads, 5);
+  for (let i = 0; i < 3; i++) assert.equal(await (await listRequest(storage)).text(), body);
+  assert.equal(downloads, 5);
+  const status = (await liveStatusViews(storage))[0].cacheStatus;
+  assert.equal(status.level, 'warn'); assert.equal(status.cached, true); assert.equal(status.cacheTime, time);
+  assert.equal(status.failures, 4); assert.match(status.reason!, /503/);
+  const restarted = new MemoryStorage(); restarted.data = new Map(storage.data);
+  assert.equal(await (await listRequest(restarted)).text(), body); assert.equal(downloads, 5);
+  fail = false; await runSync(restarted, cacheConfig); assert.equal(downloads, 6);
+  assert.deepEqual((await liveStatusViews(restarted))[0].cacheStatus, { level: 'ok', label: 'OK' });
+  assert.notEqual(await (await listRequest(restarted)).text(), body);
+});
+
+test('no-cache aggregation failure outputs origin and freezes old-local requests across restart until next aggregation', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, cachedManual);
+  let fail = true; let calls = 0;
+  mockFetch(url => { if (url === A.url) return response(leaf('vod')); calls++;
+    return fail ? new Response('no', { status: 404 }) : new Response(playlistText()); });
+  await runSync(storage, cacheConfig); assert.equal(calls, 1);
+  await assertManualViews(storage, directLives(cachedManual), cacheConfig);
+  const status = (await liveStatusViews(storage))[0].cacheStatus;
+  assert.equal(status.level, 'error'); assert.equal(status.cached, false);
+  for (const store of [storage, Object.assign(new MemoryStorage(), { data: new Map(storage.data) })]) {
+    for (let i = 0; i < 2; i++) {
+      const res = await listRequest(store); assert.equal(res.status, 302); assert.equal(res.headers.get('location'), cachedManual.url);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+    }
+  }
+  assert.equal(calls, 1); fail = false; await runSync(storage, cacheConfig); assert.equal(calls, 2);
+  assert.equal((await listRequest(storage)).status, 200);
+});
+
+test('manual first access shares one download, save is network-free and deletion/re-add revokes old bytes and late results', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage);
+  const hold = deferred<Response>(); const started = deferred<void>(); let requests = 0;
+  mockFetch(() => { requests++; started.resolve(); return hold.promise; });
+  await liveMutation(storage, cachedManual); assert.equal(requests, 0);
+  assert.equal((await liveStatusViews(storage))[0].cacheStatus.label, '等待聚合');
+  const pending = Promise.all([listRequest(storage), listRequest(storage), listRequest(storage)]);
+  await started.promise; assert.equal(requests, 1);
+  await liveMutation(storage, cachedManual, 'DELETE'); await liveMutation(storage, cachedManual);
+  hold.resolve(new Response(playlistText('不应写回')));
+  const responses = await pending;
+  assert.ok(responses.every(res => res.status === 302));
+  assert.equal((await liveStatusViews(storage))[0].cacheStatus.label, '等待聚合');
+  assert.equal((await loadLiveCache(storage)).state!.records[liveCacheKey({ ...cachedManual, type: 0 })].file, undefined);
+  mockFetch(() => { requests++; return new Response(playlistText('新内容')); });
+  const filled = await Promise.all([listRequest(storage), listRequest(storage)]);
+  assert.equal(requests, 2); assert.ok(filled.every(res => res.status === 200));
+  await liveMutation(storage, cachedManual, 'DELETE');
+  assert.equal((await listRequest(storage)).status, 404); assert.equal(requests, 2);
+});
+
+test('on-demand first failure freezes retries and switches new config to original URL without aggregation', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  let requests = 0; mockFetch(() => { requests++; return new Response('blocked', { status: 403 }); });
+  assert.equal((await listRequest(storage)).status, 302);
+  assert.equal((await listRequest(storage)).status, 302); assert.equal(requests, 1);
+  await assertManualViews(storage, directLives(cachedManual), cacheConfig);
+});
+
+test('live normalization preserves names/order/directives and resolves relative links against final upstream URL', async () => {
+  const source = '#EXTM3U\r\n#EXTINF:-1 tvg-logo="../logo.png" group-title="原组",名称 HD type\r\n./channel.m3u8?x=1#frag$线路A\r\n#UNKNOWN:keep\r\n';
+  const result = normalizePlaylist(Buffer.from(source), 'text/plain', 'https://final.test/lists/live.m3u')!;
+  assert.equal(result.data.toString(), '#EXTM3U\r\n#EXTINF:-1 tvg-logo="https://final.test/logo.png" group-title="原组",名称 HD type\r\nhttps://final.test/lists/channel.m3u8?x=1#frag$线路A\r\n#UNKNOWN:keep\r\n');
+  const txt = '原组,#genre#\n频道,../one.ts$一号#https://absolute.test/two.ts#fragment$二号\n';
+  assert.equal(normalizePlaylist(Buffer.from(txt), '', 'https://final.test/lists/live.txt')!.data.toString(),
+    '原组,#genre#\n频道,https://final.test/one.ts$一号#https://absolute.test/two.ts#fragment$二号\n');
+  assert.equal(normalizePlaylist(Buffer.from('#EXTM3U\n#EXT-X-TARGETDURATION:10\nchunk.ts'), '', 'https://final.test/live.m3u8'), null);
+  assert.throws(() => normalizePlaylist(Buffer.from('<html>wrong</html>'), '', 'https://final.test/live'), /不是直播列表/);
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  mockFetch(() => { const response = new Response(source); Object.defineProperty(response, 'url', { value: 'https://final.test/lists/live.m3u' }); return response; });
+  const response = await listRequest(storage); assert.equal(response.status, 200); assert.equal(await response.text(), result.data.toString());
+});
+
+test('special types pass through unchanged, inline channels are excluded, disabled mode caches only manual lists', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const special = { name: '插件', type: 3, api: 'csp_Live', ext: { note: '__TVBOX_BASE_URL__' } };
+  const inline = { group: '内嵌', channels: [{ name: '频道', urls: ['https://channel.test/inline'] }] };
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return url === A.url ? response({ ...leaf('vod'), lives: [automaticLive, special, inline] }) : new Response(playlistText()); });
+  await liveMutation(storage, cachedManual); await runSync(storage, cacheConfig);
+  const views = await manualLiveViews(storage, cacheConfig);
+  assert.deepEqual(views.results[0].lives![1], special); assert.deepEqual(views.results[2].lives, [automaticLive, special, ...directLives(cachedManual)]);
+  assert.ok(views.results.every(value => !value.lives!.some(entry => entry.channels)));
+  assert.ok(calls.every(url => [A.url, automaticLive.url, cachedManual.url].includes(url)));
+  await liveMutation(storage, { name: '特殊协议', url: 'rtsp://stream.test/live' });
+  assert.deepEqual((await liveStatusViews(storage))[1].cacheStatus, { level: 'ok', label: 'OK' });
+  assert.equal(cacheableLive(special), false);
+  await setLiveDisabled(storage, true); calls.length = 0; await runSync(storage, cacheConfig);
+  assert.deepEqual(new Set(calls), new Set([A.url, cachedManual.url]));
+  assert.equal((await manualLiveViews(storage, cacheConfig)).results[0].lives!.length, 2);
+});
+
+test('list download preserves declared headers and distinguishes same URL with different header identities', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const live = { ...automaticLive, ua: 'declared-agent', header: { Referer: 'https://referer.test/', 'X-Key': 'private-key' } };
+  let headers: Headers | undefined;
+  mockFetch((url, options) => { if (url === A.url) return response({ ...leaf('vod'), lives: [live] });
+    headers = new Headers(options?.headers); return new Response(playlistText()); });
+  await runSync(storage, cacheConfig);
+  assert.equal(headers!.get('user-agent'), 'declared-agent'); assert.equal(headers!.get('referer'), 'https://referer.test/');
+  assert.equal(headers!.get('x-key'), 'private-key');
+  assert.notEqual(liveCacheKey(live), liveCacheKey(automaticLive));
+  const res = await listRequest(storage, live); assert.equal(res.status, 200);
+  assert.equal((await listRequest(storage, automaticLive)).status, 404);
+});
+
+test('shared manual/upstream URL downloads once and a remaining provider retains cache after manual deletion', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false'); await liveMutation(storage, cachedManual);
+  let calls = 0;
+  mockFetch(url => { if (url === A.url) return response({ ...leaf('vod'), lives: [{ ...automaticLive, url: cachedManual.url }] }); calls++; return new Response(playlistText()); });
+  await runSync(storage, cacheConfig); assert.equal(calls, 1);
+  assert.equal((await manualLiveViews(storage, cacheConfig)).results[0].lives!.length, 1);
+  await liveMutation(storage, cachedManual, 'DELETE');
+  assert.equal((await listRequest(storage)).status, 200); assert.equal(calls, 1);
+  await roots(storage, []); await runSync(storage, cacheConfig);
+  assert.equal((await listRequest(storage)).status, 404); assert.equal(calls, 1);
+});
+
+test('a stale cache refresh cannot publish bytes after a newer aggregate starts', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, cachedManual);
+  const hold = deferred<Response>(); const started = deferred<void>(); let old = true;
+  mockFetch(url => { if (url === A.url) return response(leaf('vod')); if (old) { started.resolve(); return hold.promise; } return new Response(playlistText('最新')); });
+  const pending = runSync(storage, cacheConfig); await started.promise; old = false;
+  const newer = runSync(storage, cacheConfig); await tick();
+  hold.resolve(new Response(playlistText('过期'))); await Promise.all([pending, newer]);
+  assert.equal(await (await listRequest(storage)).text(), playlistText('最新'));
+});
+
+test('failed cache metadata commit keeps old successful bytes and prevents repeated downloads after restart', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  let calls = 0; let breakWrite = false;
+  mockFetch(() => { calls++; if (breakWrite) storage.failPut = LIVE_CACHE_STATE; return new Response(playlistText('版本' + calls)); });
+  assert.equal((await listRequest(storage)).status, 200);
+  const initial = (await loadLiveCache(storage)).state!.records[liveCacheKey({ ...cachedManual, type: 0 })];
+  breakWrite = true; await refreshLiveCache(storage, [{ ...cachedManual, type: 0 }], 200, async () => true);
+  storage.failPut = undefined;
+  const restarted = new MemoryStorage(); restarted.data = new Map(storage.data);
+  assert.equal(await (await listRequest(restarted)).text(), playlistText('版本1')); assert.equal(calls, 2);
+  const view = (await liveStatusViews(restarted))[0].cacheStatus;
+  assert.equal(view.level, 'warn'); assert.equal(view.cacheTime, initial.savedAt);
+});
+
+test('invalid cache metadata leaves VOD and declarations readable without upstream retry or private data exposure', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  await storage.put(LIVE_CACHE_STATE, '{'); let calls = 0; mockFetch(() => { calls++; throw new Error('must not fetch'); });
+  await assertManualViews(storage, directLives(cachedManual), cacheConfig);
+  const entries = await liveStatusViews(storage); assert.equal(entries.length, 1); assert.equal(entries[0].cacheStatus.level, 'unknown');
+  assert.equal((await listRequest(storage)).status, 302); assert.equal(calls, 0);
+  assert.equal(JSON.stringify(entries).includes('generation'), false);
+  assert.equal((await createLiveSourcesRouter({ storage, config }).request('/admin/lives')).status, 401);
+});
+
+test('empty HTML timeout and oversized responses isolate list failure without destroying VOD output', async () => {
+  for (const kind of ['empty', 'html', 'timeout', 'oversize']) {
+    const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, cachedManual);
+    let calls = 0;
+    mockFetch((url, options) => {
+      if (url === A.url) return response(leaf('vod')); calls++;
+      if (kind === 'timeout') return new Promise<Response>((_, reject) => options!.signal!.addEventListener('abort', () => reject(new DOMException('timeout', 'AbortError'))));
+      if (kind === 'oversize') return new Response(playlistText(), { headers: { 'Content-Length': String(21 * 1024 * 1024) } });
+      return new Response(kind === 'empty' ? '' : '<html>登录</html>');
+    });
+    await runSync(storage, cacheConfig); assert.equal(calls, 1);
+    await assertManualViews(storage, directLives(cachedManual), cacheConfig);
+    assert.equal((await liveStatusViews(storage))[0].cacheStatus.level, 'error');
+    assert.equal((await listRequest(storage)).status, 302); assert.equal(calls, 1);
+  }
+});
+
+test('generated live rows wrap full escaped diagnostics, omit LIVE tags and follow agreed state wording', () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]).find(text => text.includes('function liveSourceRow'))!;
+  new Script(script);
+  const code = script.slice(script.indexOf('function liveSourceRow'), script.indexOf('async function loadLives'));
+  const escape = (value: string) => value.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+  const input = { name: '<名字>', url: 'https://example.test/"quoted"', cacheStatus: { level: 'warn', label: '警告', reason: '<错误>' + '很长'.repeat(100), failures: 4, cached: true, cacheTime: '原时间' } };
+  const context = createContext({ esc: escape, escAttr: escape, input });
+  const render = () => new Script(code + '\nliveSourceRow(input)').runInContext(context) as string;
+  const warning = render(); assert.match(warning, /source-health-dot warn/); assert.match(warning, /&lt;错误&gt;/);
+  assert.match(warning, /已缓存/); assert.match(warning, /最后缓存时间：原时间/); assert.match(warning, /连续失败 4/);
+  assert.doesNotMatch(warning, /source-tag|title=/); assert.match(warning, /data-url=/);
+  Object.assign(input.cacheStatus, { level: 'ok', label: '健康' });
+  const healthy = render(); assert.doesNotMatch(healthy, /source-reason|source-cache-time|连续失败|不参与缓存/);
+  Object.assign(input.cacheStatus, { level: 'unknown', label: '等待聚合', reason: '', failures: 0 });
+  assert.match(render(), /状态：等待聚合/);
+});
+
+
+test('live refresh concurrency is bounded, invalid headers isolate one source and large lists stay outside config JSON', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const lists = Array.from({ length: 9 }, (_, i) => ({ name: '列表' + i, type: 0, url: 'https://lists.test/' + i + '.m3u' }));
+  const invalid = { ...automaticLive, header: { 'Invalid Header': 'secret-should-not-leak' } };
+  let active = 0; let maximum = 0; let calls = 0;
+  const large = '#EXTM3U\n' + Array.from({ length: 1000 }, (_, i) => '#EXTINF:-1,频道' + i + '\nhttps://channel.test/' + i + '.m3u8\n').join('');
+  mockFetch(async url => {
+    if (url === A.url) return response({ ...leaf('vod'), lives: [...lists, invalid] });
+    assert.notEqual(url, invalid.url); calls++; active++; maximum = Math.max(maximum, active);
+    await new Promise(resolve => realTimeout(resolve, 5)); active--; return new Response(large);
+  });
+  await runSync(storage, cacheConfig); assert.equal(calls, 9); assert.ok(maximum <= 4 && maximum > 1);
+  const views = await manualLiveViews(storage, cacheConfig);
+  assert.equal(views.results[0].lives!.length, 10); assert.ok(JSON.stringify(views.results[0]).length < 10000);
+  const bad = views.results[0].lives!.at(-1)!; assert.equal(bad.url, invalid.url);
+  const view = liveCacheView(invalid, (await loadLiveCache(storage)).state);
+  assert.equal(view.level, 'error'); assert.ok(!view.reason!.includes('secret'));
+});
+
+test('file publication failure leaves a successful previous cache readable and preserves its timestamp', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  let calls = 0; mockFetch(() => { calls++; return new Response(playlistText('文件' + calls)); });
+  assert.equal((await listRequest(storage)).status, 200);
+  const old = (await loadLiveCache(storage)).state!.records[liveCacheKey({ ...cachedManual, type: 0 })];
+  const { createHash } = await import('node:crypto');
+  const nextHash = createHash('sha256').update(playlistText('文件2')).digest('hex');
+  mkdirSync(path.join(directory, 'live', nextHash + '.m3u')); // A directory cannot be replaced by the candidate file.
+  await refreshLiveCache(storage, [{ ...cachedManual, type: 0 }], 200, async () => true);
+  assert.equal(await (await listRequest(storage)).text(), playlistText('文件1')); assert.equal(calls, 2);
+  const view = (await liveStatusViews(storage))[0].cacheStatus;
+  assert.equal(view.level, 'warn'); assert.equal(view.cacheTime, old.savedAt);
+  assert.ok(!view.reason!.includes(directory));
+});
+
+test('GET live list never downloads and late list responses cannot restore removed rows or erase loaded entries', async () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]).find(text => text.includes('function liveSourceRow'))!;
+  const code = script.slice(script.indexOf('let liveListRequest'), script.indexOf('async function addLive'));
+  const old = deferred<{ ok: boolean; json: () => Promise<object[]> }>();
+  const elements = { liveList: { innerHTML: '', querySelector: () => elements.liveList.innerHTML.includes('source-item') }, liveCount: { textContent: '' }, badgeLive: { textContent: '' } };
+  let calls = 0;
+  const context = createContext({ $: (id: keyof typeof elements) => elements[id], esc: String, escAttr: String,
+    auth: { authFetch: async () => { calls++; return calls === 1 ? old.promise : { ok: true, json: async () => [] }; } } });
+  new Script(code).runInContext(context);
+  const first = new Script('loadLives()').runInContext(context);
+  await new Script('loadLives()').runInContext(context);
+  old.resolve({ ok: true, json: async () => [{ ...cachedManual, cacheStatus: { level: 'ok', label: '健康' } }] }); await first;
+  assert.match(elements.liveList.innerHTML, /暂无直播源/); assert.equal(elements.liveCount.textContent, 0);
+  elements.liveList.innerHTML = '<div class="source-item">已有列表</div>';
+  new Script('auth.authFetch = async () => { throw new Error("offline") }').runInContext(context);
+  await new Script('loadLives()').runInContext(context); assert.ok(elements.liveList.innerHTML.includes('已有列表'));
+  const storage = new MemoryStorage(); await liveMutation(storage, cachedManual); let requests = 0;
+  mockFetch(() => { requests++; throw new Error('Status GET must not download'); });
+  assert.equal((await liveStatusViews(storage))[0].cacheStatus.label, '等待聚合'); assert.equal(requests, 0);
+});
+
+test('cached HLS-special sources remain raw healthy objects and do not repeat media downloads', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await liveMutation(storage, cachedManual); let requests = 0; let special = false;
+  mockFetch(url => { if (url === A.url) return response(leaf('vod')); requests++; return new Response(special ? '#EXTM3U\n#EXT-X-TARGETDURATION:10\nvideo.ts\n' : playlistText()); });
+  await runSync(storage, cacheConfig); special = true; await runSync(storage, cacheConfig); await runSync(storage, cacheConfig);
+  assert.equal((await loadLiveCache(storage)).state!.records[liveCacheKey({ ...cachedManual, type: 0 })].file, undefined);
+  assert.equal(requests, 2); await assertManualViews(storage, directLives(cachedManual), cacheConfig);
+  assert.deepEqual((await liveStatusViews(storage))[0].cacheStatus, { level: 'ok', label: 'OK' });
+});
+
+
+test('deleted/re-added VOD provider cannot reuse its former live file but an unchanged co-provider may', async () => {
+  for (const shared of [false, true]) {
+    const storage = new MemoryStorage(); await roots(storage, shared ? [A, B] : [A]); await storage.put(LIVE_DISABLED, 'false');
+    let fail = false;
+    mockFetch(url => url === A.url || url === B.url ? response({ ...leaf(url === A.url ? 'a' : 'b'), lives: [automaticLive] })
+      : fail ? new Response('gone', { status: 404 }) : new Response(playlistText()));
+    await runSync(storage, cacheConfig);
+    await roots(storage, shared ? [B] : []); await roots(storage, shared ? [A, B] : [A]);
+    fail = true; await runSync(storage, cacheConfig);
+    const views = await manualLiveViews(storage, cacheConfig);
+    if (shared) assert.ok(views.results[0].lives![0].url!.startsWith(cacheConfig.localBaseUrl + '/live/'));
+    else assert.equal(views.results[0].lives![0].url, automaticLive.url);
+  }
+});
+
+
+test('live file router is mounted without Admin auth and extensionless TXT plus stream-body timeout follow cache rules', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage);
+  const entry = { name: '无后缀', url: 'https://plain.test/playlist' }; await liveMutation(storage, entry);
+  let calls = 0; mockFetch(() => { calls++; return new Response('分组,#genre#\n频道,./video.ts\n'); });
+  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  const uri = '/live/' + liveCacheKey({ ...entry, type: 0 }) + '.txt';
+  const res = await app.request(uri); assert.equal(res.status, 200);
+  assert.equal(await res.text(), '分组,#genre#\n频道,https://plain.test/video.ts\n'); assert.equal(calls, 1);
+  assert.equal((await app.request('/live/' + liveCacheKey({ ...entry, type: 0 }) + '.unknown')).status, 404);
+  assert.equal((await app.request('/admin/lives')).status, 401);
+  const failing = { name: '慢响应体', url: 'https://body.test/live.m3u' }; await liveMutation(storage, failing);
+  mockFetch((_url, options) => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('#EXTM3U\n'));
+    options!.signal!.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')));
+  } })));
+  const timed = await app.request('/live/' + liveCacheKey({ ...failing, type: 0 }) + '.m3u');
+  assert.equal(timed.status, 302); assert.equal(timed.headers.get('location'), failing.url);
+  assert.match((await liveStatusViews(storage))[1].cacheStatus.reason!, /超时/);
+});
+
+
+test('flat live URLs project exact paths, redirect format changes and reject old paths without fetching', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  const entry = { ...cachedManual, type: 0 }; const key = liveCacheKey(entry);
+  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  let body = '分组,#genre#\n频道,https://channel.test/live.ts\n'; let calls = 0;
+  mockFetch(() => { calls++; return new Response(body); });
+  const first = await app.request('/live/' + key + '.m3u');
+  assert.equal(first.status, 302); assert.equal(first.headers.get('location'), './' + key + '.txt');
+  assert.equal(first.headers.get('cache-control'), 'no-store'); assert.equal(calls, 1);
+  const txt = await app.request(new URL(first.headers.get('location')!, 'http://app.test/live/' + key + '.m3u').pathname);
+  assert.equal(txt.status, 200); assert.equal(await txt.text(), body); assert.equal(calls, 1);
+  assert.equal(txt.headers.get('content-type'), 'text/plain; charset=utf-8');
+  const unchanged = await app.request('/live/' + key + '.txt', { headers: { 'If-None-Match': txt.headers.get('etag')! } });
+  assert.equal(unchanged.status, 304); assert.equal(calls, 1);
+  const views = await manualLiveViews(storage, cacheConfig);
+  for (const view of views.results.slice(0, 2)) assert.equal(view.lives!.at(-1)!.url, cacheConfig.localBaseUrl + '/live/' + key + '.txt');
+  for (const uri of ['/live/' + key + '/list.txt', '/live/' + key + '/list.m3u', '/live/' + key + '.json', '/live/invalid.txt']) {
+    assert.equal((await app.request(uri)).status, 404);
+  }
+  assert.equal(calls, 1);
+  body = playlistText('变为 M3U'); await refreshLiveCache(storage, [entry], cacheConfig.fetchTimeoutMs, async () => true);
+  const changed = await app.request('/live/' + key + '.txt');
+  assert.equal(changed.status, 302); assert.equal(changed.headers.get('location'), './' + key + '.m3u');
+  const m3u = await app.request('/live/' + key + '.m3u');
+  assert.equal(m3u.status, 200); assert.equal(await m3u.text(), body); assert.equal(calls, 2);
+  await liveMutation(storage, cachedManual, 'DELETE');
+  assert.equal((await app.request('/live/' + key + '.m3u')).status, 404); assert.equal(calls, 2);
+});
+
+test('existing playlist cache serves immediately while a remote aggregation refresh is still pending', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  mockFetch(() => new Response(playlistText('已有缓存'))); assert.equal((await listRequest(storage)).status, 200);
+  const hold = deferred<Response>(); const started = deferred<void>(); let calls = 0;
+  mockFetch(() => { calls++; started.resolve(); return hold.promise; });
+  const refreshing = refreshLiveCache(storage, [{ ...cachedManual, type: 0 }], 500, async () => true);
+  await started.promise;
+  const result = await Promise.race([listRequest(storage), new Promise<never>((_, reject) => realTimeout(() => reject(new Error('Cache hit waited for origin')), 100))]);
+  assert.equal(result.status, 200); assert.equal(await result.text(), playlistText('已有缓存')); assert.equal(calls, 1);
+  hold.resolve(new Response(playlistText('更新缓存'))); await refreshing;
+  assert.equal(await (await listRequest(storage)).text(), playlistText('更新缓存')); assert.equal(calls, 1);
+});
+
+
+test('ordinary live objects missing type project as type zero without mutating raw source data', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); await storage.put(LIVE_DISABLED, 'false');
+  const original = { name: '未指定类型', url: automaticLive.url };
+  mockFetch(url => url === A.url ? response({ ...leaf('vod'), lives: [original] }) : new Response(playlistText()));
+  await runSync(storage, cacheConfig); const views = await manualLiveViews(storage, cacheConfig);
+  assert.equal(views.results[0].lives![0].type, 0); assert.equal(views.results[2].lives![0].type, 0);
+  assert.deepEqual(JSON.parse((await storage.get(MERGED_CONFIG_FULL))!).lives, [original]);
+});
+
+
+test('damaged interface output does not block independent manual management or an existing manual file', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
+  mockFetch(() => new Response(playlistText())); assert.equal((await listRequest(storage)).status, 200);
+  await storage.put(LIVE_DISABLED, 'false'); await storage.put(MERGED_CONFIG, '{');
+  assert.equal((await liveMutation(storage, manualOne)).status, 200);
+  assert.equal((await liveStatusViews(storage)).length, 2);
+  assert.equal((await listRequest(storage)).status, 200);
+  assert.equal((await createConfigOutputRouter({ storage, config: cacheConfig }).request('/')).status, 500);
+});
+
+
+const capacityEntries = (count: number) => Array.from({ length: count }, (_, i) => ({ name: '容量' + i, url: 'https://capacity' + i + '.test/config.json' }));
+
+test('source capacity defaults to six, supports explicit zero and rejects malformed complete values', () => {
+  for (const input of [undefined, '', ' ', '-1', '1.5', '6abc', 'Infinity', '9007199254740992']) assert.equal(parseMaxDataSources(input), 6);
+  assert.equal(parseMaxDataSources('0'), 0); assert.equal(parseMaxDataSources(' 12 '), 12);
+  assert.equal(sourceLimit({}), 6); assert.equal(sourceLimit({ maxDataSources: 0 }), 0);
+  assert.equal(sourceLimit({ maxDataSources: NaN }), 6);
+});
+
+test('capacity API preserves list arrays, refuses full requests before fetch and recovers after deletion', async () => {
+  const storage = new MemoryStorage(); const entries = capacityEntries(7); await seed(storage, entries.slice(0, 5));
+  const router = createSourceMgmtRouter({ storage, config }); let calls = 0;
+  mockFetch(() => { calls++; return response(leaf('same-content')); });
+  const first = await sourceRequest(storage, entries[5], '/admin/sources'); assert.equal(first.status, 200);
+  assert.equal((await first.json() as any).capacity.current, 6); assert.equal(calls, 1);
+  const list = await router.request('/admin/sources', { headers: adminHeaders });
+  assert.equal(list.headers.get('X-Max-Data-Sources'), '6'); assert.equal((await list.json() as unknown[]).length, 6);
+  for (const [path, body] of [['/admin/sources', entries[6]], ['/admin/sources/import', { input: M.url }]]) {
+    const full = await sourceRequest(storage, body, path as string); assert.equal(full.status, 409);
+    assert.equal((await full.json() as any).code, 'source_limit_exceeded');
+  }
+  assert.equal(calls, 1);
+  await router.request('/admin/sources', { method: 'DELETE', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify(entries[0]) });
+  assert.equal((await sourceRequest(storage, entries[6], '/admin/sources')).status, 200); assert.equal(calls, 2);
+  const unlimited = await sourceRequest(storage, entries[0], '/admin/sources', { ...config, maxDataSources: 0 });
+  assert.equal(unlimited.status, 200); assert.equal((await unlimited.json() as any).capacity.remaining, null);
+});
+
+test('capacity import fills valid distinct candidates in order and never downloads excess URLs', async () => {
+  const storage = new MemoryStorage(); const old = capacityEntries(4); await seed(storage, old);
+  const bad = { name: 'bad', url: 'https://bad-capacity.test/config.json' };
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return url === bad.url ? new Response('', { status: 404 }) : response(leaf('same-content')); });
+  const result = await sourceRequest(storage, { input: JSON.stringify(index(old[0], bad, A, B, N)) });
+  assert.equal(result.status, 200); const data = await result.json() as any;
+  assert.deepEqual(data.sources, [A.url, B.url]); assert.equal(data.duplicates, 1); assert.equal(data.outcome, 'partial');
+  assert.deepEqual(data.capacity, { limit: 6, current: 6, remaining: 0, rejected: 1 });
+  assert.deepEqual(new Set(calls), new Set([bad.url, A.url, B.url])); assert.equal(calls.length, 3);
+  assert.equal(data.skipped.find((entry: any) => entry.url === N.url).stage, 'capacity');
+  assert.equal((JSON.parse((await storage.get(MANUAL_SOURCES))!) as SourceEntry[]).length, 6);
+  assert.equal(await snapshot(storage, A), undefined); assert.equal(await snapshot(storage, N), undefined);
+});
+
+test('concurrent last-slot additions cannot exceed capacity and failed inline batches save nothing', async () => {
+  const storage = new MemoryStorage(); await seed(storage, capacityEntries(5));
+  const release = deferred<void>(); const started = deferred<void>(); let calls = 0;
+  mockFetch(async url => { if (++calls === 2) started.resolve(); await release.promise; return response(leaf(new URL(url).hostname.split('.')[0])); });
+  const pending = [sourceRequest(storage, A, '/admin/sources'), sourceRequest(storage, B, '/admin/sources')];
+  await started.promise; release.resolve(); const results = await Promise.all(pending);
+  assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+  assert.equal(JSON.parse((await storage.get(MANUAL_SOURCES))!).length, 6);
+  const fresh = new MemoryStorage(); await roots(fresh, []); const before = new Map(fresh.data);
+  fresh.failBatch = values => MANUAL_SOURCES in values;
+  const failure = await sourceRequest(fresh, { input: JSON.stringify(leaf('inline')) });
+  assert.equal(failure.status, 500); assert.deepEqual(fresh.data, before);
+});
+
+test('limited aggregation keeps all declarations/history, restricts every new view and preserves authorized old output on failure', async () => {
+  const storage = new MemoryStorage(); const entries = capacityEntries(8); await seed(storage, entries);
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(leaf(new URL(url).hostname.split('.')[0])); });
+  await runSync(storage, { ...config, maxDataSources: 0 });
+  const oldOutputs = await rawOutputs(storage); const oldHealth = JSON.parse((await storage.get(SOURCE_HEALTH))!);
+  const oldSnapshot = await snapshot(storage, entries[7]); calls.length = 0;
+  storage.failBatch = values => MERGED_CONFIG in values;
+  await runSync(storage, config);
+  assert.deepEqual(calls, entries.slice(0, 6).map(entry => entry.url));
+  assert.deepEqual(await rawOutputs(storage), oldOutputs); assert.ok(await readAggregateOutputs(storage));
+  assert.equal(JSON.parse((await storage.get(MANUAL_SOURCES))!).length, 8);
+  assert.deepEqual(await snapshot(storage, entries[7]), oldSnapshot);
+  const health = JSON.parse((await storage.get(SOURCE_HEALTH))!);
+  assert.deepEqual(health.find((entry: any) => entry.url === entries[7].url), oldHealth.find((entry: any) => entry.url === entries[7].url));
+  storage.failBatch = undefined; calls.length = 0; await runSync(storage, config);
+  for (const raw of await rawOutputs(storage)) assert.equal(JSON.parse(raw!).sites.length, 6);
+  assert.equal(calls.length, 6);
+  calls.length = 0; await runSync(storage, { ...config, maxDataSources: 0 });
+  assert.equal(calls.length, 8); assert.equal(JSON.parse((await storage.get(MERGED_CONFIG))!).sites.length, 8);
+});
+
+test('capacity migration releases the parent slot and defers out-of-range unclassified roots without downloads', async () => {
+  const storage = new MemoryStorage(); const old = capacityEntries(5); await seed(storage, old);
+  await roots(storage, [...old, M, N]); const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(url === M.url ? index(A, B) : leaf(new URL(url).hostname.split('.')[0])); });
+  const ticket = await beginSourceOutputRun(storage);
+  await prepareImportOnlyRun(storage, config, ticket);
+  assert.ok(!calls.includes(N.url)); assert.ok(!calls.includes(B.url));
+  assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!).map((entry: SourceEntry) => entry.url), [...old.map(entry => entry.url), N.url]);
+  // Seven old declarations minus the parent still fills six slots; its children are uninspected.
+  const policy = JSON.parse((await storage.get(SOURCE_IMPORT_POLICY_STATE))!);
+  assert.ok(policy.remaining.some((entry: SourceEntry) => entry.url === N.url)); assert.equal(policy.completedAt, undefined);
+  assert.ok(policy.report.skipped.some((entry: any) => entry.stage === 'capacity'));
+  calls.length = 0; await runSync(storage, config);
+  assert.ok(calls.includes(N.url));
+
+  const room = new MemoryStorage(); await seed(room, old); await roots(room, [...old, M]); calls.length = 0;
+  await runSync(room, config);
+  assert.ok(calls.includes(A.url)); assert.ok(!calls.includes(B.url));
+  assert.deepEqual(JSON.parse((await room.get(MANUAL_SOURCES))!).map((entry: SourceEntry) => entry.url), [...old.map(entry => entry.url), A.url]);
+});
+
+test('automatic source scraping fills only remaining capacity and skips all page requests once full', async () => {
+  const storage = new MemoryStorage(); await seed(storage, capacityEntries(5)); let pages = 0;
+  mockFetch(url => {
+    if (url === 'https://scrape-capacity.test/') {
+      pages++; return new Response(pages === 1 ? '<div class="col-form-label">A</div><input value="' + A.url + '"><div class="col-form-label">B</div><input value="' + B.url + '">' : '');
+    }
+    return response(leaf(new URL(url).hostname.split('.')[0]));
+  });
+  const cfg = { ...config, scrapeSourceUrl: 'https://scrape-capacity.test/', scrapeSourceReferer: 'https://scrape-capacity.test/' };
+  await runSync(storage, cfg); const saved = JSON.parse((await storage.get(MANUAL_SOURCES))!);
+  assert.equal(saved.length, 6); assert.equal(saved[5].url, A.url); const before = pages;
+  await runSync(storage, cfg); assert.equal(pages, before);
+});
+
+
+function sourceCapacityFixture(handler: (url: string, options?: RequestInit) => Promise<Response>) {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]).find(text => text.includes('async function loadSources()'))!;
+  const elements: Record<string, { value: string; textContent: unknown; innerHTML: string; disabled: boolean; hidden: boolean; focus(): void }> = {};
+  const toasts: string[] = [];
+  const context = createContext({ healthMap: {},
+    $: (id: string) => elements[id] ||= { value: '', textContent: '', innerHTML: '', disabled: false, hidden: false, focus() {} },
+    esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+    toast: (text: string) => toasts.push(text), auth: { authFetch: handler },
+  });
+  new Script(capacityScript(script) + script.slice(script.indexOf('async function loadSources()'), script.indexOf('// --- MacCMS ---'))
+    + script.slice(script.indexOf('// --- Import Config ---'), script.indexOf('// Settings saves are silent'))).runInContext(context);
+  return { elements, toasts, context, run: (code: string) => new Script(code).runInContext(context) };
+}
+
+test('capacity page preserves full state across stale GETs, errors and neutralizes only out-of-range rows', async () => {
+  const entries = capacityEntries(8); const old = deferred<Response>(); let first = true;
+  const fixture = sourceCapacityFixture(async () => {
+    if (first) { first = false; return old.promise; }
+    return new Response(JSON.stringify(entries), { headers: { 'X-Max-Data-Sources': '6' } });
+  });
+  fixture.context.healthMap = Object.fromEntries(entries.map(entry => [entry.url, { status: 'ERR', label: 'HTTP 404', lastFailReason: 'OLD REASON', consecutiveFailures: 7 }]));
+  const before = JSON.stringify(fixture.context.healthMap);
+  fixture.run('updateSourceCapacityControls()'); assert.equal(fixture.elements.addBtn.disabled, true);
+  const slow = fixture.run('loadSources()'); await fixture.run('loadSources()');
+  assert.equal(fixture.elements.sourceCount.textContent, '8/6'); assert.equal(fixture.elements.importBtn.disabled, true);
+  old.resolve(new Response('[]', { headers: { 'X-Max-Data-Sources': '0' } })); await slow;
+  assert.equal(fixture.elements.sourceCount.textContent, '8/6');
+  const rows = fixture.elements.sourceList.innerHTML.split('<div class="source-item">').slice(1);
+  assert.equal(rows.length, 8);
+  for (const row of rows.slice(6)) { assert.match(row, /source-health-dot unknown/); assert.match(row, /状态：暂无数据/); assert.doesNotMatch(row, /OLD REASON|连续失败|已缓存|source-cache-time/); }
+  assert.match(rows[0], /OLD REASON/); assert.equal(JSON.stringify(fixture.context.healthMap), before);
+  assert.equal(fixture.toasts.length, 0);
+  fixture.context.auth = { authFetch: async () => new Response('', { status: 500 }) };
+  await fixture.run('loadSources()'); assert.equal(fixture.elements.sourceList.innerHTML.split('<div class="source-item">').length, 9);
+  assert.equal(fixture.elements.addBtn.disabled, true);
+  fixture.context.auth = { authFetch: async () => new Response(JSON.stringify(entries), { headers: { 'X-Max-Data-Sources': '0' } }) };
+  await fixture.run('loadSources()'); assert.equal(fixture.elements.sourceCount.textContent, 8);
+  assert.equal(fixture.elements.addBtn.disabled, false); assert.equal(fixture.elements.sourceCapacityHint.hidden, true);
+});
+
+test('actual partial import pops one capacity error, retains input and stays disabled if list reload fails; deletion restores controls', async () => {
+  const storage = new MemoryStorage(); await seed(storage, capacityEntries(4));
+  const router = createSourceMgmtRouter({ storage, config }); let failGet = false;
+  const fixture = sourceCapacityFixture(async (url, options) => {
+    if (!options && failGet) return new Response('', { status: 500 });
+    return router.request(url, { ...options, headers: { ...adminHeaders, 'Content-Type': 'application/json' } });
+  });
+  await fixture.run('loadSources()'); assert.equal(fixture.elements.sourceCount.textContent, '4/6');
+  fixture.elements.importInput = { value: JSON.stringify(index(A, B, N)), textContent: '', innerHTML: '', disabled: false, hidden: false, focus() {} };
+  const input = fixture.elements.importInput.value; mockFetch(() => response(leaf('same'))); failGet = true;
+  await fixture.run('importConfig()');
+  assert.equal(fixture.elements.sourceCount.textContent, '6/6'); assert.equal(fixture.elements.addBtn.disabled, true); assert.equal(fixture.elements.importBtn.disabled, true);
+  assert.equal(fixture.elements.importInput.value, input); assert.match(String(fixture.elements.importResult.textContent), /新增 2/);
+  assert.equal(fixture.toasts.length, 1); assert.match(fixture.toasts[0], /上限（6）/);
+  failGet = false; await fixture.run('removeSource(' + JSON.stringify(A.url) + ')');
+  assert.equal(fixture.elements.sourceCount.textContent, '5/6'); assert.equal(fixture.elements.importBtn.disabled, false);
+});
+
+
+test('all selected sources failing cannot borrow an out-of-range snapshot or revoke the otherwise valid old result', async () => {
+  const storage = new MemoryStorage(); const entries = capacityEntries(8); await seed(storage, entries);
+  mockFetch(url => response(leaf(new URL(url).hostname.split('.')[0])));
+  await runSync(storage, { ...config, maxDataSources: 0 }); const old = await rawOutputs(storage);
+  const r = await registry(storage); for (const entry of entries.slice(0, 6)) delete r.nodes[entry.url].snapshot;
+  await storage.put(SOURCE_CONFIG_SNAPSHOTS, JSON.stringify(r));
+  const calls: string[] = []; mockFetch(url => { calls.push(url); return new Response('', { status: 404 }); });
+  await runSync(storage, config);
+  assert.deepEqual(new Set(calls), new Set(entries.slice(0, 6).map(entry => entry.url)));
+  assert.deepEqual(await rawOutputs(storage), old); assert.ok(await readAggregateOutputs(storage));
+  assert.ok(await snapshot(storage, entries[7]));
 });

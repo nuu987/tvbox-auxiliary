@@ -2,9 +2,12 @@
 
 import { Hono } from 'hono';
 import type { Storage } from '../storage/interface';
-import type { AppConfig, LiveSourceEntry } from '../core/types';
-import { LIVE_SOURCES } from '../core/config';
+import type { AppConfig } from '../core/types';
+import { LIVE_SOURCES, LIVE_CACHE_STATE } from '../core/config';
 import { adminAuthMiddleware } from './admin-auth';
+import { withSourceGate } from '../core/source-gate';
+import { loadLiveCache, liveCacheView, manualLiveCacheValue } from '../core/live-cache';
+import { decodeLiveSources } from '../core/live-policy';
 
 export interface LiveSourcesRouteDeps {
   storage: Storage;
@@ -19,9 +22,11 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
   router.use('/admin/*', adminAuthMiddleware(config));
 
   router.get('/admin/lives', async (c) => {
-    const raw = await storage.get(LIVE_SOURCES);
-    const entries: LiveSourceEntry[] = raw ? JSON.parse(raw) : [];
-    return c.json(entries);
+    return withSourceGate(storage, async () => {
+      const entries = decodeLiveSources(await storage.get(LIVE_SOURCES));
+      const { state } = await loadLiveCache(storage);
+      return c.json(entries.map(entry => ({ ...entry, cacheStatus: liveCacheView({ ...entry, type: 0 }, state) })));
+    });
   });
 
   router.post('/admin/lives', async (c) => {
@@ -32,7 +37,7 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
       return c.json({ error: 'Invalid JSON' }, 400);
     }
 
-    const url = body.url?.trim();
+    const url = typeof body?.url === 'string' ? body.url.trim() : '';
     if (!url) return c.json({ error: 'URL is required' }, 400);
 
     try {
@@ -41,18 +46,16 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
       return c.json({ error: 'Invalid URL format' }, 400);
     }
 
+    if (body.name !== undefined && typeof body.name !== 'string') return c.json({ error: 'Invalid name' }, 400);
     const name = body.name?.trim() || '';
-    const raw = await storage.get(LIVE_SOURCES);
-    const entries: LiveSourceEntry[] = raw ? JSON.parse(raw) : [];
-
-    if (entries.some((e) => e.url === url)) {
-      return c.json({ error: 'Live source already exists' }, 409);
-    }
-
-    entries.push({ name, url });
-    await storage.put(LIVE_SOURCES, JSON.stringify(entries));
-
-    return c.json({ success: true });
+    return withSourceGate(storage, async () => {
+      const entries = decodeLiveSources(await storage.get(LIVE_SOURCES));
+      if (entries.some(e => e.url === url)) return c.json({ error: 'Live source already exists' }, 409);
+      entries.push({ name, url });
+      const cache = await manualLiveCacheValue(storage, entries);
+      await storage.putMany({ [LIVE_SOURCES]: JSON.stringify(entries), ...(cache === undefined ? {} : { [LIVE_CACHE_STATE]: cache }) });
+      return c.json({ success: true });
+    });
   });
 
   router.delete('/admin/lives', async (c) => {
@@ -63,15 +66,16 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
       return c.json({ error: 'Invalid JSON' }, 400);
     }
 
-    const url = body.url?.trim();
+    const url = typeof body?.url === 'string' ? body.url.trim() : '';
     if (!url) return c.json({ error: 'URL is required' }, 400);
 
-    const raw = await storage.get(LIVE_SOURCES);
-    const entries: LiveSourceEntry[] = raw ? JSON.parse(raw) : [];
-    const filtered = entries.filter((e) => e.url !== url);
-    await storage.put(LIVE_SOURCES, JSON.stringify(filtered));
-
-    return c.json({ success: true });
+    return withSourceGate(storage, async () => {
+      const entries = decodeLiveSources(await storage.get(LIVE_SOURCES));
+      const next = entries.filter(e => e.url !== url);
+      const cache = await manualLiveCacheValue(storage, next);
+      await storage.putMany({ [LIVE_SOURCES]: JSON.stringify(next), ...(cache === undefined ? {} : { [LIVE_CACHE_STATE]: cache }) });
+      return c.json({ success: true });
+    });
   });
 
   return router;

@@ -3,16 +3,9 @@ import type { Storage } from '../storage/interface';
 import { EXPORT_CONFIG, LAST_UPDATE, MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY, SITE_SOURCE_ATTRIBUTION } from './config';
 import { withSourceGate } from './source-gate';
 import { encodeSiteSourceAttribution, readSiteSourceNames } from './site-source-attribution';
+import { activationFailures, decodeOutputState as decode, type OutputState } from './aggregate-state';
+import { loadLivePolicy, applyStoredLivePolicy, type LivePolicy } from './live-policy';
 
-interface OutputState {
-  version: 1;
-  policy?: typeof SOURCE_IMPORT_POLICY;
-  epoch: string;
-  pending: boolean;
-  blocked: boolean;
-  activeRun?: string;
-  published?: { runId: string; savedAt: string; epoch: string };
-}
 export interface OutputRunTicket { runId: string; epoch: string }
 interface AggregatePayloads {
   merged: string | null;
@@ -21,38 +14,15 @@ interface AggregatePayloads {
 }
 export interface AggregatePublication extends AggregatePayloads {
   siteSourceNames: string[][];
+  liveDisabled: boolean;
 }
 export interface AggregateOutputs extends AggregatePayloads {
   siteSourceNames: string[][] | null;
+  livePolicy: LivePolicy;
   /** Private comparison token; never return it through an API. */
   token: string;
 }
 
-// A failed activation cannot durably mark the store, but must fail closed in this process.
-const activationFailures = new WeakSet<Storage>();
-function object(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-function decode(raw: string | null): OutputState | null {
-  if (raw === null) return null; // Untracked legacy output, readable until its first actual run.
-  const value: unknown = JSON.parse(raw);
-  if (!object(value) || value.version !== 1 || typeof value.epoch !== 'string' || !value.epoch
-    || typeof value.pending !== 'boolean' || typeof value.blocked !== 'boolean'
-    || (value.policy !== undefined && value.policy !== SOURCE_IMPORT_POLICY)
-    || (value.activeRun !== undefined && (typeof value.activeRun !== 'string' || !value.activeRun))) {
-    throw new Error('Invalid aggregate output state');
-  }
-  if (value.published !== undefined) {
-    const p = value.published;
-    if (!object(p) || typeof p.runId !== 'string' || !p.runId || typeof p.epoch !== 'string' || !p.epoch
-      || typeof p.savedAt !== 'string' || !Number.isFinite(Date.parse(p.savedAt))) {
-      throw new Error('Invalid aggregate publication');
-    }
-    // A pending deletion intentionally retains the earlier publication's epoch.
-    if (!value.pending && !value.blocked && p.epoch !== value.epoch) throw new Error('Invalid publication epoch');
-  } else if (!value.pending && !value.blocked) throw new Error('Missing aggregate publication');
-  return value as unknown as OutputState;
-}
 async function recoverableState(storage: Storage): Promise<OutputState> {
   const raw = await storage.get(SOURCE_OUTPUT_STATE);
   try {
@@ -113,8 +83,11 @@ export async function publishAggregateOutputs(storage: Storage, ticket: OutputRu
     throw new Error('Aggregate output run superseded or sources revoked; run again');
   }
   if (outputs.merged === null || outputs.full === null || outputs.exported === null) throw new Error('Incomplete aggregate output');
+  const livePolicy = await loadLivePolicy(storage);
+  if (livePolicy.disabled !== outputs.liveDisabled) throw new Error('Live policy changed during aggregation; run again');
   await storage.putMany({
-    [MERGED_CONFIG]: outputs.merged, [MERGED_CONFIG_FULL]: outputs.full, [EXPORT_CONFIG]: outputs.exported,
+    [MERGED_CONFIG]: JSON.stringify(applyStoredLivePolicy(JSON.parse(outputs.merged), livePolicy)), [MERGED_CONFIG_FULL]: outputs.full,
+    [EXPORT_CONFIG]: JSON.stringify(applyStoredLivePolicy(JSON.parse(outputs.exported), livePolicy)),
     [LAST_UPDATE]: savedAt,
     [SITE_SOURCE_ATTRIBUTION]: encodeSiteSourceAttribution(ticket.runId, outputs.full, outputs.siteSourceNames),
     [SOURCE_OUTPUT_STATE]: JSON.stringify({ ...state, pending: false, blocked: false,
@@ -131,12 +104,13 @@ async function readUnlocked(storage: Storage): Promise<AggregateOutputs | null> 
     const merged = await storage.get(MERGED_CONFIG);
     const full = await storage.get(MERGED_CONFIG_FULL);
     const exported = await storage.get(EXPORT_CONFIG);
+    const livePolicy = await loadLivePolicy(storage);
     let attribution: string | null = null;
     try { attribution = await storage.get(SITE_SOURCE_ATTRIBUTION); } catch { /* Optional editor metadata. */ }
     const siteSourceNames = readSiteSourceNames(attribution, full || merged, state?.published?.runId);
     // Include payloads: two legacy/instant patches may have identical state metadata.
-    const token = createHash('sha256').update(JSON.stringify([raw, merged, full, exported, attribution])).digest('hex');
-    return { merged, full, exported, siteSourceNames, token };
+    const token = createHash('sha256').update(JSON.stringify([raw, merged, full, exported, attribution, livePolicy.token])).digest('hex');
+    return { merged, full, exported, siteSourceNames, livePolicy, token };
   } catch { return null; }
 }
 export async function readAggregateOutputs(storage: Storage): Promise<AggregateOutputs | null> {
@@ -161,4 +135,10 @@ export async function publishAggregatePatch(storage: Storage, token: string, mer
     await storage.putMany({ [MERGED_CONFIG]: merged, [EXPORT_CONFIG]: exported, [LAST_UPDATE]: new Date().toISOString() });
     return true;
   });
+}
+
+/** Caller holds the source gate; used by resource work without holding it across downloads. */
+export async function isCurrentAggregateRun(storage: Storage, ticket: OutputRunTicket): Promise<boolean> {
+  const state = decode(await storage.get(SOURCE_OUTPUT_STATE));
+  return !activationFailures.has(storage) && !!state && !state.pending && state.epoch === ticket.epoch && state.activeRun === ticket.runId;
 }

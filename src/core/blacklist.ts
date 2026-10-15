@@ -2,8 +2,9 @@
 
 import type { Storage } from '../storage/interface';
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxConfig, RegexRule, RegexValidationResult } from './types';
-import { BLACKLIST, BASE_URL_PLACEHOLDER, LIVE_DISABLED } from './config';
+import { BLACKLIST, BASE_URL_PLACEHOLDER } from './config';
 import { readAggregateOutputs, publishAggregatePatch } from './aggregate-output';
+import { applyStoredLivePolicy, type LivePolicy } from './live-policy';
 import { rewriteJarUrls } from './jar-proxy';
 import { logger } from './logger';
 
@@ -286,34 +287,30 @@ export async function applyBlacklist(
 }
 
 /**
- * 生成导出快照配置：应用黑名单、LIVE_DISABLED 清空 lives、删除 pic 前缀，
+ * 生成导出快照配置：应用黑名单、直播策略、删除 pic 前缀，
  * URL 保持原始（不调用 rewriteJarUrls）。供 syncer Step 4.6.5 和 patchMergedConfig 共用 (D-03)。
  *
  * - D-01: 不调用 rewriteJarUrls，URL 保持原始
  * - D-02: 调用 applyBlacklist 复用黑名单过滤（与 MERGED_CONFIG 屏蔽状态一致）
- * - D-04: liveDisabled=true 时清空 lives
+ * - 快照只保存接口直播结果，手动地址由输出路由实时组合
  * - D-05: 删除 pic 字段
  * - D-06: 返回完整 TVBoxConfig 字段集，不引入 _meta
  *
  * @param merged       MERGED_CONFIG_FULL 解析后的完整配置（含原始 URL）
  * @param blacklist    当前黑名单
- * @param liveDisabled 直播功能禁用开关
+ * @param livePolicy   当前直播输出策略快照
  * @returns            导出快照 TVBoxConfig
  */
 export async function generateExportConfig(
   merged: TVBoxConfig,
   blacklist: Blacklist,
-  liveDisabled: boolean,
+  livePolicy: LivePolicy,
 ): Promise<TVBoxConfig> {
   const { config: filtered } = await applyBlacklist(merged, blacklist);
 
-  if (liveDisabled) {
-    filtered.lives = [];
-  }
-
-  delete (filtered as TVBoxConfig).pic;
-
-  return filtered;
+  const result = applyStoredLivePolicy(filtered, livePolicy);
+  delete result.pic;
+  return result;
 }
 
 /**
@@ -350,15 +347,9 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
   }
 
   const blacklist = await loadBlacklist(storage);
-  const { config: filtered } = await applyBlacklist(full, blacklist);
-
-  // 直播功能禁用开关：强制清空 lives（在 JAR 改写前应用）
-  const liveDisabledRaw = await storage.get(LIVE_DISABLED);
-  const liveDisabled = liveDisabledRaw !== 'false';
-  if (liveDisabled) {
-    logger.info('blacklist', 'patchMergedConfig: live_disabled=true, clearing lives');
-    filtered.lives = [];
-  }
+  const { config: blacklisted } = await applyBlacklist(full, blacklist);
+  const livePolicy = outputs.livePolicy;
+  const filtered = applyStoredLivePolicy(blacklisted, livePolicy);
 
   // Reapply JAR proxy URL rewrite with placeholder (mirrors sync Step 7)
   logger.info('blacklist', 'patchMergedConfig: reapplying JAR rewrite with placeholder');
@@ -366,7 +357,7 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
 
   // D-03: 同步更新 EXPORT_CONFIG（含原始 URL，供 /admin/export-config 下载）
   // result 含改写后的代理 URL（写入 MERGED_CONFIG），exportConfig 含原始 URL（写入 EXPORT_CONFIG）
-  const exportConfig = await generateExportConfig(full, blacklist, liveDisabled);
+  const exportConfig = await generateExportConfig(full, blacklist, livePolicy);
   delete (exportConfig as TVBoxConfig).pic; // D-05: 删除图片代理前缀（防御性，generateExportConfig 已删）
   const patched = await publishAggregatePatch(storage, outputs.token, JSON.stringify(result), JSON.stringify(exportConfig));
   if (!patched) return { patched: false, reason: 'Aggregate output changed or became unavailable; retry after sync' };
@@ -378,7 +369,7 @@ export async function patchMergedConfig(storage: Storage): Promise<{ patched: bo
 
   // Build warning string reflecting what was and wasn't reapplied
   const skipped = ['name transforms (Step 5.5)', 'credential injection (Step 5.7)', 'search quota (Step 4.7)', 'empty-entry cleanup (Step 4.6)', 'image proxy prefix (Step 7.5)'];
-  const liveNote = liveDisabled ? '; live_disabled=true → lives cleared' : '';
+  const liveNote = livePolicy.disabled ? '; interface lives disabled; output uses current manual addresses' : '';
   return { patched: true, warning: `Instant patch reapplied blacklist + JAR rewrite${liveNote}. Skipped: ${skipped.join(', ')}; full sync will resolve differences` };
 }
 

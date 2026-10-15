@@ -147,23 +147,16 @@ ${sharedStyles}
 
 .source-item{position:relative}
 
-#sourceList .source-status,
-#sourceList .source-reason,
-#sourceList .source-cache-time{
+:is(#sourceList, #liveList) .source-status,
+:is(#sourceList, #liveList) .source-reason,
+:is(#sourceList, #liveList) .source-cache-time{
   font-family:var(--mono);
   font-size:0.7rem;
   color:var(--text-dim);
 }
-
-#sourceList .source-info{
-  overflow:visible;
-}
-
-#sourceList .source-name,
-#sourceList .source-url,
-#sourceList .source-status,
-#sourceList .source-reason,
-#sourceList .source-cache-time{
+:is(#sourceList, #liveList) .source-info{overflow:visible}
+.source-capacity-hint{margin-bottom:12px;color:var(--text-dim);font-family:var(--mono);font-size:0.7rem;line-height:1.8;overflow-wrap:anywhere}
+:is(#sourceList, #liveList) :is(.source-name, .source-url, .source-status, .source-reason, .source-cache-time){
   white-space:normal;
   overflow:visible;
   text-overflow:clip;
@@ -197,12 +190,9 @@ ${sharedStyles}
 <div class="container" id="mainContent" style="display:none">
   <header class="header">
     <div class="header-top">
-      <div class="header-label">管理控制台</div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
-        </div>
+      <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
     </div>
-    <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
     <nav class="header-nav">
       <a href="/status">首页</a>
       <a href="/admin" class="active">接口管理</a>
@@ -229,7 +219,7 @@ ${sharedStyles}
         <input class="name-input" type="text" id="addName" placeholder="名称（可选）">
         <input type="url" id="addUrl" placeholder="TVBox 配置 JSON 地址">
         <input class="name-input" type="text" id="addConfigKey" placeholder="Config Key (optional, for AES ECB)">
-        <button class="btn" id="addBtn" onclick="addSource()">添加</button>
+        <button class="btn" id="addBtn" onclick="addSource()" disabled>添加</button>
       </div>
       <div id="addResult" class="source-operation-result" role="status" aria-live="polite"></div>
       <!-- Import (collapsible) -->
@@ -237,7 +227,7 @@ ${sharedStyles}
       <div class="collapsible-body">
         <textarea id="importInput" class="import-textarea" placeholder="粘贴 TVBox JSON 内容或 URL..."></textarea>
         <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn btn-sm" id="importBtn" onclick="importConfig()">导入</button>
+          <button class="btn btn-sm" id="importBtn" onclick="importConfig()" disabled>导入</button>
         </div>
         <div id="importResult" class="source-operation-result" role="status" aria-live="polite"></div>
       </div>
@@ -249,6 +239,7 @@ ${sharedStyles}
         <span>接口列表</span>
         <span class="count" id="sourceCount">0</span>
       </div>
+      <div id="sourceCapacityHint" class="source-capacity-hint" hidden></div>
       <div class="source-list" id="sourceList">
         <div class="empty">Loading sources...</div>
       </div>
@@ -309,19 +300,6 @@ ${sharedStyles}
       </div>
     </div>
 
-    <!-- Channel Probe (Node/Docker only) -->
-    <div class="section" id="channelProbeSection">
-      <div class="section-title">频道级测速（仅 Node/Docker）</div>
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-          <input type="checkbox" id="channelProbeCheck" onchange="toggleChannelProbe()">
-          <span>启用定时频道测速（每 12 小时）</span>
-        </label>
-        <button class="btn btn-sm" id="channelProbeTriggerBtn" onclick="triggerChannelProbe()">立即执行</button>
-        <button class="btn btn-sm" onclick="loadChannelProbe()">刷新</button>
-      </div>
-      <div id="channelProbeStatus" style="font-size:0.85rem;color:var(--text-secondary);line-height:1.6"></div>
-    </div>
   </div>
 
   <!-- Search Quota Tab -->
@@ -358,7 +336,6 @@ ${sharedStyles}
           <option value="0">周日</option>
         </select>
         <button class="btn btn-sm" id="syncSaveBtn" onclick="saveSyncSchedule()">保存</button>
-        <span class="status-text" id="syncStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
       </div>
       <div id="syncEnvNotice" style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary);display:none">
         环境变量已设定，禁用手动设置聚合时间
@@ -372,17 +349,16 @@ ${sharedStyles}
           <input type="checkbox" id="smartJarUrlCheck" onchange="saveSmartJarUrl()">
           <span>智能响应静态资源地址</span>
         </label>
-        <span class="status-text" id="smartJarUrlStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
       </div>
-      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">实验性功能，复用访问接口时的头部信息动态地为该客户端生成静态资源地址，注意潜在的安全风险。</div>
+      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">使用请求体头部中的主机信息为该客户端动态生成静态资源地址，注意潜在的安全风险，默认不支持非局域网访问（请设置环境变量：DMZ=0）</div>
 
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
           <input type="checkbox" id="liveDisabledCheck" onchange="saveLiveDisabled()">
-          <span>禁用直播功能</span>
+          <span>禁用接口提供的直播源</span>
         </label>
-        <span class="status-text" id="liveDisabledStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
       </div>
+      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">启用后忽略接口提供的直播源并锁定配置编辑，手动添加的不受影响</div>
     </div>
 
     <div class="section">
@@ -399,8 +375,7 @@ ${sharedStyles}
         </div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-        <button class="btn btn-sm" onclick="saveEdgeProxies()">保存</button>
-        <span class="status-text" id="edgeProxiesStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
+        <button class="btn btn-sm" id="edgeProxiesSaveBtn" onclick="saveEdgeProxies()">保存</button>
       </div>
     </div>
 
@@ -410,7 +385,6 @@ ${sharedStyles}
         <label class="form-label" style="margin:0">可搜索源上限</label>
         <input type="number" id="maxSearchableInput" class="nt-input" style="width:80px" min="0" max="1000" value="0">
         <button class="btn btn-sm" id="searchQuotaSaveBtn" onclick="saveSearchQuota()">保存</button>
-        <span class="status-text" id="searchQuotaStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
       </div>
       <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">限制可搜索源数量，减少 TVBox 搜索崩溃。0 = 不限制。置顶源在搜索页签管理。</div>
     </div>
@@ -429,7 +403,6 @@ ${sharedStyles}
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn" id="ntSaveBtn" onclick="saveNameTransform()">保存</button>
-        <span class="status-text" id="ntStatus" style="font-family:var(--mono);font-size:0.75rem"></span>
       </div>
     </div>
   </div>
@@ -461,7 +434,6 @@ const auth = initAuth('loginInput', 'loginError', 'loginOverlay', 'mainContent',
 
 // --- Tab switching ---
 function switchTab(tab) {
-  if (tab === 'live' && $('liveDisabledCheck')?.checked) return;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
   document.querySelectorAll('.tab-panel').forEach(p => {
     const id = 'panel' + tab.charAt(0).toUpperCase() + tab.slice(1);
@@ -471,10 +443,40 @@ function switchTab(tab) {
   // 切到 logs 时延迟初始化 SSE 连接，切走时主动 abort 释放（Pitfall 4 防泄漏）
   if (tab === 'logs') startLogStream();
   else stopLogStream();
+  if (tab === 'live') loadLives();
 }
 
 // --- Source health ---
 let healthMap = {};
+let sourceListRequest = 0;
+let sourceLimitValue = null;
+let sourceTotal = 0;
+let sourceOperationBusy = false;
+function updateSourceCapacityControls() {
+  const full = sourceLimitValue !== null && sourceLimitValue > 0 && sourceTotal >= sourceLimitValue;
+  const disabled = sourceOperationBusy || sourceLimitValue === null || full;
+  $('addBtn').disabled = disabled;
+  $('importBtn').disabled = disabled;
+  const hint = $('sourceCapacityHint');
+  hint.hidden = !full;
+  hint.textContent = full ? '接口数量已达到上限（' + sourceLimitValue + '），请删除至上限以下后再添加。'
+    + (sourceTotal > sourceLimitValue ? ' 本轮仅聚合列表前 ' + sourceLimitValue + ' 条；旧结果在新聚合成功前保持。' : '') : '';
+}
+function sourceCapacityFeedback(data) {
+  const capacity = data.capacity;
+  if (capacity && Number.isSafeInteger(capacity.limit) && capacity.limit >= 0
+      && Number.isSafeInteger(capacity.current) && capacity.current >= 0) {
+    ++sourceListRequest; // A pre-mutation GET cannot overwrite the confirmed capacity.
+    sourceLimitValue = capacity.limit;
+    sourceTotal = capacity.current;
+    $('sourceCount').textContent = capacity.limit > 0 ? capacity.current + '/' + capacity.limit : capacity.current;
+    $('badgeSources').textContent = capacity.current;
+    updateSourceCapacityControls();
+  }
+  if (data.code === 'source_limit_exceeded' || (data.capacity && data.capacity.rejected > 0)) {
+    toast('接口数量已达到上限（' + data.capacity.limit + '），超出的接口未添加。', 'error');
+  }
+}
 
 async function loadSourceHealth() {
   try {
@@ -500,24 +502,34 @@ async function loadAll() {
   loadLiveDisabled();
   loadEdgeProxies();
   loadSearchQuota();
-  loadChannelProbe();
 }
 
 async function loadSources() {
+  const request = ++sourceListRequest;
   const list = $('sourceList');
   try {
     const res = await auth.authFetch('/admin/sources');
+    if (!res.ok) throw new Error('Load failed');
+    const rawLimit = res.headers.get('X-Max-Data-Sources');
+    if (rawLimit === null || !/^\\d+$/.test(rawLimit)) throw new Error('Missing capacity');
+    const limit = Number(rawLimit);
+    if (!Number.isSafeInteger(limit)) throw new Error('Invalid capacity');
     const sources = await res.json();
-    $('sourceCount').textContent = sources.length;
+    if (request !== sourceListRequest) return;
+    if (!Array.isArray(sources)) throw new Error('Invalid sources');
+    sourceLimitValue = limit;
+    sourceTotal = sources.length;
+    $('sourceCount').textContent = limit > 0 ? sources.length + '/' + limit : sources.length;
     $('badgeSources').textContent = sources.length;
+    updateSourceCapacityControls();
 
     if (sources.length === 0) {
       list.innerHTML = '<div class="empty">' + "暂无源。请在上方添加。" + '</div>';
       return;
     }
 
-    list.innerHTML = sources.map(s => {
-      const h = healthMap[s.url];
+    list.innerHTML = sources.map((s, index) => {
+      const h = limit > 0 && index >= limit ? null : healthMap[s.url];
       // Plan 03.1 D-10: 后端已分类，直接使用 h.status
       const level = h && h.aggregation && h.aggregation.latest && h.aggregation.latest.reason ? 'error' : !h ? 'unknown'
         : h.status === 'ERR' ? 'error'
@@ -550,7 +562,9 @@ async function loadSources() {
       </div>\`;
     }).join('');
   } catch {
-    list.innerHTML = '<div class="empty">' + "加载源失败" + '</div>';
+    if (request !== sourceListRequest) return;
+    if (sourceLimitValue === null) list.innerHTML = '<div class="empty">' + "加载源失败" + '</div>';
+    updateSourceCapacityControls();
   }
 }
 
@@ -571,7 +585,8 @@ async function addSource() {
   const name = $('addName').value.trim() || '';
   const configKey = $('addConfigKey').value.trim() || '';
   const result = $('addResult');
-  btn.disabled = true;
+  sourceOperationBusy = true;
+  updateSourceCapacityControls();
   btn.textContent = '检查中...';
   btn.className = 'btn loading';
   result.className = 'source-operation-result';
@@ -582,15 +597,17 @@ async function addSource() {
       body: JSON.stringify({ name, url, configKey })
     });
     const d = await res.json();
+    sourceCapacityFeedback(d);
     renderSourceImportResult(result, res.ok ? d : { error: d.error || '添加失败' });
     if (res.ok && d.added > 0) {
       if (!(d.skipped || []).length) {
         $('addUrl').value = ''; $('addName').value = ''; $('addConfigKey').value = '';
       }
-      loadSources();
+      await loadSources();
     }
+    else if (res.status === 409) await loadSources();
   } catch { renderSourceImportResult(result, { error: '网络错误' }); }
-  finally { btn.disabled = false; btn.textContent = '添加'; btn.className = 'btn'; }
+  finally { sourceOperationBusy = false; btn.textContent = '添加'; btn.className = 'btn'; updateSourceCapacityControls(); }
 }
 
 // --- Remove source ---
@@ -602,8 +619,9 @@ async function removeSource(url) {
       body: JSON.stringify({ url })
     });
     if (res.ok) {
+      sourceCapacityFeedback(await res.json());
       toast("源已删除");
-      loadSources();
+      await loadSources();
     } else {
       const d = await res.json();
       toast(d.error || "删除", 'error');
@@ -727,33 +745,40 @@ async function batchImportMacCMS() {
 }
 
 // --- Live Sources ---
+let liveListRequest = 0;
+function liveSourceRow(s) {
+  const status = s.cacheStatus || { level: 'unknown', label: '等待聚合' };
+  const level = ['ok', 'warn', 'error', 'unknown'].includes(status.level) ? status.level : 'unknown';
+  const reason = status.reason && level !== 'ok' ? status.reason : '';
+  const count = level !== 'ok' && status.failures > 0 ? ' · 连续失败 ' + esc(String(status.failures)) : '';
+  return '<div class="source-item">'
+    + '<span class="source-health-dot ' + level + '"></span>'
+    + '<div class="source-info">'
+    + '<div class="source-name">' + esc(s.name || 'Unnamed') + '</div>'
+    + '<div class="source-url">' + esc(s.url) + '</div>'
+    + '<div class="source-status">状态：' + esc(status.label) + count + '</div>'
+    + (reason ? '<div class="source-reason">原因：' + esc(reason) + (status.cached ? ' · 已缓存' : '') + '</div>' : '')
+    + (reason && status.cached && status.cacheTime ? '<div class="source-cache-time">最后缓存时间：' + esc(status.cacheTime) + '</div>' : '')
+    + '</div><div class="source-actions">'
+    + '<button class="btn btn-sm btn-danger" data-url="' + escAttr(s.url) + '" onclick="removeLive(this.dataset.url)">删除</button>'
+    + '</div></div>';
+}
 async function loadLives() {
+  const request = ++liveListRequest;
   const list = $('liveList');
   try {
     const res = await auth.authFetch('/admin/lives');
+    if (!res.ok) throw new Error('Load failed');
     const entries = await res.json();
+    if (request !== liveListRequest) return;
     $('liveCount').textContent = entries.length;
     $('badgeLive').textContent = entries.length;
-
-    if (entries.length === 0) {
-      list.innerHTML = '<div class="empty">' + "暂无直播源。请在上方添加。" + '</div>';
-      return;
-    }
-
-    list.innerHTML = entries.map(s => \`
-      <div class="source-item">
-        <span class="source-tag manual">LIVE</span>
-        <div class="source-info">
-          <div class="source-name">\${esc(s.name || 'Unnamed')}</div>
-          <div class="source-url">\${esc(s.url)}</div>
-        </div>
-        <div class="source-actions">
-          <button class="btn btn-sm btn-danger" onclick="removeLive('\${esc(s.url)}')">\${"删除"}</button>
-        </div>
-      </div>
-    \`).join('');
+    list.innerHTML = entries.length ? entries.map(liveSourceRow).join('')
+      : '<div class="empty">暂无直播源。请在上方添加。</div>';
   } catch {
-    list.innerHTML = '<div class="empty">' + "加载直播源失败" + '</div>';
+    if (request === liveListRequest && !list.querySelector('.source-item')) {
+      list.innerHTML = '<div class="empty">加载直播源失败</div>';
+    }
   }
 }
 
@@ -763,6 +788,8 @@ async function addLive() {
   const name = $('liveName').value.trim() || '';
 
   const btn = $('liveAddBtn');
+  if (btn.disabled) return;
+  btn.disabled = true;
   btn.textContent = "添加中...";
   btn.className = 'btn loading';
 
@@ -787,6 +814,7 @@ async function addLive() {
 
   btn.textContent = "添加";
   btn.className = 'btn';
+  btn.disabled = false;
 }
 
 async function removeLive(url) {
@@ -808,7 +836,8 @@ async function importConfig() {
   const input = $('importInput').value.trim();
   if (!input) { $('importInput').focus(); return; }
   const result = $('importResult');
-  btn.disabled = true;
+  sourceOperationBusy = true;
+  updateSourceCapacityControls();
   btn.textContent = '检查中...';
   btn.className = 'btn btn-sm loading';
   result.className = 'source-operation-result';
@@ -818,13 +847,33 @@ async function importConfig() {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input })
     });
     const d = await res.json();
+    sourceCapacityFeedback(d);
     renderSourceImportResult(result, res.ok ? d : { error: d.error || '解析失败' });
     if (res.ok && d.added > 0) {
       if (!(d.skipped || []).length) $('importInput').value = '';
-      loadSources();
+      await loadSources();
     }
+    else if (res.status === 409) await loadSources();
   } catch { renderSourceImportResult(result, { error: '网络错误' }); }
-  finally { btn.disabled = false; btn.textContent = '导入'; btn.className = 'btn btn-sm'; }
+  finally { sourceOperationBusy = false; btn.textContent = '导入'; btn.className = 'btn btn-sm'; updateSourceCapacityControls(); }
+}
+
+// Settings saves are silent; the disabled control prevents overlapping writes.
+async function saveSetting(control, url, data) {
+  if (control.disabled) return false;
+  control.disabled = true;
+  try {
+    const res = await auth.authFetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    control.disabled = false;
+  }
 }
 
 // --- Name Transform ---
@@ -839,37 +888,10 @@ async function loadNameTransform() {
 }
 
 async function saveNameTransform() {
-  const btn = $('ntSaveBtn');
-  const status = $('ntStatus');
-  btn.textContent = "保存中...";
-  btn.className = 'btn loading';
-  status.textContent = '';
-
-  try {
-    const res = await auth.authFetch('/admin/name-transform', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prefix: $('ntPrefix').value || '',
-        suffix: $('ntSuffix').value || '',
-      })
-    });
-    const d = await res.json();
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      status.textContent = d.error || "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-  }
-
-  btn.textContent = "保存";
-  btn.className = 'btn';
-  setTimeout(() => { status.textContent = ''; }, 3000);
+  await saveSetting($('ntSaveBtn'), '/admin/name-transform', {
+    prefix: $('ntPrefix').value || '',
+    suffix: $('ntSuffix').value || '',
+  });
 }
 
 // --- Sync Schedule ---
@@ -902,48 +924,11 @@ async function loadSyncSchedule() {
 }
 
 async function saveSyncSchedule() {
-  const btn = $('syncSaveBtn');
-  const status = $('syncStatus');
-  btn.textContent = "保存中...";
-  btn.className = 'btn btn-sm loading';
-  status.textContent = '';
-
   const period = $('syncPeriod').value;
-  const timeVal = $('syncTime').value || '05:00';
-  const parts = timeVal.split(':');
-  const hh = Number(parts[0]);
-  const mm = Number(parts[1]);
-  const schedule = {
-    period,
-    hour: hh,
-    minute: mm,
-  };
-  if (period === 'weekly') {
-    schedule.dayOfWeek = parseInt($('syncDayOfWeek').value);
-  }
-
-  try {
-    const res = await auth.authFetch('/admin/cron-interval', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ schedule })
-    });
-    const d = await res.json();
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      status.textContent = d.error || "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-  }
-
-  btn.textContent = "保存";
-  btn.className = 'btn btn-sm';
-  setTimeout(() => { status.textContent = ''; }, 3000);
+  const parts = ($('syncTime').value || '05:00').split(':');
+  const schedule = { period, hour: Number(parts[0]), minute: Number(parts[1]) };
+  if (period === 'weekly') schedule.dayOfWeek = parseInt($('syncDayOfWeek').value);
+  await saveSetting($('syncSaveBtn'), '/admin/cron-interval', { schedule });
 }
 
 // --- Smart JAR URL Toggle ---
@@ -958,30 +943,12 @@ async function loadSmartJarUrl() {
 }
 
 async function saveSmartJarUrl() {
-  const status = $('smartJarUrlStatus');
-  const enabled = $('smartJarUrlCheck').checked;
-  status.textContent = '';
-
-  try {
-    const res = await auth.authFetch('/admin/smart-jar-url', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled })
-    });
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      const d = await res.json();
-      status.textContent = d.error || "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
+  const check = $('smartJarUrlCheck');
+  if (check.disabled) return;
+  const enabled = check.checked;
+  if (!await saveSetting(check, '/admin/smart-jar-url', { enabled })) {
+    check.checked = !enabled;
   }
-
-  setTimeout(() => { status.textContent = ''; }, 3000);
 }
 
 // --- Live Disabled Toggle ---
@@ -998,115 +965,17 @@ async function loadLiveDisabled() {
 
 function updateLiveTabState(disabled) {
   const liveTab = document.querySelector('.tab[data-tab="live"]');
-  if (!liveTab) return;
-  if (disabled) {
-    liveTab.classList.add('disabled');
-    if (liveTab.classList.contains('active')) switchTab('sources');
-  } else {
-    liveTab.classList.remove('disabled');
-  }
+  if (liveTab) liveTab.classList.remove('disabled');
 }
 
 async function saveLiveDisabled() {
-  const status = $('liveDisabledStatus');
-  const disabled = $('liveDisabledCheck').checked;
-  status.textContent = "应用中...";
-  status.className = 'status-text';
-
-  try {
-    const res = await auth.authFetch('/admin/live-disabled', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ disabled })
-    });
-    if (res.ok) {
-      const d = await res.json();
-      status.textContent = disabled ? "已禁用直播" : "已启用直播";
-      status.className = 'status-text success';
-      updateLiveTabState(disabled);
-    } else {
-      const d = await res.json();
-      status.textContent = d.error || "保存失败";
-      status.className = 'status-text error';
-      $('liveDisabledCheck').checked = !disabled;
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-    $('liveDisabledCheck').checked = !disabled;
-  }
-
-  setTimeout(() => { status.textContent = ''; }, 3000);
-}
-
-// --- Channel Probe (Node/Docker) ---
-async function loadChannelProbe() {
-  const box = $('channelProbeStatus');
-  try {
-    const res = await auth.authFetch('/admin/channel-probe/status');
-    if (res.status === 404) {
-      $('channelProbeSection').style.display = 'none';
-      return;
-    }
-    if (!res.ok) {
-      box.textContent = "仅 Node/Docker 支持频道级测速";
-      return;
-    }
-    const d = await res.json();
-    $('channelProbeCheck').checked = !!d.enabled;
-    const s = d.status || {};
-    const stateLabel = { idle: "空闲", running: "运行中", done: "已完成", error: "失败" }[s.state] || s.state || '-';
-    const lines = [];
-    lines.push("状态" + ': ' + stateLabel + (d.running ? ' ⏳' : ''));
-    if (s.totalUrls) {
-      lines.push("进度" + ': ' + (s.probed || 0) + ' / ' + s.totalUrls + ' | ' + "覆盖率" + ': ' + (s.coverage || 0) + '% | ' + "频道数" + ': ' + (s.totalChannels || 0));
-    }
-    if (s.durationMs) {
-      lines.push("耗时" + ': ' + (s.durationMs / 1000).toFixed(1) + 's');
-    }
-    if (s.finishedAt) {
-      lines.push("完成时间" + ': ' + new Date(s.finishedAt).toLocaleString());
-    }
-    if (s.error) {
-      lines.push('⚠️ ' + s.error);
-    }
-    box.innerHTML = lines.map(l => '<div>' + l.replace(/</g,'&lt;') + '</div>').join('');
-  } catch {
-    box.textContent = "网络错误";
-  }
-}
-
-async function toggleChannelProbe() {
-  const enabled = $('channelProbeCheck').checked;
-  try {
-    await auth.authFetch('/admin/channel-probe/toggle', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled })
-    });
-    toast("已保存");
-    loadChannelProbe();
-  } catch {
-    toast("网络错误", 'error');
-  }
-}
-
-async function triggerChannelProbe() {
-  const btn = $('channelProbeTriggerBtn');
-  btn.disabled = true;
-  try {
-    const res = await auth.authFetch('/admin/channel-probe/trigger', { method: 'POST' });
-    const d = await res.json();
-    if (res.ok) {
-      toast("测速已启动");
-      setTimeout(loadChannelProbe, 500);
-    } else {
-      toast(d.error || 'Failed', 'error');
-    }
-  } catch {
-    toast("网络错误", 'error');
-  } finally {
-    btn.disabled = false;
+  const check = $('liveDisabledCheck');
+  if (check.disabled) return;
+  const disabled = check.checked;
+  if (await saveSetting(check, '/admin/live-disabled', { disabled })) {
+    updateLiveTabState(disabled);
+  } else {
+    check.checked = !disabled;
   }
 }
 
@@ -1123,25 +992,10 @@ async function loadEdgeProxies() {
 }
 
 async function saveEdgeProxies() {
-  const status = $('edgeProxiesStatus');
-  try {
-    const res = await auth.authFetch('/admin/edge-proxies', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fetchProxy: $('edgeFetchProxyUrl').value.trim(), vercel: $('edgeVercelUrl').value.trim() })
-    });
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      status.textContent = "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-  }
-  setTimeout(() => { status.textContent = ''; }, 3000);
+  await saveSetting($('edgeProxiesSaveBtn'), '/admin/edge-proxies', {
+    fetchProxy: $('edgeFetchProxyUrl').value.trim(),
+    vercel: $('edgeVercelUrl').value.trim(),
+  });
 }
 
 
@@ -1160,30 +1014,10 @@ async function loadSearchQuota() {
 }
 
 async function saveSearchQuota() {
-  const status = $('searchQuotaStatus');
-  status.textContent = '';
-  const data = {
+  await saveSetting($('searchQuotaSaveBtn'), '/admin/search-quota', {
     maxSearchable: parseInt($('maxSearchableInput').value) || 0,
     pinnedKeys: [...sqPinnedKeys],
-  };
-  try {
-    const res = await auth.authFetch('/admin/search-quota', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    if (res.ok) {
-      status.textContent = "已保存";
-      status.className = 'status-text success';
-    } else {
-      status.textContent = "保存失败";
-      status.className = 'status-text error';
-    }
-  } catch {
-    status.textContent = "网络错误";
-    status.className = 'status-text error';
-  }
-  setTimeout(() => { status.textContent = ''; }, 3000);
+  });
 }
 
 async function loadSearchQuotaReport() {
@@ -1301,7 +1135,7 @@ async function triggerRefresh() {
     const d = await res.json();
     if (d.success) {
       toast("同步已开始");
-      setTimeout(() => { loadSourceHealth(); loadSources(); }, 3000);
+      setTimeout(() => { loadSourceHealth(); loadSources(); loadLives(); }, 3000);
     } else {
       toast("刷新失败", 'error');
     }
