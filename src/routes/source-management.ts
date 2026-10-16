@@ -4,13 +4,14 @@ import type { Storage } from '../storage/interface';
 import type { AppConfig, SourceEntry } from '../core/types';
 import { MANUAL_SOURCES } from '../core/config';
 import { adminAuthMiddleware } from './admin-auth';
-import { withSourceGate, saveSourceRoots, captureSourceBaseline, type SourceBaseline } from '../core/source-fallback';
+import { withSourceGate, saveSourceRoots, captureSourceBaseline, sourceRootGenerations, type SourceBaseline } from '../core/source-fallback';
 import { externalSourceEntry, planSourceImport, SourceImportError, type SourceImportPlan } from '../core/source-import';
 import { sourceActivity, activityBusyMessage, type SourceActivity } from '../core/source-activity';
 import { loadFetchProxy } from '../core/fetch-proxy';
 import { sourceDisplayName } from '../core/source-name';
 import { sourceMigrationReport } from '../core/source-import-policy';
 import { sourceCapacity, sourceLimit, sourceLimitMessage } from '../core/source-capacity';
+import { readJarWarnings, type JarWarning } from '../core/jar-diagnostics';
 
 export interface SourceMgmtRouteDeps { storage: Storage; config: AppConfig; activity?: SourceActivity }
 function importErrorBody(error: unknown) {
@@ -29,10 +30,15 @@ export function createSourceMgmtRouter({ storage, config, activity = sourceActiv
     try { await next(); } finally { release(); }
   });
   router.get('/admin/sources', async c => {
-    const raw = await storage.get(MANUAL_SOURCES);
     c.header('X-Max-Data-Sources', String(limit));
-    const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
-    return c.json(sources.map(source => ({ ...source, name: sourceDisplayName(source) })));
+    return withSourceGate(storage, async () => {
+      const raw = await storage.get(MANUAL_SOURCES);
+      const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
+      const warnings = await sourceRootGenerations(storage, sources)
+        .then(generations => readJarWarnings(storage, generations)).catch((): Record<string, JarWarning[]> => ({}));
+      return c.json(sources.map(source => ({ ...source, name: sourceDisplayName(source),
+        ...(warnings[source.url] ? { jarWarnings: warnings[source.url] } : {}) })));
+    });
   });
   router.get('/admin/sources/migration-result', async c => c.json({ report: await sourceMigrationReport(storage) }));
 

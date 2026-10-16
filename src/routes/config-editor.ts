@@ -32,7 +32,9 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     }
 
     let parsed: TVBoxConfig;
+    let original: TVBoxConfig;
     try {
+      original = JSON.parse(cached);
       const adminBase = (config.localBaseUrl || '').replace(/\/$/, '');
       const substituted = applyBaseUrlPlaceholder(cached, adminBase);
       parsed = JSON.parse(substituted);
@@ -54,7 +56,7 @@ export function createConfigEditorRouter(deps: ConfigEditorRouteDeps): Hono {
     // Build sites with fingerprint + blocked status + group
     const sites = [];
     for (const [index, site] of (parsed.sites || []).entries()) {
-      const fp = await siteFingerprint(site);
+      const fp = await siteFingerprint(original.sites?.[index] || site, original.spider);
       const api = site.api || '';
       let group = '其他';
       if (api.startsWith('csp_') || api.startsWith('py_') || api.startsWith('js_')) {

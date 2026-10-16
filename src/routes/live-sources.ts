@@ -8,6 +8,7 @@ import { adminAuthMiddleware } from './admin-auth';
 import { withSourceGate } from '../core/source-gate';
 import { loadLiveCache, liveCacheView, manualLiveCacheValue } from '../core/live-cache';
 import { decodeLiveSources } from '../core/live-policy';
+import { sourceDisplayName } from '../core/source-name';
 
 export interface LiveSourcesRouteDeps {
   storage: Storage;
@@ -47,7 +48,7 @@ export function createLiveSourcesRouter(deps: LiveSourcesRouteDeps): Hono {
     }
 
     if (body.name !== undefined && typeof body.name !== 'string') return c.json({ error: 'Invalid name' }, 400);
-    const name = body.name?.trim() || '';
+    const name = sourceDisplayName({ name: body.name?.trim(), url });
     return withSourceGate(storage, async () => {
       const entries = decodeLiveSources(await storage.get(LIVE_SOURCES));
       if (entries.some(e => e.url === url)) return c.json({ error: 'Live source already exists' }, 409);

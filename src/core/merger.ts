@@ -1,7 +1,8 @@
 // 站点级合并引擎
 
 import type { TVBoxConfig, TVBoxSite, SourcedConfig } from './types';
-import { normalizeConfig, extractSpiderJarUrl } from './parser';
+import { normalizeConfig } from './parser';
+import { effectiveSiteJar, jarDeclaration, type JarDeclaration } from './jar-identity';
 import {
   deduplicateSites,
   siteDedupKey,
@@ -25,6 +26,13 @@ import { sourceDisplayName } from './source-name';
 export interface MergeResult {
   config: TVBoxConfig;
   siteSourceNames: string[][];
+  jarConflicts: JarConflict[];
+}
+
+export interface JarConflict {
+  url: string;
+  md5s: (string | null)[];
+  sources: { url: string; identity: string; name: string }[];
 }
 
 export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
@@ -33,10 +41,11 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
 
   // Step 2: 确定全局 spider（投票制：选引用最多 type:3 站点的 JAR）
   const globalSpider = selectGlobalSpider(normalized);
-  const globalSpiderFull = globalSpider ? findFullSpiderString(normalized, globalSpider) : null;
+  const jarConflicts = collectJarConflicts(normalized);
 
   // Step 3: 收集并合并所有字段
   const allSites: TVBoxSite[] = [];
+  const siteKeys = new WeakMap<TVBoxSite, string>();
   const siteGroups = new WeakMap<TVBoxSite, Map<string, string>>();
   const sourceGroups = new Map<string, Map<string, string>>();
   const allParses: TVBoxConfig['parses'] = [];
@@ -55,15 +64,14 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
       for (const site of config.sites) {
         const siteCopy = { ...site };
 
-        if (site.type === 3 && !site.jar) {
-          const spiderJar = extractSpiderJarUrl(config.spider);
-          if (spiderJar && spiderJar !== globalSpider) {
-            siteCopy.jar = config.spider;
-          }
+        const declaration = effectiveSiteJar(site, config.spider);
+        if (site.type === 3 && !site.jar && declaration && declaration.identity !== globalSpider?.identity) {
+          siteCopy.jar = declaration.raw;
         }
 
         // Capture duplicate groups before dedup mutates conflicting keys/names.
-        const groupKey = siteDedupKey(siteCopy);
+        const groupKey = siteDedupKey(siteCopy, declaration?.identity || '');
+        siteKeys.set(siteCopy, groupKey);
         let origins = sourceGroups.get(groupKey);
         if (!origins) {
           origins = new Map();
@@ -88,9 +96,9 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
   }
 
   // Step 4: 去重
-  const dedupedSites = deduplicateSites(allSites);
+  const dedupedSites = deduplicateSites(allSites, site => siteKeys.get(site)!);
 
-  const spider = globalSpiderFull || globalSpider;
+  const spider = globalSpider?.raw;
   const merged: TVBoxConfig = {
     ...(spider ? { spider } : {}),
     sites: dedupedSites,
@@ -105,35 +113,37 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
 
   logger.info('merger', `Merged: ${merged.sites?.length} sites, ${merged.parses?.length} parses, ${merged.lives?.length} lives`);
 
-  return { config: merged, siteSourceNames: dedupedSites.map(site => Array.from(siteGroups.get(site)?.values() || [])) };
+  return { config: merged, siteSourceNames: dedupedSites.map(site => Array.from(siteGroups.get(site)?.values() || [])), jarConflicts };
 }
 
 /**
  * 选择全局 spider JAR
- * 统计每个 JAR URL 被多少个 type:3 站点引用，选引用最多的
+ * 统计每个完整 JAR 声明被多少个未显式指定 jar 的 type:3 站点引用，选引用最多的
  */
-function selectGlobalSpider(configs: SourcedConfig[]): string | null {
-  const jarCounts = new Map<string, number>();
+function selectGlobalSpider(configs: SourcedConfig[]): JarDeclaration | null {
+  const jarCounts = new Map<string, { declaration: JarDeclaration; count: number }>();
 
   for (const sourced of configs) {
-    const spiderJar = extractSpiderJarUrl(sourced.config.spider);
+    const spiderJar = jarDeclaration(sourced.config.spider);
     if (!spiderJar) continue;
 
     const type3Count = (sourced.config.sites || []).filter((s) => s.type === 3 && !s.jar).length;
     if (type3Count > 0) {
-      jarCounts.set(spiderJar, (jarCounts.get(spiderJar) || 0) + type3Count);
+      const entry = jarCounts.get(spiderJar.identity) || { declaration: spiderJar, count: 0 };
+      entry.count += type3Count;
+      jarCounts.set(spiderJar.identity, entry);
     }
   }
 
   if (jarCounts.size === 0) return null;
 
   // 选引用次数最多的
-  let maxJar: string | null = null;
+  let maxJar: JarDeclaration | null = null;
   let maxCount = 0;
-  for (const [jar, count] of jarCounts) {
+  for (const { declaration, count } of jarCounts.values()) {
     if (count > maxCount) {
       maxCount = count;
-      maxJar = jar;
+      maxJar = declaration;
     }
   }
 
@@ -141,16 +151,23 @@ function selectGlobalSpider(configs: SourcedConfig[]): string | null {
 }
 
 /**
- * 找到使用指定 JAR URL 的完整 spider 字符串（可能含 md5 等后缀）
+ * 汇总实际站点依赖中同一 JAR 地址的不同 MD5 声明及贡献来源
  */
-function findFullSpiderString(configs: SourcedConfig[], jarUrl: string): string | null {
-  for (const sourced of configs) {
-    const extracted = extractSpiderJarUrl(sourced.config.spider);
-    if (extracted === jarUrl && sourced.config.spider) {
-      return sourced.config.spider;
+function collectJarConflicts(configs: SourcedConfig[]): JarConflict[] {
+  const groups = new Map<string, { md5s: Set<string | null>; sources: Map<string, JarConflict['sources'][number]> }>();
+  for (const source of configs) {
+    for (const site of source.config.sites || []) {
+      const declaration = effectiveSiteJar(site, source.config.spider);
+      if (!declaration) continue;
+      const group = groups.get(declaration.url) || { md5s: new Set<string | null>(), sources: new Map() };
+      const identity = source.sourceIdentity || source.sourceUrl;
+      group.md5s.add(declaration.md5);
+      group.sources.set(identity, { url: source.sourceUrl, identity, name: sourceDisplayName({ name: source.sourceName, url: source.sourceUrl }) });
+      groups.set(declaration.url, group);
     }
   }
-  return null;
+  return [...groups.entries()].filter(([, group]) => group.md5s.size > 1)
+    .map(([url, group]) => ({ url, md5s: [...group.md5s], sources: [...group.sources.values()] }));
 }
 
 /**

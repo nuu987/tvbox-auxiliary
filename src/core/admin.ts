@@ -98,8 +98,9 @@ ${sharedStyles}
 #panelSources .source-import-toggle:hover{color:var(--text-bright)}
 #panelSources .source-import-toggle:focus-visible{outline:2px solid var(--green);outline-offset:2px;border-radius:4px}
 .source-import-panel{margin-top:0;margin-bottom:12px}
-.source-add-description,.source-import-description{font-family:var(--mono);font-size:0.75rem;font-weight:400;line-height:1.6;color:var(--text-dim);padding:0 0 12px;margin:0;overflow-wrap:anywhere}
+.source-add-description,.source-import-description,.source-list-description{font-family:var(--mono);font-size:0.75rem;font-weight:400;line-height:1.6;color:var(--text-dim);padding:0 0 12px;margin:0;overflow-wrap:anywhere}
 .source-import-actions{display:flex;align-items:center;gap:8px;margin:8px 0 15px}
+.source-warning{font-family:var(--mono);font-size:0.7rem;line-height:1.6;color:var(--amber);white-space:pre-wrap;overflow-wrap:anywhere;min-width:0;margin-top:4px}
 
 /* Import textarea */
 .import-textarea{
@@ -255,6 +256,7 @@ ${sharedStyles}
         <span>接口列表</span>
         <span class="count" id="sourceCount">0</span>
       </div>
+      <p class="source-list-description">注意，聚合过多的接口会导致 Tvbox 启动缓慢与加载崩溃，一般不建议添加超过 3 个接口</p>
       <div id="sourceCapacityHint" class="source-capacity-hint" hidden></div>
       <div class="source-list" id="sourceList">
         <div class="empty">Loading sources...</div>
@@ -564,6 +566,9 @@ async function loadSources() {
       const statusLine = '<div class="source-status">状态：' + esc(status) +
         (h && !h.waiting && !h.local && h.status !== 'OK' ? ' · 连续失败 ' + esc(String(h.consecutiveFailures || 0)) : '') + '</div>';
       const reasonLine = reason ? '<div class="source-reason">原因：' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
+      const jarWarnings = limit > 0 && index >= limit ? [] : s.jarWarnings || [];
+      const warningLines = jarWarnings.map(warning => '<div class="source-warning">JAR 提示：' + esc(warning.message)
+        + '\\n地址：' + esc(warning.url) + '\\nMD5：' + esc(warning.md5s.map(md5 => md5 === null ? '未声明' : md5).join('、')) + '</div>').join('');
       const cacheTime = cached && saved && saved.fallbackApplied && saved.snapshotTime
         ? '<div class="source-cache-time">已缓存的最后成功聚合时间：' + esc(saved.snapshotTime) + '</div>' : '';
 
@@ -572,7 +577,7 @@ async function loadSources() {
         <div class="source-info">
           <div class="source-name">\${esc(s.name || s.url)}\${s.configKey ? ' 🔑' : ''}</div>
           <div class="source-url">\${esc(s.url)}</div>
-          \${statusLine}\${reasonLine}\${cacheTime}
+          \${statusLine}\${reasonLine}\${warningLines}\${cacheTime}
         </div>
         <div class="source-actions">
           <button class="btn btn-sm btn-danger" data-source-delete data-url="\${esc(s.url)}" onclick="removeSource(this.dataset.url)" \${sourceOperationBusy ? 'disabled' : ''}>\${"删除"}</button>
@@ -776,7 +781,7 @@ function liveSourceRow(s) {
   return '<div class="source-item">'
     + '<span class="source-health-dot ' + level + '"></span>'
     + '<div class="source-info">'
-    + '<div class="source-name">' + esc(s.name || 'Unnamed') + '</div>'
+    + '<div class="source-name">' + esc(s.name || s.url) + '</div>'
     + '<div class="source-url">' + esc(s.url) + '</div>'
     + '<div class="source-status">状态：' + esc(status.label) + count + '</div>'
     + (reason ? '<div class="source-reason">原因：' + esc(reason) + (status.cached ? ' · 已缓存' : '') + '</div>' : '')

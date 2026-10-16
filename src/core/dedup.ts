@@ -1,45 +1,37 @@
 // 去重逻辑
 
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxDoh, TVBoxRule } from './types';
+import { effectiveSiteJar } from './jar-identity';
 
-export function siteDedupKey(site: TVBoxSite): string {
-  return `${site.key}|${site.api}`;
+export function siteDedupKey(site: TVBoxSite, jarIdentity = effectiveSiteJar(site)?.identity || ''): string {
+  return JSON.stringify([site.key, site.api, jarIdentity]);
 }
 
 /**
  * 站点去重
- * 去重键: key + api（所有类型统一，JAR 差异不作为区分维度）
- * 冲突: key 相同但 api 不同 → key 加来源后缀
+ * Preserve JAR declaration variants; reserve original keys before generating suffixes.
  */
-export function deduplicateSites(sites: TVBoxSite[]): TVBoxSite[] {
-  const keyMap = new Map<string, TVBoxSite>(); // key → first site
-
+export function deduplicateSites(sites: TVBoxSite[], keyFor: (site: TVBoxSite) => string = siteDedupKey): TVBoxSite[] {
   const result: TVBoxSite[] = [];
   const seen = new Set<string>();
-  const usedKeys = new Map<string, number>(); // key → count, for suffix
+  const reserved = new Set(sites.map(site => site.key));
+  const used = new Set<string>();
+  const suffixes = new Map<string, number>();
 
   for (const site of sites) {
-    const dk = siteDedupKey(site);
+    const dk = keyFor(site);
     if (seen.has(dk)) continue;
     seen.add(dk);
 
-    // 处理 key 冲突：同 key 不同内容
-    if (keyMap.has(site.key)) {
-      const existing = keyMap.get(site.key)!;
-      if (siteDedupKey(existing) !== dk) {
-        // key 冲突，加后缀
-        const count = (usedKeys.get(site.key) || 1) + 1;
-        usedKeys.set(site.key, count);
-        site.key = `${site.key}_${count}`;
-        if (site.name) {
-          site.name = `${site.name}(${count})`;
-        }
-      }
-    } else {
-      keyMap.set(site.key, site);
-      usedKeys.set(site.key, 1);
+    if (used.has(site.key)) {
+      const original = site.key;
+      let count = suffixes.get(original) || 1;
+      do { count++; } while (reserved.has(`${original}_${count}`) || used.has(`${original}_${count}`));
+      suffixes.set(original, count);
+      site.key = `${original}_${count}`;
+      if (site.name) site.name = `${site.name}(${count})`;
     }
-
+    used.add(site.key);
     result.push(site);
   }
 

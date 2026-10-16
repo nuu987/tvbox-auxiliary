@@ -1,4 +1,5 @@
 import type { LiveSourceEntry, TVBoxLive } from './types';
+import { sourceDisplayName } from './source-name';
 
 /** Validate our declarations only; downloaded TVBox objects remain permissive. */
 export function decodeLiveSources(raw: string | null): LiveSourceEntry[] {
@@ -11,7 +12,8 @@ export function decodeLiveSources(raw: string | null): LiveSourceEntry[] {
       throw new Error('Invalid manual live source entry');
     }
     new URL(entry.url);
-    return { name: 'name' in entry && typeof entry.name === 'string' ? entry.name : '', url: entry.url };
+    const name = 'name' in entry && typeof entry.name === 'string' ? entry.name : '';
+    return { name: sourceDisplayName({ name, url: entry.url }), url: entry.url };
   });
 }
 

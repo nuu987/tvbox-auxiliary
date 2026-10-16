@@ -484,6 +484,13 @@ export async function captureSourceBaseline(storage: Storage) {
 }
 export type SourceBaseline = Awaited<ReturnType<typeof captureSourceBaseline>>;
 
+/** Gate held. Optional source diagnostics need identities, not processing reports. */
+export async function sourceRootGenerations(storage: Storage, sources: SourceEntry[]): Promise<Record<string, string>> {
+  const registry = await loadRegistry(storage);
+  reconcile(registry, sources);
+  return Object.fromEntries(sources.map(source => [source.url, registry.nodes[source.url].generation]));
+}
+
 /** Caller holds the gate; migration composes these values with its policy/owned-output batch. */
 export function migrationSourceValues(baseline: SourceBaseline, sources: SourceEntry[], checkedLeaves: Set<string>) {
   const registry = flattenRegistry(baseline.registry, sources);

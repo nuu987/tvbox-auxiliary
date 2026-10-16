@@ -6,40 +6,10 @@ import { safeFileName } from './site-store';
 import { logger } from './logger';
 import { retryDownload, DOWNLOAD_DEADLINE_MS } from './download-retry';
 import * as fs from 'fs';
+import { parseSpiderString, jarDeclaration, jarCacheKey, type JarDeclaration } from './jar-identity';
+export { parseSpiderString } from './jar-identity';
 
 const JAR_PREFIX = 'jar:';
-
-/**
- * 解析 spider/jar 字符串
- *
- * 格式：{prefix}{url};md5;{hash}  或  {prefix}{url}
- * prefix 可能是 "img+" 或空
- */
-export function parseSpiderString(spider: string): {
-  prefix: string;
-  url: string;
-  md5: string | null;
-  raw: string;
-} {
-  let prefix = '';
-  let rest = spider;
-
-  // 提取 img+ 前缀
-  if (rest.startsWith('img+')) {
-    prefix = 'img+';
-    rest = rest.substring(4);
-  }
-
-  // 分离 ;md5;hash
-  const md5Idx = rest.indexOf(';md5;');
-  if (md5Idx !== -1) {
-    const url = rest.substring(0, md5Idx);
-    const md5 = rest.substring(md5Idx + 5);
-    return { prefix, url, md5, raw: spider };
-  }
-
-  return { prefix, url: rest, md5: null, raw: spider };
-}
 
 /**
  * 为 URL 生成短 key（无 MD5 时使用）
@@ -64,7 +34,7 @@ export async function urlToKey(url: string): Promise<string> {
 function buildRewrittenSpider(
   spider: string,
   baseUrl: string,
-  urlKeyMap: Map<string, string>,
+  identityKeyMap: Map<string, string>,
 ): string | null {
   if (!spider) return null;
 
@@ -73,7 +43,8 @@ function buildRewrittenSpider(
     return null;
   }
 
-  const key = urlKeyMap.get(parsed.url);
+  const declaration = jarDeclaration(spider);
+  const key = declaration && identityKeyMap.get(declaration.identity);
   if (!key) return null;
 
   const proxyUrl = `${baseUrl.replace(/\/$/, '')}/jar/${key}`;
@@ -83,21 +54,19 @@ function buildRewrittenSpider(
   return `${parsed.prefix}${proxyUrl}`;
 }
 
-export interface JarResource {
-  url: string;
+export interface JarResource extends JarDeclaration {
   key: string;
-  md5: string | null;
   index: number;
 }
 
 /** Plan original JAR identities once, before any URL is rewritten. */
 export async function createJarResourcePlan(config: TVBoxConfig, storage: Storage): Promise<JarResource[]> {
-  const declarations = new Map<string, { md5: string | null; index: number }>();
+  const declarations = new Map<string, { declaration: JarDeclaration; index: number }>();
   const add = (value: string | undefined, index: number) => {
     if (!value) return;
-    const { url, md5 } = parseSpiderString(value);
-    if ((url.startsWith('http://') || url.startsWith('https://')) && !declarations.has(url)) {
-      declarations.set(url, { md5, index });
+    const declaration = jarDeclaration(value);
+    if (declaration && !declarations.has(declaration.identity)) {
+      declarations.set(declaration.identity, { declaration, index });
     }
   };
   // The shared spider has no required site.jar declaration; give it a cache directory too.
@@ -105,21 +74,20 @@ export async function createJarResourcePlan(config: TVBoxConfig, storage: Storag
   (config.sites || []).forEach((site, index) => add(site.jar, index));
 
   const resources: JarResource[] = [];
-  for (const [url, declaration] of declarations) {
-    const { md5 } = declaration;
-    const key = md5 || await urlToKey(url);
-    let index = declaration.index;
+  for (const { declaration, index: ownerIndex } of declarations.values()) {
+    const key = jarCacheKey(declaration);
+    let index = ownerIndex;
     const previous = await storage.get(`jar-source:${key}`);
     if (previous) {
       try {
         const mapping: unknown = JSON.parse(previous);
-        if (mapping && typeof mapping === 'object' && 'index' in mapping
+        if (mapping && typeof mapping === 'object' && 'identity' in mapping && mapping.identity === declaration.identity && 'index' in mapping
           && typeof mapping.index === 'number' && Number.isSafeInteger(mapping.index) && mapping.index >= 0) {
           index = mapping.index;
         }
       } catch { /* Use the current owner when the previous mapping is malformed. */ }
     }
-    resources.push({ url, key, md5, index });
+    resources.push({ ...declaration, key, index });
   }
   return resources;
 }
@@ -128,7 +96,7 @@ export async function createJarResourcePlan(config: TVBoxConfig, storage: Storag
  * 改写合并后配置中的所有 JAR URL
  *
  * 两步走：
- * 1. 收集所有唯一 JAR URL → 生成 key → 批量写 KV（~10 次写入）
+ * 1. 收集完整 JAR 声明身份 → 生成 key → 写入映射
  * 2. 纯内存改写 spider/jar 字段（不再触发 KV 写入）
  */
 export async function rewriteJarUrls(
@@ -144,37 +112,37 @@ export async function rewriteJarUrls(
     return config;
   }
 
-  // Step 2: 为每个唯一 URL 生成 key + 批量写 KV + jar-source 映射
-  const urlKeyMap = new Map<string, string>(); // url → key
+  // One stable proxy/cache mapping per complete declaration.
+  const identityKeyMap = new Map<string, string>();
 
-  for (const { url, key, index } of planned) {
-    urlKeyMap.set(url, key);
+  for (const { url, key, index, identity } of planned) {
+    identityKeyMap.set(identity, key);
     await storage.put(`${JAR_PREFIX}${key}`, url);
     const name = safeFileName(url);
-    await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name }));
+    await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name, identity, version: 2 }));
     logger.info('jar-proxy', `Mapped ${key} → ${url.substring(0, 60)}...`);
   }
 
-  logger.info('jar-proxy', `Wrote ${urlKeyMap.size} KV mappings`);
+  logger.info('jar-proxy', `Wrote ${identityKeyMap.size} KV mappings`);
 
   // Step 3: 纯内存改写
   const result = { ...config };
 
   if (result.spider) {
-    const rewritten = buildRewrittenSpider(result.spider, baseUrl, urlKeyMap);
+    const rewritten = buildRewrittenSpider(result.spider, baseUrl, identityKeyMap);
     if (rewritten) result.spider = rewritten;
   }
 
   if (result.sites) {
     result.sites = result.sites.map((site) => {
       if (!site.jar) return site;
-      const rewritten = buildRewrittenSpider(site.jar, baseUrl, urlKeyMap);
+      const rewritten = buildRewrittenSpider(site.jar, baseUrl, identityKeyMap);
       if (rewritten) return { ...site, jar: rewritten };
       return site;
     });
   }
 
-  logger.info('jar-proxy', `Rewrote ${urlKeyMap.size} unique JAR URLs across config`);
+  logger.info('jar-proxy', `Rewrote ${identityKeyMap.size} JAR declarations across config`);
 
   // 确保 spider 在 JSON 输出中排在首位（对象字面量属性顺序）
   const { spider, ...rest } = result;
@@ -245,27 +213,29 @@ export interface SiteResource {
   url: string;
   type: string;
   index: number;
+  jarIdentity?: string;
 }
 
 export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[], spider?: string): SiteResource[] {
   const seen = new Map<string, SiteResource>();
   const resources: SiteResource[] = [];
-  const add = (url: string, type: string, index: number) => {
-    const existing = seen.get(url);
+  const add = (url: string, type: string, index: number, declaration = type === 'jar' ? jarDeclaration(url) : null) => {
+    const identity = declaration?.identity || url;
+    const existing = seen.get(identity);
     if (existing) {
       // Non-JAR rewriting writes mappings in traversal order; the last owner wins.
       if (existing.type !== 'jar' && type !== 'jar') existing.index = index;
       return;
     }
-    const resource = { url, type, index };
-    seen.set(url, resource);
+    const resource: SiteResource = { url, type, index, ...(declaration ? { jarIdentity: declaration.identity } : {}) };
+    seen.set(identity, resource);
     resources.push(resource);
   };
 
   if (spider) {
     const { url } = parseSpiderString(spider);
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      add(url, 'jar', 0);
+      add(url, 'jar', 0, jarDeclaration(spider));
     }
   }
 
@@ -274,7 +244,7 @@ export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[
     if (site.jar) {
       const parsed = parseSpiderString(site.jar);
       if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
-        add(parsed.url, 'jar', index);
+        add(parsed.url, 'jar', index, jarDeclaration(site.jar));
       }
     }
 

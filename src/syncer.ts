@@ -11,7 +11,7 @@ import { refreshLiveCache, pruneLiveCache, liveCacheProviders } from './core/liv
 import { supportedLives, liveAddress } from './core/live-source';
 import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, EDGE_PROXIES, SEARCH_QUOTA_REPORT, BASE_URL_PLACEHOLDER } from './core/config';
 import { loadLivePolicy } from './core/live-policy';
-import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
+import { loadBlacklist, applyBlacklist, pruneStoredBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
 import { parseConfigJson } from './core/fetcher';
 import { scrapeSourceList, scrapeMacCMSSources, type ScrapeSourceConfig, type ScrapeMacCMSConfig } from './core/source-scraper';
@@ -256,12 +256,16 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     lives: source.config.lives?.length || 0,
   }));
   const mergeResult = mergeConfigs(allConfigs);
+  for (const conflict of mergeResult.jarConflicts) logger.warnFields('merger', 'jar-md5-conflict', {
+    message: '同一JAR地址存在不同MD5声明，已分别保留', url: conflict.url,
+    md5s: conflict.md5s, sources: conflict.sources.map(source => source.name),
+  });
   let merged = mergeResult.config;
   logger.infoFields('sync', 'merge-output', configCounts(merged));
 
   // Step 4.5: 黑名单过滤
   logger.info('sync', 'Step 4.5: Applying blacklist...');
-  const blacklist = await loadBlacklist(storage);
+  let blacklist = await loadBlacklist(storage);
   const hasBlacklist = blacklist.sites.length > 0 || blacklist.parses.length > 0 || blacklist.lives.length > 0 || blacklist.regexRules.length > 0;
   logger.infoFields('sync', 'blacklist-inventory', {
     sites: blacklist.sites.length,
@@ -276,9 +280,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
 
   if (hasBlacklist) {
     // 自动清理黑名单中已不存在的条目（必须在过滤前比对，否则被屏蔽的条目会被误判为"过时"而清掉）
-    const pruned = await pruneBlacklist(blacklist, merged);
+    const pruned = await pruneStoredBlacklist(storage, merged);
     if (JSON.stringify(pruned) !== JSON.stringify(blacklist)) {
-      await saveBlacklist(storage, pruned);
       logger.infoFields('sync', 'blacklist-pruned', {
         sitesBefore: blacklist.sites.length,
         sitesAfter: pruned.sites.length,
@@ -289,6 +292,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
       });
     }
 
+    blacklist = pruned;
     const { config: filtered, removedSites, removedParses, removedLives, removedByRegex, removedItems } = await applyBlacklist(merged, pruned);
     merged = filtered;
     removedItems.forEach((item) => logger.infoFields('sync', 'blacklist-removed-item', {
@@ -396,7 +400,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
 
   // Step 6.8: Capture original URLs and shared JAR identities before proxy rewriting.
   const jarResources = await createJarResourcePlan(merged, storage);
-  const jarResourceByUrl = new Map(jarResources.map(resource => [resource.url, resource]));
+  const jarResourceByIdentity = new Map(jarResources.map(resource => [resource.identity, resource]));
   const resources = collectAllSiteResources(merged.sites || [], merged.parses, merged.spider);
   const sorted = sortResourcesByPriority(resources, merged.spider);
 
@@ -425,8 +429,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
       let failed = 0;
       let copiedFromLive = 0;
 
-      for (const { url, type, index } of sorted) {
-        const jarResource = type === 'jar' ? jarResourceByUrl.get(url) : undefined;
+      for (const { url, type, index, jarIdentity } of sorted) {
+        const jarResource = jarIdentity ? jarResourceByIdentity.get(jarIdentity) : undefined;
         let key: string | null = null;
 
         if (type === 'jar') {
@@ -560,6 +564,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   await fallback.commit(async savedAt => {
     await publishAggregateOutputs(storage, ticket,
       { merged: mergedJson, full: fullJson, exported: exportJson, siteSourceNames: mergeResult.siteSourceNames,
+        jarDiagnostics: { conflicts: mergeResult.jarConflicts, generations: Object.fromEntries(sources
+          .map(source => [source.url, fallback.identity(source)?.generation || ''])) },
         liveDisabled: livePolicy.disabled }, savedAt);
   });
   try { await imports.consume(); }

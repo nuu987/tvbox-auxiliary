@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'crypto';
 import type { Storage } from '../storage/interface';
-import { EXPORT_CONFIG, LAST_UPDATE, MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY, SITE_SOURCE_ATTRIBUTION } from './config';
+import { EXPORT_CONFIG, LAST_UPDATE, MERGED_CONFIG, MERGED_CONFIG_FULL, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY, SITE_SOURCE_ATTRIBUTION, JAR_DECLARATION_DIAGNOSTICS } from './config';
 import { withSourceGate } from './source-gate';
 import { encodeSiteSourceAttribution, readSiteSourceNames } from './site-source-attribution';
 import { activationFailures, decodeOutputState as decode, type OutputState } from './aggregate-state';
 import { loadLivePolicy, applyStoredLivePolicy, type LivePolicy } from './live-policy';
+import { encodeJarDiagnostics, type JarDiagnosticsInput } from './jar-diagnostics';
 
 export interface OutputRunTicket { runId: string; epoch: string }
 interface AggregatePayloads {
@@ -15,6 +16,7 @@ interface AggregatePayloads {
 export interface AggregatePublication extends AggregatePayloads {
   siteSourceNames: string[][];
   liveDisabled: boolean;
+  jarDiagnostics?: JarDiagnosticsInput;
 }
 export interface AggregateOutputs extends AggregatePayloads {
   siteSourceNames: string[][] | null;
@@ -90,6 +92,7 @@ export async function publishAggregateOutputs(storage: Storage, ticket: OutputRu
     [EXPORT_CONFIG]: JSON.stringify(applyStoredLivePolicy(JSON.parse(outputs.exported), livePolicy)),
     [LAST_UPDATE]: savedAt,
     [SITE_SOURCE_ATTRIBUTION]: encodeSiteSourceAttribution(ticket.runId, outputs.full, outputs.siteSourceNames),
+    [JAR_DECLARATION_DIAGNOSTICS]: encodeJarDiagnostics(ticket.runId, outputs.full, outputs.jarDiagnostics),
     [SOURCE_OUTPUT_STATE]: JSON.stringify({ ...state, pending: false, blocked: false,
       published: { runId: ticket.runId, epoch: ticket.epoch, savedAt } }),
   });

@@ -2,14 +2,19 @@
 
 import type { Storage } from '../storage/interface';
 import type { TVBoxSite, TVBoxParse, TVBoxLive, TVBoxConfig, RegexRule, RegexValidationResult } from './types';
-import { BLACKLIST, BASE_URL_PLACEHOLDER } from './config';
+import { BLACKLIST, BASE_URL_PLACEHOLDER, MERGED_CONFIG_FULL } from './config';
+import { withSourceGate } from './source-gate';
+import { effectiveSiteJar } from './jar-identity';
 import { readAggregateOutputs, publishAggregatePatch } from './aggregate-output';
 import { applyStoredLivePolicy, type LivePolicy } from './live-policy';
 import { rewriteJarUrls } from './jar-proxy';
 import { logger } from './logger';
 
 export interface Blacklist {
-  sites: string[];                // site fingerprint: sha256(api|ext|jar)[:16]
+  sites: string[];
+  siteIdentityVersion?: 2;
+  legacySiteAliases?: Record<string, string[]>;
+  unresolvedLegacySites?: string[];
   parses: string[];               // parse url
   lives: string[];                // live url
   regexRules: RegexRule[];        // 正则屏蔽规则
@@ -32,46 +37,134 @@ export interface BlacklistRemovedItem {
 
 /**
  * 计算站点稳定指纹
- * 用 api+ext+jar 生成，不依赖 key（key 的 _2/_3 后缀不稳定）
+ * Fingerprints stay independent of generated key/name suffixes.
  */
-export async function siteFingerprint(site: TVBoxSite): Promise<string> {
-  const ext = typeof site.ext === 'string' ? site.ext : JSON.stringify(site.ext || '');
-  const raw = `${site.api}|${ext}|${site.jar || ''}`;
+async function fingerprintText(raw: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
-  const arr = new Uint8Array(buf);
-  return Array.from(arr.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(new Uint8Array(buf).slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/**
- * 从 KV 加载黑名单（防御性：失败时返回空黑名单，不中断聚合）
- */
-export async function loadBlacklist(storage: Storage): Promise<Blacklist> {
-  try {
-    const raw = await storage.get(BLACKLIST);
-    if (!raw) return EMPTY_BLACKLIST;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.sites) || !Array.isArray(parsed.parses) || !Array.isArray(parsed.lives)) {
-      logger.warn('blacklist', 'Invalid structure, skipping');
-      return EMPTY_BLACKLIST;
-    }
-    return {
-      sites: parsed.sites,
-      parses: parsed.parses,
-      lives: parsed.lives,
-      regexRules: Array.isArray(parsed.regexRules) ? parsed.regexRules : [],
-      regexBlockOverrides: Array.isArray(parsed.regexBlockOverrides) ? parsed.regexBlockOverrides : [],
-    };
-  } catch (e) {
-    logger.error('blacklist', `Failed to load, skipping filter: ${e instanceof Error ? e.message : String(e)}`);
-    return EMPTY_BLACKLIST;
+export async function legacySiteFingerprint(site: TVBoxSite): Promise<string> {
+  const ext = typeof site.ext === 'string' ? site.ext : JSON.stringify(site.ext || '');
+  return fingerprintText(`${site.api}|${ext}|${site.jar || ''}`);
+}
+
+export async function siteFingerprint(site: TVBoxSite, spider?: string): Promise<string> {
+  const jar = effectiveSiteJar(site, spider);
+  if (!jar) return legacySiteFingerprint(site);
+  const ext = typeof site.ext === 'string' ? site.ext : JSON.stringify(site.ext || '');
+  return 'j2:' + await fingerprintText(JSON.stringify([site.api, ext, jar.identity]));
+}
+
+/** Gate held by caller. Persist the one-time conversion before FULL can change. */
+async function loadBlacklistUnlocked(storage: Storage, loadedRaw?: string): Promise<Blacklist> {
+  const raw = loadedRaw === undefined ? await storage.get(BLACKLIST) : loadedRaw;
+  const value: unknown = raw ? JSON.parse(raw) : { ...EMPTY_BLACKLIST };
+  const strings = (input: unknown): input is string[] => Array.isArray(input) && input.every(item => typeof item === 'string');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !('sites' in value) || !('parses' in value)
+    || !('lives' in value) || !strings(value.sites) || !strings(value.parses) || !strings(value.lives)) {
+    throw new Error('Invalid blacklist structure');
   }
+  const fields = value as Record<string, unknown>;
+  const legacySiteAliases: Record<string, string[]> = Object.create(null);
+  if (fields.siteIdentityVersion === 2) {
+    const aliases = fields.legacySiteAliases;
+    if (aliases !== undefined) {
+      if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) throw new Error('Invalid blacklist aliases');
+      for (const [id, targets] of Object.entries(aliases)) {
+        if (!strings(targets)) throw new Error('Invalid blacklist alias targets');
+        legacySiteAliases[id] = targets;
+      }
+    }
+    if (fields.unresolvedLegacySites !== undefined && !strings(fields.unresolvedLegacySites)) throw new Error('Invalid legacy blacklist records');
+  }
+  const blacklist: Blacklist = { sites: [...value.sites], parses: [...value.parses], lives: [...value.lives],
+    regexRules: Array.isArray(fields.regexRules) ? [...fields.regexRules] : [],
+    regexBlockOverrides: strings(fields.regexBlockOverrides) ? [...fields.regexBlockOverrides] : [],
+    ...(fields.siteIdentityVersion === 2 ? { siteIdentityVersion: 2 as const, legacySiteAliases,
+      unresolvedLegacySites: strings(fields.unresolvedLegacySites) ? [...fields.unresolvedLegacySites] : [] } : {}) };
+  if (blacklist.siteIdentityVersion === 2) {
+    // New non-JAR rows still use legacy-shaped fingerprints. Authorize only
+    // those exact current rows; never bind an unresolved old JAR record anew.
+    const fullRaw = await storage.get(MERGED_CONFIG_FULL);
+    try {
+      const full: TVBoxConfig | null = fullRaw ? JSON.parse(fullRaw) : null;
+      if (full && Array.isArray(full.sites)) for (const site of full.sites) {
+        if (effectiveSiteJar(site, full.spider)) continue;
+        const id = await legacySiteFingerprint(site);
+        if (!blacklist.unresolvedLegacySites?.includes(id)) {
+          const aliases = blacklist.legacySiteAliases ||= {};
+          if (!Object.prototype.hasOwnProperty.call(aliases, id)) aliases[id] = [id];
+        }
+      }
+    } catch { /* No new alias can be established from damaged optional FULL. */ }
+    return blacklist;
+  }
+  const aliases: Record<string, string[]> = Object.create(null);
+  const fullRaw = await storage.get(MERGED_CONFIG_FULL);
+  let full: TVBoxConfig | undefined;
+  try {
+    const parsed = fullRaw ? JSON.parse(fullRaw) : null;
+    if (parsed && Array.isArray(parsed.sites)) full = parsed;
+  } catch { /* Unknown old records are preserved, never rebound to a new global JAR. */ }
+  if (full) for (const site of full.sites || []) {
+    const old = await legacySiteFingerprint(site);
+    const current = await siteFingerprint(site, full.spider);
+    const ids = aliases[old] ||= [];
+    if (!ids.includes(current)) ids.push(current);
+  }
+  const unresolved: string[] = [];
+  const sites = new Set<string>();
+  for (const id of blacklist.sites) {
+    if (id.startsWith('j2:')) sites.add(id);
+    else if (aliases[id]) aliases[id].forEach(current => sites.add(current));
+    else unresolved.push(id);
+  }
+  const next: Blacklist = { ...blacklist, sites: [...sites], siteIdentityVersion: 2,
+    legacySiteAliases: aliases, unresolvedLegacySites: unresolved };
+  await saveBlacklist(storage, next);
+  if (unresolved.length) logger.warn('blacklist', `保留 ${unresolved.length} 条无法确认原站点归属的旧屏蔽记录，未扩大匹配`);
+  return next;
 }
 
-/**
- * 保存黑名单到 KV
- */
+export async function loadBlacklist(storage: Storage): Promise<Blacklist> {
+  const raw = await storage.get(BLACKLIST);
+  // Ordinary reads do not occupy the mutation gate. Only a pending format
+  // conversion needs a fresh read and write under it.
+  if (raw && JSON.parse(raw)?.siteIdentityVersion === 2) return loadBlacklistUnlocked(storage, raw);
+  return withSourceGate(storage, () => loadBlacklistUnlocked(storage));
+}
+
 export async function saveBlacklist(storage: Storage, blacklist: Blacklist): Promise<void> {
   await storage.put(BLACKLIST, JSON.stringify(blacklist));
+}
+
+export function mutateBlacklist<T>(storage: Storage, work: (blacklist: Blacklist) => T | Promise<T>): Promise<T> {
+  return withSourceGate(storage, async () => {
+    const blacklist = await loadBlacklistUnlocked(storage);
+    const result = await work(blacklist);
+    await saveBlacklist(storage, blacklist);
+    return result;
+  });
+}
+
+export class StaleSiteFingerprint extends Error {}
+export function resolveSiteIds(blacklist: Blacklist, id: string): string[] {
+  const aliases = blacklist.legacySiteAliases;
+  if (aliases && Object.prototype.hasOwnProperty.call(aliases, id)) return aliases[id];
+  if (/^[a-f0-9]{16}$/i.test(id) || blacklist.unresolvedLegacySites?.includes(id)) {
+    throw new StaleSiteFingerprint('站点信息已更新，请刷新页面后重试');
+  }
+  return [id];
+}
+
+/** Prune the latest value under the same gate as Admin mutations. */
+export function pruneStoredBlacklist(storage: Storage, config: TVBoxConfig): Promise<Blacklist> {
+  return mutateBlacklist(storage, async blacklist => {
+    const pruned = await pruneBlacklist(blacklist, config);
+    Object.assign(blacklist, pruned);
+    return blacklist;
+  });
 }
 
 const MAX_PATTERN_LENGTH = 200;
@@ -108,29 +201,23 @@ export function validateRegexPattern(pattern: string): RegexValidationResult {
 export async function saveRegexRule(storage: Storage, pattern: string): Promise<{ success: boolean; rule?: RegexRule; error?: string }> {
   const validation = validateRegexPattern(pattern);
   if (!validation.valid) return { success: false, error: validation.error };
-  const blacklist = await loadBlacklist(storage);
-  const rule: RegexRule = {
-    id: crypto.randomUUID(),
-    pattern,
-    createdAt: new Date().toISOString(),
-  };
-  blacklist.regexRules.push(rule);
-  await saveBlacklist(storage, blacklist);
-  return { success: true, rule };
+  return mutateBlacklist(storage, blacklist => {
+    const rule: RegexRule = { id: crypto.randomUUID(), pattern, createdAt: new Date().toISOString() };
+    blacklist.regexRules.push(rule);
+    return { success: true, rule };
+  });
 }
 
 /**
  * 删除正则屏蔽规则
  */
 export async function deleteRegexRule(storage: Storage, ruleId: string): Promise<{ success: boolean; error?: string }> {
-  const blacklist = await loadBlacklist(storage);
-  const index = blacklist.regexRules.findIndex(r => r.id === ruleId);
-  if (index === -1) {
-    return { success: false, error: '规则不存在' };
-  }
-  blacklist.regexRules.splice(index, 1);
-  await saveBlacklist(storage, blacklist);
-  return { success: true };
+  return mutateBlacklist(storage, blacklist => {
+    const index = blacklist.regexRules.findIndex(r => r.id === ruleId);
+    if (index === -1) return { success: false, error: '规则不存在' };
+    blacklist.regexRules.splice(index, 1);
+    return { success: true };
+  });
 }
 
 /**
@@ -215,7 +302,7 @@ export async function applyBlacklist(
   if (siteSet.size > 0) {
     const filtered: TVBoxSite[] = [];
     for (const site of sites) {
-      const fp = await siteFingerprint(site);
+      const fp = await siteFingerprint(site, config.spider);
       if (siteSet.has(fp)) {
         removedSites++;
         removedItems.push({
@@ -384,7 +471,7 @@ export async function pruneBlacklist(
   // 收集当前所有 site fingerprint
   const currentSiteFps = new Set<string>();
   for (const site of currentConfig.sites || []) {
-    currentSiteFps.add(await siteFingerprint(site));
+    currentSiteFps.add(await siteFingerprint(site, currentConfig.spider));
   }
 
   // 收集当前所有 parse url
@@ -409,6 +496,7 @@ export async function pruneBlacklist(
   }
 
   return {
+    ...blacklist,
     sites: prunedSites,
     parses: prunedParses,
     lives: prunedLives,

@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import { adminAuthMiddleware } from './admin-auth';
 import type { RuntimeState } from './admin-auth';
 import {
-  siteFingerprint, loadBlacklist, saveBlacklist,
+  loadBlacklist, mutateBlacklist, resolveSiteIds, StaleSiteFingerprint,
   saveRegexRule, deleteRegexRule, patchMergedConfig,
 } from '../core/blacklist';
 import { setDirtyMarker, clearDirtyMarker } from '../core/dirty-marker';
@@ -84,175 +84,44 @@ export function createBlacklistRouter(deps: BlacklistRouteDeps): Hono {
     return c.json({ rules: blacklist.regexRules });
   });
 
-  // ─── Blacklist CRUD ─────────────────────────────────────
-  router.post('/admin/blacklist', async (c) => {
-    let body: { type?: string; id?: string };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    const { type, id } = body;
-    if (!type || !id) return c.json({ error: 'type and id are required' }, 400);
-    if (!['sites', 'parses', 'lives', 'regexOverrides'].includes(type)) {
-      return c.json({ error: 'type must be sites, parses, lives, or regexOverrides' }, 400);
-    }
-
-    const t0 = performance.now();
-    try {
-      const blacklist = await loadBlacklist(storage);
-      if (type === 'regexOverrides') {
-        const beforeSize = blacklist.regexBlockOverrides.length;
-        if (!blacklist.regexBlockOverrides.includes(id)) {
-          blacklist.regexBlockOverrides.push(id);
-        }
-        await saveBlacklist(storage, blacklist);
-        await setDirtyMarker(storage);
-        const afterSize = blacklist.regexBlockOverrides.length;
-        logger.debugFields('blacklist', 'block', {
-          type, id, beforeSize, afterSize,
-          added: afterSize > beforeSize,
-          durationMs: Math.round(performance.now() - t0),
-        });
-        return c.json({ success: true });
-      }
-      const key = type as 'sites' | 'parses' | 'lives';
-      const list = blacklist[key];
-      const beforeSize = list.length;
-      if (!list.includes(id)) {
-        list.push(id);
-      }
-      await saveBlacklist(storage, blacklist);
-      await setDirtyMarker(storage);
-      const afterSize = list.length;
-      logger.debugFields('blacklist', 'block', {
-        type, id, beforeSize, afterSize,
-        added: afterSize > beforeSize,
-        durationMs: Math.round(performance.now() - t0),
-      });
-
-      return c.json({ success: true });
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.warnFields('blacklist', 'block-failed', {
-        type, id, error: msg,
-        durationMs: Math.round(performance.now() - t0),
-      });
-      return c.json({ error: 'Server error: ' + msg }, 500);
-    }
-  });
-
-  router.post('/admin/blacklist/batch', async (c) => {
-    let body: { type?: string; ids?: string[] };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    const { type, ids } = body;
-    if (!type || !Array.isArray(ids) || ids.length === 0) {
-      return c.json({ error: 'type and ids[] are required' }, 400);
-    }
-    if (ids.length > 500) {
-      return c.json({ error: 'Too many ids (max 500)' }, 400);
-    }
-    if (!['sites', 'parses', 'lives', 'regexOverrides'].includes(type)) {
-      return c.json({ error: 'type must be sites, parses, lives, or regexOverrides' }, 400);
-    }
-
-    const t0 = performance.now();
-    const blacklist = await loadBlacklist(storage);
-    const beforeSize = (blacklist[type as keyof typeof blacklist] as string[]).length;
-    if (type === 'regexOverrides') {
-      let added = 0;
-      for (const id of ids) {
-        if (typeof id === 'string' && !blacklist.regexBlockOverrides.includes(id)) {
-          blacklist.regexBlockOverrides.push(id);
-          added++;
-        }
-      }
-      await saveBlacklist(storage, blacklist);
-      await setDirtyMarker(storage);
-      const afterSize = blacklist.regexBlockOverrides.length;
-      logger.debugFields('blacklist', 'batch-block', {
-        type, requested: ids.length, added, beforeSize, afterSize,
-        durationMs: Math.round(performance.now() - t0),
-      });
-      return c.json({ success: true, added });
-    }
-    const list = blacklist[type as keyof typeof blacklist] as string[];
-    let added = 0;
-    for (const id of ids) {
-      if (typeof id === 'string' && !list.includes(id)) {
-        list.push(id);
-        added++;
-      }
-    }
-    await saveBlacklist(storage, blacklist);
-    await setDirtyMarker(storage);
-    const afterSize = list.length;
-    logger.debugFields('blacklist', 'batch-block', {
-      type, requested: ids.length, added, beforeSize, afterSize,
-      durationMs: Math.round(performance.now() - t0),
+  // All read/modify/write operations share the migration's short storage gate.
+  async function change(type: string, ids: string[], remove = false): Promise<number> {
+    return mutateBlacklist(storage, blacklist => {
+      const key = type === 'regexOverrides' ? 'regexBlockOverrides' : type as 'sites' | 'parses' | 'lives';
+      const resolved = type === 'sites' ? ids.flatMap(id => resolveSiteIds(blacklist, id)) : ids;
+      const before = blacklist[key].length;
+      if (remove) blacklist[key] = blacklist[key].filter(id => !resolved.includes(id));
+      else blacklist[key] = [...new Set([...blacklist[key], ...resolved])];
+      return Math.abs(blacklist[key].length - before);
     });
-
-    return c.json({ success: true, added });
-  });
-
-  router.delete('/admin/blacklist', async (c) => {
-    let body: { type?: string; id?: string };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON' }, 400);
-    }
-
-    const { type, id } = body;
-    if (!type || !id) return c.json({ error: 'type and id are required' }, 400);
-    if (!['sites', 'parses', 'lives', 'regexOverrides'].includes(type)) {
-      return c.json({ error: 'type must be sites, parses, lives, or regexOverrides' }, 400);
-    }
-
-    const t0 = performance.now();
-    try {
-      const blacklist = await loadBlacklist(storage);
-      if (type === 'regexOverrides') {
-        const beforeSize = blacklist.regexBlockOverrides.length;
-        blacklist.regexBlockOverrides = blacklist.regexBlockOverrides.filter(v => v !== id);
-        await saveBlacklist(storage, blacklist);
-        await setDirtyMarker(storage);
-        const afterSize = blacklist.regexBlockOverrides.length;
-        logger.debugFields('blacklist', 'unblock', {
-          type, id, beforeSize, afterSize,
-          removed: afterSize < beforeSize,
-          durationMs: Math.round(performance.now() - t0),
-        });
-        return c.json({ success: true });
+  }
+  for (const action of ['add', 'batch', 'remove'] as const) {
+    const path = action === 'batch' ? '/admin/blacklist/batch' : '/admin/blacklist';
+    const method = action === 'remove' ? 'delete' : 'post';
+    router[method](path, async c => {
+      let body: { type?: string; id?: string; ids?: string[] };
+      try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+      const type = body?.type;
+      const ids = action === 'batch' ? body?.ids : typeof body?.id === 'string' ? [body.id] : [];
+      if (!type || !['sites', 'parses', 'lives', 'regexOverrides'].includes(type)) {
+        return c.json({ error: 'type must be sites, parses, lives, or regexOverrides' }, 400);
       }
-      const key = type as 'sites' | 'parses' | 'lives';
-      const beforeSize = blacklist[key].length;
-      blacklist[key] = blacklist[key].filter(v => v !== id);
-      await saveBlacklist(storage, blacklist);
-      await setDirtyMarker(storage);
-      const afterSize = blacklist[key].length;
-      logger.debugFields('blacklist', 'unblock', {
-        type, id, beforeSize, afterSize,
-        removed: afterSize < beforeSize,
-        durationMs: Math.round(performance.now() - t0),
-      });
-
-      return c.json({ success: true });
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.warnFields('blacklist', 'unblock-failed', {
-        type, id, error: msg,
-        durationMs: Math.round(performance.now() - t0),
-      });
-      return c.json({ error: 'Server error: ' + msg }, 500);
-    }
-  });
+      if (!Array.isArray(ids) || !ids.length || ids.some(id => typeof id !== 'string' || !id)) {
+        return c.json({ error: action === 'batch' ? 'type and ids[] are required' : 'type and id are required' }, 400);
+      }
+      if (ids.length > 500) return c.json({ error: 'Too many ids (max 500)' }, 400);
+      try {
+        const changed = await change(type, ids, action === 'remove');
+        await setDirtyMarker(storage);
+        logger.debugFields('blacklist', action, { type, count: ids.length, changed });
+        return c.json({ success: true, ...(action === 'batch' ? { added: changed } : {}) });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn('blacklist', message);
+        return c.json({ error: message }, error instanceof StaleSiteFingerprint ? 409 : 500);
+      }
+    });
+  }
 
   // ─── 即时补丁 ──────────────────────────────────────────
   router.post('/admin/patch-config', async (c) => {

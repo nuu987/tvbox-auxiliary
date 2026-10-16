@@ -20,7 +20,10 @@ import { createExportConfigRouter } from '../src/routes/export-config';
 import { createCloudCredRouter } from '../src/routes/cloud-credentials';
 import { createRefreshRouter } from '../src/routes/refresh';
 import { createJarProxyRouter } from '../src/routes/jar-proxy';
-import { downloadResource, parseSpiderString, urlToKey } from '../src/core/jar-proxy';
+import { downloadResource, parseSpiderString, urlToKey, createJarResourcePlan } from '../src/core/jar-proxy';
+import { jarDeclaration, jarCacheKey } from '../src/core/jar-identity';
+import { createBlacklistRouter } from '../src/routes/blacklist';
+import { loadBlacklist, legacySiteFingerprint, siteFingerprint, applyBlacklist } from '../src/core/blacklist';
 import { getSiteResourceDir } from '../src/core/site-store';
 import { createLiveSourcesRouter } from '../src/routes/live-sources';
 import { createSettingsRouter } from '../src/routes/settings';
@@ -52,7 +55,7 @@ import { BLACKLIST, MANUAL_SOURCES, MERGED_CONFIG, LAST_UPDATE, SOURCE_CONFIG_SN
   SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, MACCMS_SOURCES,
   MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS,
   SITE_SOURCE_ATTRIBUTION, EDGE_PROXIES, LIVE_DISABLED, LIVE_SOURCES, SMART_JAR_URL_ENABLED,
-  LIVE_CACHE_STATE, NAME_TRANSFORM, SOURCE_IMPORT_CACHE } from '../src/core/config';
+  LIVE_CACHE_STATE, NAME_TRANSFORM, SOURCE_IMPORT_CACHE, JAR_DECLARATION_DIAGNOSTICS } from '../src/core/config';
 
 class MemoryStorage implements Storage {
   data = new Map<string, string>();
@@ -1837,7 +1840,7 @@ test('merge attributes all duplicate contributors without changing first content
   const before = JSON.stringify(sources); const merged = mergeConfigs(sources);
   assert.deepEqual(merged.config.sites!.map(s => [s.key, s.api, s.name]), [
     ['shared', 'csp_common', 'Winner'], ['conflict', 'csp_a', 'First'], ['other-key', 'csp_common', 'Other key'],
-    ['conflict_2', 'csp_b', 'Second(2)'], ['conflict_2', 'csp_b', 'Original suffix'],
+    ['conflict_3', 'csp_b', 'Second(3)'], ['conflict_2', 'csp_b', 'Original suffix'],
   ]);
   assert.deepEqual(merged.siteSourceNames, [['Same name', 'B', 'Same name'], ['Same name'], ['Same name'], ['B'], ['Same name']]);
   assert.equal(JSON.stringify(sources), before);
@@ -2305,7 +2308,7 @@ test('real Admin and shared transport rebuild the log window on EOF reconnect wi
 const manualOne = { name: '我的直播 <&> 🎬', url: 'https://manual.test/list.m3u?marker=__TVBOX_BASE_URL__&q=%22' };
 const manualTwo = { name: '', url: 'http://192.168.1.9/live.txt' };
 const automaticLive = { name: 'upstream live', type: 0, url: 'https://upstream.test/live.m3u' };
-const directLives = (...entries: { name: string; url: string }[]) => entries.map(entry => ({ ...entry, type: 0 }));
+const directLives = (...entries: { name: string; url: string }[]) => entries.map(entry => ({ ...entry, name: entry.name.trim() ? entry.name : entry.url, type: 0 }));
 async function seedLegacyLives(storage: Storage) {
   const raw = JSON.stringify({ ...leaf('legacy-vod'), lives: [automaticLive] });
   await storage.putMany({ [MERGED_CONFIG]: raw, [MERGED_CONFIG_FULL]: raw, [EXPORT_CONFIG]: raw, [LAST_UPDATE]: 'old-success' });
@@ -2416,11 +2419,61 @@ test('manual live CRUD stays authenticated and serializes concurrent additions a
   }
   const added = await Promise.all([liveMutation(storage, manualOne), liveMutation(storage, manualTwo)]);
   assert.deepEqual(added.map(result => result.status), [200, 200]);
-  assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), [manualOne, manualTwo]);
+  assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), [manualOne, { ...manualTwo, name: manualTwo.url }]);
   const duplicates = await Promise.all([liveMutation(storage, manualOne), liveMutation(storage, manualOne)]);
   assert.deepEqual(duplicates.map(result => result.status), [409, 409]);
   await Promise.all([liveMutation(storage, manualOne, 'DELETE'), liveMutation(storage, manualTwo, 'DELETE')]);
   assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), []);
+});
+
+test('new manual lives persist original URL names for missing, empty and whitespace-only names', async () => {
+  mockFetch(() => { throw new Error('Naming manual lives must not download'); });
+  for (const name of [undefined, '', ' \t ', ' 我的直播 🎬 ']) {
+    const storage = new MemoryStorage(); await seedLegacyLives(storage);
+    const url = 'https://manual.test/default-name.m3u?marker=__TVBOX_BASE_URL__&q=%22';
+    const expectedName = name?.trim() || url;
+    assert.equal((await liveMutation(storage, { name, url: '  ' + url + '  ' })).status, 200);
+    assert.deepEqual(JSON.parse((await storage.get(LIVE_SOURCES))!), [{ name: expectedName, url }]);
+    const [entry] = await liveStatusViews(storage);
+    assert.equal(entry.name, expectedName); assert.equal(entry.cacheStatus.label, '等待聚合');
+    for (const disabled of [true, false]) {
+      await setLiveDisabled(storage, disabled);
+      const views = await manualLiveViews(storage, cacheConfig);
+      for (const [index, view] of views.results.entries()) {
+        const live = view.lives!.at(-1)!;
+        assert.equal(live.name, expectedName);
+        if (index < 2) assert.match(live.url!, /\/live\/[a-f0-9]{64}\.m3u$/);
+        else assert.equal(live.url, url);
+      }
+    }
+  }
+});
+
+test('legacy unnamed manual lives gain original URL names without read-time writes or cache identity changes', async () => {
+  const storage = new MemoryStorage(); await seedLegacyLives(storage);
+  const entries = [
+    { name: '', url: 'https://legacy.test/empty.m3u' },
+    { name: ' \t ', url: 'https://legacy.test/blank.m3u' },
+    { url: 'https://legacy.test/missing.m3u' },
+    { name: ' 原有名称 🎬 ', url: 'https://legacy.test/named.m3u' },
+  ];
+  const raw = JSON.stringify(entries); await storage.put(LIVE_SOURCES, raw);
+  const before = await rawOutputs(storage); const stamp = await storage.get(LAST_UPDATE);
+  mockFetch(() => { throw new Error('Reading old names must not download'); });
+  const projected = await liveStatusViews(storage);
+  assert.deepEqual(projected.map(entry => entry.name), [...entries.slice(0, 3).map(entry => entry.url), entries[3].name]);
+  await assertManualViews(storage, entries.map((entry, index) => ({ name: projected[index].name, url: entry.url, type: 0 })), cacheConfig);
+  assert.equal(await storage.get(LIVE_SOURCES), raw);
+  assert.deepEqual(await rawOutputs(storage), before); assert.equal(await storage.get(LAST_UPDATE), stamp);
+  let requests = 0; mockFetch(() => { requests++; return new Response(playlistText()); });
+  await refreshLiveCache(storage, [{ ...projected[0], type: 0 }], 200, async () => true);
+  const key = liveCacheKey({ ...entries[0], type: 0 });
+  assert.equal(await (await jarApp(storage).request('/live/' + key + '.m3u')).text(), playlistText());
+  assert.equal(requests, 1);
+  const views = await manualLiveViews(storage, cacheConfig);
+  assert.equal(views.results[0].lives![0].name, entries[0].url);
+  assert.equal(views.results[2].lives![0].name, entries[0].url);
+  assert.equal(await storage.get(LIVE_SOURCES), raw);
 });
 
 test('setting changes apply immediately, enabled sources retain address objects, and legacy probe data remains inert', async () => {
@@ -3861,6 +3914,7 @@ test('URL-line and nameless directory children persist URL names without inherit
   }
 });
 
+const jarKey = (value: string) => jarCacheKey(jarDeclaration(value)!);
 const sharedJarUrl = 'https://resources.test/shared.jar?version=1';
 const declaredJarMd5 = '0123456789abcdef0123456789abcdef';
 
@@ -4004,6 +4058,7 @@ for (const failure of ['HTTP 401', 'connection reset']) {
 test('import stages original JAR references without downloading files, then aggregation prefetches from the staged config', async () => {
   const storage = new MemoryStorage();
   const upstream = { ...leaf('imported-jar'), spider: sharedJarUrl + ';md5;' + declaredJarMd5 };
+  const key = jarKey(upstream.spider);
   const calls: string[] = [];
   mockFetch(url => {
     calls.push(url); if (url === A.url) return response(upstream);
@@ -4012,14 +4067,14 @@ test('import stages original JAR references without downloading files, then aggr
   assert.equal((await sourceRequest(storage, A, '/admin/sources')).status, 200);
   assert.deepEqual(calls, [A.url]);
   assert.deepEqual(await storage.list('jar:'), []);
-  assert.equal(existsSync(path.join(getSiteResourceDir(0, 'jar'), declaredJarMd5 + '.jar')), false);
+  assert.equal(existsSync(path.join(getSiteResourceDir(0, 'jar'), key + '.jar')), false);
   assert.equal((await importCache(storage)).entries[A.url].config.spider, upstream.spider);
   await runSync(storage, config);
   assert.deepEqual(calls, [A.url, sharedJarUrl]);
   assert.equal((await status(storage)).records[0].acquisition, 'import-cache');
   assert.equal((await snapshot(storage)).config.spider, upstream.spider);
   assert.equal((await importCache(storage)).entries[A.url], undefined);
-  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + key);
   assert.equal(res.status, 200); assert.equal(await res.text(), 'imported JAR bytes');
   assert.deepEqual(calls, [A.url, sharedJarUrl]);
 });
@@ -4043,7 +4098,7 @@ for (const [label, prefix, md5] of [
     });
     await runSync(storage, config);
     assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]); // Legacy inspection precedes first actual acquisition.
-    const key = md5 || await urlToKey(sharedJarUrl);
+    const key = jarKey(declaration);
     const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
     assert.equal(merged.spider, prefix + '__TVBOX_BASE_URL__/jar/' + key + suffix);
     assert.equal(merged.sites![0].jar, undefined);
@@ -4093,15 +4148,15 @@ test('shared and distinct JARs use original URLs once, global priority and match
   assert.deepEqual(calls, [A.url, A.url, sharedJarUrl, alternate, plain]);
   const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
   const proxy = createJarProxyRouter({ storage, config });
-  const plainKey = await urlToKey(plain);
-  for (const [url, key, index] of [[sharedJarUrl, declaredJarMd5, 0], [alternate, alternateMd5, 0], [plain, plainKey, 4]] as const) {
+  const plainKey = jarKey(plain);
+  for (const [url, key, index] of [[sharedJarUrl, jarKey(shared), 0], [alternate, jarKey(alternateDeclaration), 0], [plain, plainKey, 4]] as const) {
     assert.equal(JSON.parse((await storage.get('jar-source:' + key))!).index, index);
     assert.equal(readFileSync(path.join(getSiteResourceDir(index, 'jar'), key + '.jar'), 'utf8'), 'bytes for ' + url);
     const res = await proxy.request('/jar/' + key); assert.equal(res.status, 200);
     assert.equal(await res.text(), 'bytes for ' + url);
   }
-  assert.equal(parseSpiderString(merged.sites![2].jar!).url, '__TVBOX_BASE_URL__/jar/' + declaredJarMd5);
-  assert.equal(parseSpiderString(merged.sites![3].jar!).url, '__TVBOX_BASE_URL__/jar/' + alternateMd5);
+  assert.equal(parseSpiderString(merged.sites![2].jar!).url, '__TVBOX_BASE_URL__/jar/' + jarKey(shared));
+  assert.equal(parseSpiderString(merged.sites![3].jar!).url, '__TVBOX_BASE_URL__/jar/' + jarKey(alternateDeclaration));
   assert.equal((await storage.list('jar:')).length, 3);
   assert.deepEqual(calls, [A.url, A.url, sharedJarUrl, alternate, plain]);
 });
@@ -4110,6 +4165,7 @@ test('site-only JAR with declared MD5 is downloaded into the same nonzero owner 
   const storage = new MemoryStorage(); await roots(storage, [A]);
   const upstream: TVBoxConfig = { sites: [leaf('without-jar').sites![0],
     { ...leaf('own-jar').sites![0], jar: sharedJarUrl + ';md5;' + declaredJarMd5 }] };
+  const key = jarKey(upstream.sites![1].jar!);
   const calls: string[] = [];
   mockFetch(url => {
     calls.push(url); if (url === A.url) return response(upstream);
@@ -4119,34 +4175,35 @@ test('site-only JAR with declared MD5 is downloaded into the same nonzero owner 
   assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]);
   const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
   assert.equal(merged.spider, undefined);
-  assert.equal(JSON.parse((await storage.get('jar-source:' + declaredJarMd5))!).index, 1);
-  assert.equal(readFileSync(path.join(getSiteResourceDir(1, 'jar'), declaredJarMd5 + '.jar'), 'utf8'), 'site-only bytes');
-  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  assert.equal(JSON.parse((await storage.get('jar-source:' + key))!).index, 1);
+  assert.equal(readFileSync(path.join(getSiteResourceDir(1, 'jar'), key + '.jar'), 'utf8'), 'site-only bytes');
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + key);
   assert.equal(res.status, 200); assert.equal(await res.text(), 'site-only bytes');
   assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]);
 });
 
-test('an existing JAR directory mapping preserves a valid legacy cache when its site index differs', async () => {
+test('an existing JAR directory mapping preserves a valid declaration-aware cache when its site index differs', async () => {
   const storage = new MemoryStorage(); await roots(storage, [A]);
   const upstream: TVBoxConfig = { sites: [leaf('first').sites![0],
     { ...leaf('legacy-owner').sites![0], jar: sharedJarUrl + ';md5;' + declaredJarMd5 }] };
+  const key = jarKey(upstream.sites![1].jar!);
   const previousDir = getSiteResourceDir(0, 'jar'); mkdirSync(previousDir, { recursive: true });
-  writeFileSync(path.join(previousDir, declaredJarMd5 + '.jar'), 'valid legacy bytes');
-  await storage.put('jar-source:' + declaredJarMd5, JSON.stringify({ index: 0, name: 'old.jar', hash: declaredJarMd5.slice(0, 8) }));
+  writeFileSync(path.join(previousDir, key + '.jar'), 'valid mapped bytes');
+  await storage.put('jar-source:' + key, JSON.stringify({ index: 0, name: 'old.jar', hash: key.slice(0, 8), identity: jarDeclaration(upstream.sites![1].jar!)!.identity, version: 2 }));
   const calls: string[] = [];
   mockFetch(url => { calls.push(url); assert.equal(url, A.url); return response(upstream); });
   await runSync(storage, config);
   assert.deepEqual(calls, [A.url, A.url]);
-  assert.equal(JSON.parse((await storage.get('jar-source:' + declaredJarMd5))!).index, 0);
-  assert.equal(readFileSync(path.join(previousDir, declaredJarMd5 + '.jar'), 'utf8'), 'valid legacy bytes');
-  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
-  assert.equal(res.status, 200); assert.equal(await res.text(), 'valid legacy bytes');
+  assert.equal(JSON.parse((await storage.get('jar-source:' + key))!).index, 0);
+  assert.equal(readFileSync(path.join(previousDir, key + '.jar'), 'utf8'), 'valid mapped bytes');
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + key);
+  assert.equal(res.status, 200); assert.equal(await res.text(), 'valid mapped bytes');
   assert.deepEqual(calls, [A.url, A.url]);
-  const mapping = await storage.get('jar-source:' + declaredJarMd5);
+  const mapping = await storage.get('jar-source:' + key);
   assert.equal((await patchMergedConfig(storage)).patched, true);
-  assert.equal(await storage.get('jar-source:' + declaredJarMd5), mapping);
-  const afterPatch = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
-  assert.equal(afterPatch.status, 200); assert.equal(await afterPatch.text(), 'valid legacy bytes');
+  assert.equal(await storage.get('jar-source:' + key), mapping);
+  const afterPatch = await createJarProxyRouter({ storage, config }).request('/jar/' + key);
+  assert.equal(afterPatch.status, 200); assert.equal(await afterPatch.text(), 'valid mapped bytes');
   assert.deepEqual(calls, [A.url, A.url]);
 });
 
@@ -4162,7 +4219,7 @@ test('failed refresh does not reuse an expired JAR, preserves peers and supports
     assert.equal(url, peer); return new Response('peer bytes');
   });
   await runSync(storage, config);
-  const key = await urlToKey(sharedJarUrl);
+  const key = jarKey(sharedJarUrl);
   const cachedFile = path.join(getSiteResourceDir(0, 'jar'), key + '.jar');
   const expired = new Date(Date.now() - 172_800_000);
   utimesSync(cachedFile, expired, expired);
@@ -4176,7 +4233,7 @@ test('failed refresh does not reuse an expired JAR, preserves peers and supports
   assert.equal((await status(storage)).records[0].status, 'OK');
   assert.equal((await status(storage)).records[0].consecutiveFailures, 0);
   const proxy = createJarProxyRouter({ storage, config });
-  const peerKey = await urlToKey(peer);
+  const peerKey = jarKey(peer);
   assert.equal(await (await proxy.request('/jar/' + peerKey)).text(), 'peer bytes');
   assert.equal((await proxy.request('/jar/' + key)).status, 502);
   assert.equal(existsSync(cachedFile), false);
@@ -4468,4 +4525,337 @@ test('shared login focuses only when authentication requires input and preserves
       assert.equal(loaded, 1, scenario);
     }
   }
+});
+
+
+const versionOne = sharedJarUrl + ';md5;' + 'a'.repeat(32);
+const versionTwo = sharedJarUrl + ';md5;' + 'b'.repeat(32);
+const jarSite = (key = 'movie', jar?: string): TVBoxSite => ({ key, name: key, type: 3, api: 'csp_Demo', ...(jar ? { jar } : {}) });
+const jarSource = (entry: SourceEntry, spider: string, sites = [jarSite()]) => ({ sourceUrl: entry.url, sourceName: entry.name, config: { spider, sites } });
+const jarApp = (storage: Storage) => createApp({ storage, config: cacheConfig, runtime: idleRuntime,
+  triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: 'busy' }) });
+async function jarSourceViews(storage: Storage) {
+  const result = await jarApp(storage).request('/admin/sources', { headers: adminHeaders });
+  assert.equal(result.status, 200);
+  return result.json() as Promise<Array<SourceEntry & { jarWarnings?: { message: string; url: string; md5s: (string | null)[] }[] }>>;
+}
+async function exportView(storage: Storage) {
+  const response = await jarApp(storage).request('/admin/export-config', { headers: adminHeaders });
+  assert.equal(response.status, 200);
+  return response.json() as Promise<TVBoxConfig>;
+}
+
+for (const variant of ['different URL', 'different MD5', 'different loading prefix'] as const) {
+  test('merge preserves distinct JAR declarations and correct origins: ' + variant, () => {
+    mockFetch(() => { throw new Error('merge must not fetch resources'); });
+    const second = variant === 'different URL' ? versionOne.replace('shared.jar', 'other.jar')
+      : variant === 'different MD5' ? versionTwo : 'img+' + versionOne;
+    const inputs = [jarSource(A, versionOne), jarSource(B, second), jarSource(N, versionOne, [jarSite('movie', versionOne)])];
+    const before = JSON.stringify(inputs);
+    const result = mergeConfigs(inputs);
+    assert.deepEqual(result.config.sites!.map(site => site.key), ['movie', 'movie_2']);
+    assert.equal(result.config.spider, versionOne);
+    assert.equal(result.config.sites![1].jar, second);
+    assert.deepEqual(result.siteSourceNames, [[A.name, N.name], [B.name]]);
+    assert.equal(result.jarConflicts.length, variant === 'different MD5' ? 1 : 0);
+    assert.equal(JSON.stringify(inputs), before);
+    assert.doesNotMatch(JSON.stringify(result.config), /identity|jarConflicts|sourceNames/);
+  });
+}
+
+test('global selection votes for full declaration identity and keeps the actual winning checksum', () => {
+  const result = mergeConfigs([jarSource(A, versionOne), jarSource(B, versionTwo, [jarSite('b1'), jarSite('b2')])]);
+  assert.equal(result.config.spider, versionTwo);
+  assert.equal(result.config.sites![0].jar, versionOne);
+  assert.equal(result.config.sites![1].jar, undefined);
+  const same = mergeConfigs([jarSource(A, versionOne), jarSource(B, versionOne.replace(';md5;' + 'a'.repeat(32), ';md5;' + 'A'.repeat(32)))]);
+  assert.equal(same.config.sites!.length, 1);
+  assert.deepEqual(same.siteSourceNames, [[A.name, B.name]]);
+  assert.equal(same.jarConflicts.length, 0);
+});
+
+test('generated site keys avoid all original suffixes and stay deterministic across repeated merges', () => {
+  const inputs = [jarSource(A, versionOne, [jarSite(), jarSite('movie_2'), jarSite('movie_3')]), jarSource(B, versionTwo)];
+  const first = mergeConfigs(inputs);
+  assert.deepEqual(first.config.sites!.map(site => site.key), ['movie', 'movie_2', 'movie_3', 'movie_4']);
+  assert.deepEqual(mergeConfigs(inputs), first);
+});
+
+test('same URL version declarations retain separate real files, proxies, export and healthy source status', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]);
+  const calls: string[] = []; let jarRequests = 0;
+  const events: LogEntry[] = []; restoreMocks.push(subscribeLogSink(event => { events.push(event); }));
+  mockFetch(url => {
+    calls.push(url);
+    if (url === A.url) return response(jarSource(A, versionOne).config);
+    if (url === B.url) return response(jarSource(B, versionTwo).config);
+    assert.equal(url, sharedJarUrl); return new Response(++jarRequests === 1 ? 'version-one-bytes' : 'version-two-bytes');
+  });
+  assert.equal((await runSync(storage, cacheConfig)).outcome, 'saved');
+  assert.equal(jarRequests, 2);
+  const full = JSON.parse((await storage.get(MERGED_CONFIG_FULL))!) as TVBoxConfig;
+  assert.equal(full.spider, versionOne); assert.equal(full.sites![1].jar, versionTwo);
+  assert.deepEqual(full.sites!.map(site => site.key), ['movie', 'movie_2']);
+  const app = jarApp(storage); const merged = await (await app.request('/')).json() as TVBoxConfig;
+  assert.equal(parseSpiderString(merged.spider!).url, cacheConfig.localBaseUrl + '/jar/' + jarKey(versionOne));
+  assert.equal(parseSpiderString(merged.sites![1].jar!).url, cacheConfig.localBaseUrl + '/jar/' + jarKey(versionTwo));
+  assert.notEqual(jarKey(versionOne), jarKey(versionTwo));
+  assert.equal(await (await app.request('/jar/' + jarKey(versionOne))).text(), 'version-one-bytes');
+  assert.equal(await (await app.request('/jar/' + jarKey(versionTwo))).text(), 'version-two-bytes');
+  const exported = await exportView(storage);
+  assert.equal(exported.spider, versionOne); assert.equal(exported.sites![1].jar, versionTwo);
+  assert.deepEqual(exported.sites!.map(site => site.key), ['movie', 'movie_2']);
+  assert.doesNotMatch(JSON.stringify(exported), /jarWarnings|jarConflicts|generation|identity|__TVBOX_BASE_URL__|sourceNames/);
+  assert.ok(!JSON.stringify(exported).includes('/jar/' + jarKey(versionOne)));
+  assert.equal(jarRequests, 2); // Neither export nor prefetched proxy reads download again.
+  assert.ok((await status(storage)).records.every((record: { status: string; consecutiveFailures: number }) => record.status === 'OK' && record.consecutiveFailures === 0));
+  assert.ok((await jarSourceViews(storage)).every(source => source.jarWarnings?.length === 1));
+  assert.equal(events.filter(event => event.scope === 'merger' && event.message.includes('jar-md5-conflict')).length, 1);
+  const publicStatus = await (await app.request('/source-status')).text();
+  assert.doesNotMatch(publicStatus, /jarWarnings|jar_md5_conflict|md5s|fullHash/);
+  assert.equal((await app.request('/admin/sources')).status, 401);
+  calls.length = 0; await runSync(storage, cacheConfig);
+  assert.ok(calls.every(url => url === A.url || url === B.url)); // Both identities retain their own valid file.
+});
+
+test('different JAR URLs with identical MD5 and identical bytes remain independent resources', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]);
+  const other = versionOne.replace('shared.jar', 'same-content.jar'); const calls: string[] = [];
+  mockFetch(url => {
+    if (url === A.url || url === B.url) return response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : other).config);
+    calls.push(url); return new Response('exactly-identical-bytes');
+  });
+  await runSync(storage, cacheConfig);
+  assert.equal(calls.length, 2); assert.equal(new Set(calls).size, 2);
+  const exported = await exportView(storage); assert.equal(exported.sites!.length, 2);
+  assert.equal(exported.sites![1].jar, other);
+  assert.notEqual(jarKey(versionOne), jarKey(other));
+  assert.equal(await storage.get('jar:' + jarKey(versionOne)), sharedJarUrl);
+  assert.equal(await storage.get('jar:' + jarKey(other)), parseSpiderString(other).url);
+  assert.ok((await jarSourceViews(storage)).every(source => !source.jarWarnings));
+});
+
+test('a legacy MD5 cache is not rebound to a new declaration identity during cold transition', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const oldKey = 'a'.repeat(32); const dir = getSiteResourceDir(0, 'jar'); mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, oldKey + '.jar'), 'unknown-legacy-bytes');
+  await storage.put('jar:' + oldKey, 'https://legacy.test/different.jar');
+  await storage.put('jar-source:' + oldKey, JSON.stringify({ index: 0, name: 'legacy.jar', hash: oldKey.slice(0, 8) }));
+  let requests = 0;
+  mockFetch(url => url === A.url ? response(jarSource(A, versionOne).config) : (requests++, new Response('new-identity-bytes')));
+  await runSync(storage, cacheConfig); assert.equal(requests, 1);
+  assert.equal(await storage.get('jar:' + oldKey), 'https://legacy.test/different.jar');
+  assert.equal(await (await jarApp(storage).request('/jar/' + jarKey(versionOne))).text(), 'new-identity-bytes');
+});
+
+test('conflict diagnostics follow successful publication, survive failures and clear on successful resolution', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]); let same = false;
+  mockFetch(url => url === A.url || url === B.url
+    ? response(jarSource(url === A.url ? A : B, url === A.url || same ? versionOne : versionTwo).config) : new Response('bytes'));
+  await runSync(storage, cacheConfig);
+  const before = await rawOutputs(storage); const diagnostic = await storage.get(JAR_DECLARATION_DIAGNOSTICS);
+  same = true; storage.failPut = JAR_DECLARATION_DIAGNOSTICS;
+  assert.equal((await runSync(storage, cacheConfig)).outcome, 'failed'); storage.failPut = undefined;
+  assert.deepEqual(await rawOutputs(storage), before);
+  assert.equal(await storage.get(JAR_DECLARATION_DIAGNOSTICS), diagnostic);
+  assert.ok((await jarSourceViews(storage)).every(source => source.jarWarnings?.length === 1));
+  await runSync(storage, cacheConfig);
+  assert.ok((await jarSourceViews(storage)).every(source => !source.jarWarnings));
+  assert.equal((await exportView(storage)).sites!.length, 1);
+});
+
+test('deleted and re-added source generations cannot inherit an old JAR conflict warning', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]);
+  mockFetch(url => url === A.url || url === B.url
+    ? response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : versionTwo).config) : new Response('bytes'));
+  await runSync(storage, cacheConfig);
+  await roots(storage, [B]); assert.deepEqual((await jarSourceViews(storage)).map(source => source.url), [B.url]);
+  await roots(storage, [B, A]); const entries = await jarSourceViews(storage);
+  assert.equal(entries[0].jarWarnings!.length, 1); assert.equal(entries[1].jarWarnings, undefined);
+});
+
+test('restored source snapshots retain their JAR conflict and provenance without hiding acquisition failure', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]); let failA = false;
+  mockFetch(url => {
+    if (url === A.url && failA) throw new Error('fixture source unavailable');
+    return url === A.url || url === B.url
+      ? response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : versionTwo).config) : new Response('bytes');
+  });
+  await runSync(storage, cacheConfig);
+  const firstSnapshot = await snapshot(storage, A);
+  failA = true;
+  assert.equal((await runSync(storage, cacheConfig)).outcome, 'saved');
+  const record = (await status(storage)).records.find((source: { url: string }) => source.url === A.url);
+  assert.equal(record.status, 'ERR'); assert.equal(record.consecutiveFailures, 1);
+  assert.equal(record.aggregation.latest.mode, 'restored');
+  assert.equal(record.aggregation.lastSuccessful.fallbackApplied, true);
+  assert.equal((await snapshot(storage, A)).savedAt, firstSnapshot.savedAt);
+  assert.ok((await jarSourceViews(storage)).every(source => source.jarWarnings?.length === 1));
+  const outputs = await readAggregateOutputs(storage);
+  assert.deepEqual(outputs!.siteSourceNames, [[A.name], [B.name]]);
+  const exported = await exportView(storage);
+  assert.equal(exported.sites!.length, 2); assert.equal(exported.spider, versionOne);
+  assert.equal(exported.sites![1].jar, versionTwo);
+});
+
+test('damaged, stale or unavailable optional JAR diagnostics never poison config or source-list reads', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]);
+  mockFetch(url => url === A.url || url === B.url
+    ? response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : versionTwo).config) : new Response('bytes'));
+  await runSync(storage, cacheConfig);
+  const raw = (await storage.get(JAR_DECLARATION_DIAGNOSTICS))!;
+  for (const damaged of ['{', JSON.stringify({ ...JSON.parse(raw), runId: 'stale' }), JSON.stringify({ ...JSON.parse(raw), fullHash: 'wrong' })]) {
+    await storage.put(JAR_DECLARATION_DIAGNOSTICS, damaged);
+    assert.ok((await jarSourceViews(storage)).every(source => !source.jarWarnings));
+    assert.equal((await jarApp(storage).request('/')).status, 200);
+    assert.equal((await exportView(storage)).sites!.length, 2);
+  }
+  storage.failGet = JAR_DECLARATION_DIAGNOSTICS;
+  assert.equal((await jarSourceViews(storage)).length, 2);
+});
+
+test('a single interface with two MD5 declarations receives one warning without dropping either site', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const upstream = jarSource(A, versionOne, [jarSite('movie'), jarSite('explicit', versionTwo)]).config;
+  mockFetch(url => url === A.url ? response(upstream) : new Response('bytes'));
+  await runSync(storage, cacheConfig);
+  const [entry] = await jarSourceViews(storage);
+  assert.equal(entry.jarWarnings!.length, 1); assert.equal((await exportView(storage)).sites!.length, 2);
+});
+
+test('legacy inherited JAR blocking migrates using old FULL, not the next global choice', async () => {
+  const storage = new MemoryStorage();
+  const old = jarSource(A, versionOne).config; const oldId = await legacySiteFingerprint(old.sites[0]);
+  await storage.put(MERGED_CONFIG_FULL, JSON.stringify(old));
+  await storage.put(BLACKLIST, JSON.stringify({ sites: [oldId], parses: ['keep-parse'], lives: ['keep-live'], regexRules: [], regexBlockOverrides: ['keep-override'] }));
+  const blacklist = await loadBlacklist(storage);
+  const idA = await siteFingerprint(old.sites[0], versionOne);
+  assert.deepEqual(blacklist.sites, [idA]); assert.deepEqual(blacklist.legacySiteAliases![oldId], [idA]);
+  const next = { spider: versionTwo, sites: [jarSite('a', versionOne), jarSite('b')] };
+  assert.deepEqual((await applyBlacklist(next, blacklist)).config.sites!.map(site => site.key), ['b']);
+  await storage.put(MERGED_CONFIG_FULL, JSON.stringify(next));
+  assert.deepEqual((await loadBlacklist(storage)).sites, [idA]);
+  const router = createBlacklistRouter({ storage, config, runtime: idleRuntime });
+  const removed = await router.request('/admin/blacklist', { method: 'DELETE', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: oldId }) });
+  assert.equal(removed.status, 200); assert.deepEqual((await loadBlacklist(storage)).sites, []);
+  assert.deepEqual((await loadBlacklist(storage)).parses, ['keep-parse']);
+  assert.deepEqual((await loadBlacklist(storage)).regexBlockOverrides, ['keep-override']);
+});
+
+test('unresolved legacy blocks remain stored and never attach to a later FULL with a different JAR', async () => {
+  const storage = new MemoryStorage(); const oldId = await legacySiteFingerprint(jarSite());
+  await storage.put(BLACKLIST, JSON.stringify({ sites: [oldId], parses: [], lives: [] }));
+  assert.deepEqual((await loadBlacklist(storage)).unresolvedLegacySites, [oldId]);
+  await storage.put(MERGED_CONFIG_FULL, JSON.stringify(jarSource(A, versionTwo).config));
+  const loaded = await loadBlacklist(storage); assert.deepEqual(loaded.sites, []);
+  assert.deepEqual(loaded.unresolvedLegacySites, [oldId]);
+  const removed = await createBlacklistRouter({ storage, config, runtime: idleRuntime }).request('/admin/blacklist', {
+    method: 'DELETE', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: oldId }) });
+  assert.equal(removed.status, 409);
+});
+
+test('a failed legacy block conversion cannot publish new FULL or silently reset settings', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const old = jarSource(A, versionOne).config; const raw = JSON.stringify(old);
+  const blacklist = JSON.stringify({ sites: [await legacySiteFingerprint(old.sites[0])], parses: [], lives: [] });
+  await storage.putMany({ [MERGED_CONFIG_FULL]: raw, [MERGED_CONFIG]: raw, [EXPORT_CONFIG]: raw, [BLACKLIST]: blacklist });
+  storage.failPut = BLACKLIST;
+  mockFetch(() => response(jarSource(A, versionTwo).config));
+  assert.equal((await runSync(storage, cacheConfig)).outcome, 'failed');
+  assert.deepEqual(await rawOutputs(storage), [raw, raw, raw]);
+  assert.equal(await storage.get(BLACKLIST), blacklist);
+});
+
+test('JAR variants block and restore independently in editor, main and export including instant patches', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]); let requests = 0;
+  mockFetch(url => { requests++; return url === A.url || url === B.url
+    ? response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : versionTwo).config) : new Response('bytes'); });
+  await runSync(storage, cacheConfig); const before = requests;
+  const sites = await editorSites(storage); assert.notEqual(sites[0].fingerprint, sites[1].fingerprint);
+  const app = jarApp(storage);
+  const block = await app.request('/admin/blacklist', { method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: sites[0].fingerprint }) });
+  assert.equal(block.status, 200); assert.equal((await patchMergedConfig(storage)).patched, true);
+  assert.deepEqual((await exportView(storage)).sites!.map(site => site.key), ['movie_2']);
+  const main = await (await app.request('/')).json() as TVBoxConfig; assert.equal(main.sites!.length, 1);
+  assert.equal(parseSpiderString(main.sites![0].jar!).url, cacheConfig.localBaseUrl + '/jar/' + jarKey(versionTwo));
+  assert.deepEqual((await editorSites(storage)).map(site => site.blocked), [true, false]);
+  assert.ok((await jarSourceViews(storage)).every(source => source.jarWarnings!.length === 1));
+  const unblock = await app.request('/admin/blacklist', { method: 'DELETE', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: sites[0].fingerprint }) });
+  assert.equal(unblock.status, 200); await patchMergedConfig(storage);
+  assert.equal((await exportView(storage)).sites!.length, 2);
+  assert.equal(requests, before); // Patching, UI reads and export perform no upstream requests.
+});
+
+test('concurrent blacklist mutations preserve both identities and migration metadata', async () => {
+  const storage = new MemoryStorage(); await storage.put(MERGED_CONFIG_FULL, JSON.stringify({ spider: versionOne, sites: [jarSite('a'), jarSite('b', versionTwo)] }));
+  await loadBlacklist(storage);
+  const ids = [await siteFingerprint(jarSite('a'), versionOne), await siteFingerprint(jarSite('b', versionTwo), versionOne)];
+  const router = createBlacklistRouter({ storage, config, runtime: idleRuntime });
+  const results = await Promise.all(ids.map(id => router.request('/admin/blacklist', { method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id }) })));
+  assert.ok(results.every(response => response.status === 200));
+  const blacklist = await loadBlacklist(storage); assert.deepEqual(new Set(blacklist.sites), new Set(ids));
+  assert.equal(blacklist.siteIdentityVersion, 2); assert.ok(blacklist.legacySiteAliases);
+});
+
+
+test('missing MD5 is a separate declaration but checksum casing and unreferenced spiders do not create false conflicts', () => {
+  const result = mergeConfigs([jarSource(A, sharedJarUrl), jarSource(B, versionOne)]);
+  assert.deepEqual(result.jarConflicts[0].md5s, [null, 'a'.repeat(32)]);
+  assert.equal(result.config.sites!.length, 2);
+  const unused = mergeConfigs([jarSource(A, versionOne, [jarSite('explicit', 'https://other.test/actual.jar')]),
+    jarSource(B, versionTwo, [jarSite('second', 'https://other.test/actual.jar')])]);
+  assert.equal(unused.jarConflicts.length, 0); assert.equal(unused.config.spider, undefined);
+});
+
+test('an expired failing version cannot fall back to another version at the same origin URL', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A, B]); let failing = false; let downloads = 0;
+  mockFetch(url => {
+    if (url === A.url || url === B.url) return response(jarSource(url === A.url ? A : B, url === A.url ? versionOne : versionTwo).config);
+    downloads++; return failing ? new Response('', { status: 503 }) : new Response('separate cached bytes');
+  });
+  await runSync(storage, cacheConfig);
+  const key = jarKey(versionTwo); const mapping = JSON.parse((await storage.get('jar-source:' + key))!);
+  const file = path.join(getSiteResourceDir(mapping.index, 'jar'), key + '.jar');
+  utimesSync(file, new Date(0), new Date(0)); failing = true; downloads = 0;
+  assert.equal((await runSync(storage, cacheConfig)).outcome, 'saved');
+  assert.equal(downloads, 3); // Only the expired declaration refreshes, using the existing retry policy.
+  assert.equal(existsSync(file), false);
+  const app = jarApp(storage);
+  assert.equal(await (await app.request('/jar/' + jarKey(versionOne))).text(), 'separate cached bytes');
+  assert.equal((await app.request('/jar/' + key)).status, 502);
+  assert.equal((await exportView(storage)).sites!.length, 2);
+  assert.ok((await status(storage)).records.every((record: { status: string }) => record.status === 'OK'));
+});
+
+test('unavailable source identity metadata hides optional warnings without failing source management', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]); storage.failGet = SOURCE_CONFIG_SNAPSHOTS;
+  const entries = await jarSourceViews(storage);
+  assert.equal(entries.length, 1); assert.equal(entries[0].url, A.url); assert.equal(entries[0].jarWarnings, undefined);
+});
+
+test('damaged version-two blacklist metadata fails explicitly and never saves an empty replacement', async () => {
+  const storage = new MemoryStorage(); const corrupt = JSON.stringify({ sites: [], parses: [], lives: [], siteIdentityVersion: 2, legacySiteAliases: { old: 'not-an-array' } });
+  await storage.put(BLACKLIST, corrupt);
+  await assert.rejects(loadBlacklist(storage), /alias/);
+  const response = await createBlacklistRouter({ storage, config, runtime: idleRuntime }).request('/admin/blacklist', {
+    method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: 'j2:new' }) });
+  assert.equal(response.status, 500); assert.equal(await storage.get(BLACKLIST), corrupt);
+});
+
+test('explicit legacy JAR blocks and new non-JAR batch blocks stay editable after identity migration', async () => {
+  const storage = new MemoryStorage(); const explicit = jarSite('explicit', versionOne);
+  const oldId = await legacySiteFingerprint(explicit);
+  await storage.put(MERGED_CONFIG_FULL, JSON.stringify({ spider: versionTwo, sites: [explicit] }));
+  await storage.put(BLACKLIST, JSON.stringify({ sites: [oldId], parses: [], lives: [] }));
+  const migrated = await loadBlacklist(storage);
+  assert.deepEqual(migrated.sites, [await siteFingerprint(explicit, versionTwo)]);
+  const newSites: TVBoxSite[] = [{ key: 'json', type: 1, api: 'https://json.test/api' }, { key: 'xml', type: 0, api: 'https://xml.test/api' }];
+  await storage.put(MERGED_CONFIG_FULL, JSON.stringify({ sites: newSites }));
+  const ids = await Promise.all(newSites.map(site => siteFingerprint(site)));
+  const router = createBlacklistRouter({ storage, config, runtime: idleRuntime });
+  const response = await router.request('/admin/blacklist/batch', { method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', ids }) });
+  assert.equal(response.status, 200); assert.equal((await response.json() as { added: number }).added, 2);
+  const after = await loadBlacklist(storage); assert.ok(ids.every(id => after.sites.includes(id)));
+  const removed = await router.request('/admin/blacklist', { method: 'DELETE', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'sites', id: ids[0] }) });
+  assert.equal(removed.status, 200); assert.ok(!(await loadBlacklist(storage)).sites.includes(ids[0]));
 });
