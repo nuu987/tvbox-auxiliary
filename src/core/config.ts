@@ -124,3 +124,4 @@ export const KV_GROUP_ORDER = 'group_order';
 
 // 高级去重配置
 export const KV_DEDUP_CONFIG = 'dedup_config';
+export const SOURCE_IMPORT_CACHE = 'source_import_cache';

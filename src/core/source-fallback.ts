@@ -9,6 +9,9 @@ import { isMultiRepoConfig } from './fetcher';
 import { prepareSourceLeaf } from './source-leaf';
 import { readImportPolicy } from './source-import-state';
 import { logger } from './logger';
+import { importCacheValue, type AcceptedImport } from './source-import-cache';
+import { SOURCE_IMPORT_CACHE } from './config';
+import { sourceDisplayName } from './source-name';
 
 type Kind = 'leaf' | 'index';
 type FailureStage = 'acquisition' | 'local_read' | 'preparation';
@@ -22,6 +25,7 @@ interface Snapshot {
   config: TVBoxConfig;
 }
 interface Node {
+  importedAt?: string;
   fingerprint: string;
   generation: string;
   name: string;
@@ -123,6 +127,7 @@ async function loadRegistry(storage: Storage): Promise<Registry> {
         || typeof value.name !== 'string'
         || (data.version === 1 && (!Array.isArray(value.children) || value.children.some(c => typeof c !== 'string')))) continue;
       const node: Node = { fingerprint: value.fingerprint, generation: value.generation, name: value.name };
+      if (typeof value.importedAt === 'string' && Number.isFinite(Date.parse(value.importedAt))) node.importedAt = value.importedAt;
       if (data.version === 1) node.children = value.children as string[];
       if (value.classification === 'leaf' || value.classification === 'index') node.classification = value.classification;
       const s = value.snapshot;
@@ -181,16 +186,23 @@ function revokedRoots(previous: Record<string, string>, sources: SourceEntry[]):
 }
 
 /** Caller holds the gate. Persist list, identities and pending output invalidation together. */
-export async function saveSourceRoots(storage: Storage, sources: SourceEntry[], extra: Record<string, string> = {}, checkedLeaves: string[] = []): Promise<void> {
+export async function saveSourceRoots(storage: Storage, sources: SourceEntry[], extra: Record<string, string> = {}, checkedLeaves: string[] = [], imported: AcceptedImport[] = []): Promise<void> {
   const previous = await rootsFromStorage(storage);
   const registry = await loadRegistry(storage);
   const revoked = revokedRoots(Object.fromEntries(previous.map(source => [source.url, fingerprint(source)])), sources)
     || revokedRoots(registry.roots, sources);
   let changed = reconcile(registry, sources);
+  const cachedAt = Date.now();
+  for (const item of imported) {
+    registry.nodes[item.entry.url].importedAt = new Date(cachedAt).toISOString();
+    registry.revision = randomUUID(); changed = true;
+  }
   for (const url of checkedLeaves) if (registry.nodes[url] && registry.nodes[url].classification !== 'leaf') {
     registry.nodes[url].classification = 'leaf'; changed = true; registry.revision = randomUUID();
   }
   const values: Record<string, string> = { ...extra, [MANUAL_SOURCES]: JSON.stringify(sources), [SOURCE_URLS]: JSON.stringify(sources) };
+  const cache = await importCacheValue(storage, registry, imported, cachedAt);
+  if (cache !== undefined) values[SOURCE_IMPORT_CACHE] = cache;
   if (changed || revoked) values[SOURCE_CONFIG_SNAPSHOTS] = JSON.stringify(registry);
   if (revoked) values[SOURCE_OUTPUT_STATE] = await pendingOutputState(storage);
   await storage.putMany(values);
@@ -266,9 +278,14 @@ export class SourceFallbackRound {
   }
 
   // Use the current persisted identity for each independent source.
-  source = (source: SourceEntry): SourceEntry => this.roots.get(source.url) || source;
+  source = (source: SourceEntry): SourceEntry => {
+    const current = this.roots.get(source.url) || source;
+    return { ...current, name: sourceDisplayName(current) };
+  };
 
-  sourceEntries(): SourceEntry[] { return copy([...this.roots.values()]); }
+  sourceEntries(): SourceEntry[] { return copy([...this.roots.values()].map(this.source)); }
+  identity(source: SourceEntry) { return this.baseline.nodes[source.url]; }
+  fresh(source: SourceEntry): boolean { return this.observations.get(source.url)?.mode === 'fresh'; }
 
   activeUrls(): Set<string> {
     return new Set([...Object.keys(this.baseline.nodes), ...Object.keys(this.staged.nodes)]);
@@ -480,17 +497,22 @@ export function migrationSourceValues(baseline: SourceBaseline, sources: SourceE
 export function rememberSourceMigration(storage: Storage, registry: SourceBaseline['registry']): void { rememberLifecycle(storage, registry); }
 
 /** Project only effective generation-matched independent source reports. */
-export async function sourceAggregationStatuses(storage: Storage): Promise<Map<string, { name: string; local: boolean; aggregation: SourceAggregationStatus }>> {
+export async function sourceAggregationStatuses(storage: Storage): Promise<Map<string, { name: string; local: boolean; waiting?: boolean; generation?: string; aggregation: SourceAggregationStatus }>> {
   const registry = await loadRegistry(storage);
   reconcile(registry, await rootsFromStorage(storage));
   const reports = await loadReports(storage);
-  const statuses = new Map<string, { name: string; local: boolean; aggregation: SourceAggregationStatus }>();
+  const statuses = new Map<string, { name: string; local: boolean; waiting?: boolean; generation?: string; aggregation: SourceAggregationStatus }>();
+  for (const source of await rootsFromStorage(storage)) {
+    const node = registry.nodes[source.url];
+    if (node?.importedAt) statuses.set(source.url, { name: source.name, local: false, waiting: true, generation: node.generation, aggregation: {} });
+  }
   if (!reports) return statuses;
   for (const report of [reports.latest, reports.lastSuccessful]) {
     if (!report) continue;
     for (const o of report.observations) {
       if (!registry.roots[o.url] || registry.nodes[o.url]?.generation !== o.generation || report.identities[o.url] !== o.generation) continue;
       const status = statuses.get(o.url) || { name: o.name, local: o.local, aggregation: {} };
+      if (status.generation) status.waiting = false;
       if (report === reports.latest) status.aggregation.latest = {
         roundId: report.roundId, attemptedAt: report.attemptedAt, outcome: report.outcome, kind: o.kind, mode: o.mode, reason: o.reason, stage: o.stage,
       };

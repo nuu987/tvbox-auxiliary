@@ -83,24 +83,39 @@ ${sharedStyles}
 
 
 /* Complete operation diagnostics; no ellipsis or fixed-height clipping. */
-.source-operation-result{white-space:pre-wrap;overflow-wrap:anywhere;overflow:visible;min-width:0;margin-top:8px;font-size:0.8rem}
-.source-operation-result.error{color:var(--red)}
-.source-operation-result.success{color:var(--green)}
+.source-operation-result{white-space:pre-wrap;overflow-wrap:anywhere;overflow:visible;min-width:0;margin:12px 0 16px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text-dim);font-family:var(--mono);font-size:0.75rem;line-height:1.6}
+.source-operation-result:empty{display:none}
+.source-operation-result.error{color:var(--red);background:var(--red-dim);border-color:var(--red-dim)}
+.source-operation-result.success{color:var(--green);background:var(--green-dim);border-color:var(--green-dim)}
+.compact-source-form input{min-width:0;max-width:100%}
+.compact-source-form .name-input{flex:0 0 12%;width:12%;min-width:72px;max-width:none;padding-inline:8px}
+@media(max-width:560px){
+  .compact-source-form{display:grid;grid-template-columns:minmax(72px,12%) minmax(0,1fr)}
+  .compact-source-form .name-input{width:100%}
+  .compact-source-form .btn{grid-column:2;justify-self:end}
+}
+#panelSources .source-import-toggle{width:100%;border:0;background:transparent;text-align:left;padding:17px 0;margin-top:8px;font-size:0.75rem;font-weight:600;letter-spacing:normal;color:var(--text)}
+#panelSources .source-import-toggle:hover{color:var(--text-bright)}
+#panelSources .source-import-toggle:focus-visible{outline:2px solid var(--green);outline-offset:2px;border-radius:4px}
+.source-import-panel{margin-top:0;margin-bottom:12px}
+.source-add-description,.source-import-description{font-family:var(--mono);font-size:0.75rem;font-weight:400;line-height:1.6;color:var(--text-dim);padding:0 0 12px;margin:0;overflow-wrap:anywhere}
+.source-import-actions{display:flex;align-items:center;gap:8px;margin:8px 0 15px}
 
 /* Import textarea */
 .import-textarea{
   width:100%;
-  min-height:100px;
+  min-height:190px;
   font-family:var(--mono);
   font-size:0.75rem;
   padding:10px;
-  background:var(--bg);
+  background:var(--surface);
   border:1px solid var(--border);
-  border-radius:4px;
+  border-radius:6px;
   color:var(--text-bright);
   resize:vertical;
-  margin-bottom:8px;
+  box-sizing:border-box;
 }
+.import-textarea:focus{outline:none;border-color:var(--green)}
 
 /* Batch textarea */
 .batch-textarea{
@@ -214,22 +229,23 @@ ${sharedStyles}
   <div class="tab-panel active" id="panelSources">
     <!-- Add source -->
     <div class="section">
-      <div class="section-title">添加接口</div>
-      <div class="add-form">
-        <input class="name-input" type="text" id="addName" placeholder="名称（可选）">
-        <input type="url" id="addUrl" placeholder="TVBox 配置 JSON 地址">
-        <input class="name-input" type="text" id="addConfigKey" placeholder="Config Key (optional, for AES ECB)">
+      <div class="section-title">添加单仓接口</div>
+      <p class="source-add-description" id="sourceAddDescription">配置接口名称后，在配置编辑页面中将显示点播站点对应的来源接口</p>
+      <div class="add-form compact-source-form">
+        <input class="name-input" type="text" id="addName" placeholder="名称(可选)" aria-describedby="sourceAddDescription">
+        <input type="url" id="addUrl" placeholder="接口网址">
         <button class="btn" id="addBtn" onclick="addSource()" disabled>添加</button>
       </div>
       <div id="addResult" class="source-operation-result" role="status" aria-live="polite"></div>
       <!-- Import (collapsible) -->
-      <div class="collapsible-toggle" onclick="toggleCollapsible(this)">导入配置</div>
-      <div class="collapsible-body">
-        <textarea id="importInput" class="import-textarea" placeholder="粘贴 TVBox JSON 内容或 URL..."></textarea>
-        <div style="display:flex;gap:8px;align-items:center">
+      <button type="button" class="collapsible-toggle source-import-toggle" aria-expanded="false" aria-controls="sourceImportPanel" onclick="toggleCollapsible(this);this.setAttribute('aria-expanded',this.classList.contains('open'))">高级添加</button>
+      <div class="collapsible-body source-import-panel" id="sourceImportPanel">
+        <p class="source-import-description" id="sourceImportDescription">支持多条单仓、多条多仓或原始多仓 JSON 三种格式的分别导入。不支持嵌套多仓。</p>
+        <textarea id="importInput" class="import-textarea" aria-label="接口导入内容" aria-describedby="sourceImportDescription"></textarea>
+        <div id="importResult" class="source-operation-result" role="status" aria-live="polite"></div>
+        <div class="source-import-actions">
           <button class="btn btn-sm" id="importBtn" onclick="importConfig()" disabled>导入</button>
         </div>
-        <div id="importResult" class="source-operation-result" role="status" aria-live="polite"></div>
       </div>
     </div>
 
@@ -282,7 +298,7 @@ ${sharedStyles}
     <!-- Add live source -->
     <div class="section">
       <div class="section-title">添加直播源</div>
-      <div class="add-form">
+      <div class="add-form compact-source-form">
         <input class="name-input" type="text" id="liveName" placeholder="名称（如 iptv365）">
         <input type="url" id="liveUrl" placeholder="m3u/txt 地址">
         <button class="btn" id="liveAddBtn" onclick="addLive()">添加</button>
@@ -457,6 +473,7 @@ function updateSourceCapacityControls() {
   const disabled = sourceOperationBusy || sourceLimitValue === null || full;
   $('addBtn').disabled = disabled;
   $('importBtn').disabled = disabled;
+  document.querySelectorAll('#sourceList [data-source-delete]').forEach(button => { button.disabled = sourceOperationBusy; });
   const hint = $('sourceCapacityHint');
   hint.hidden = !full;
   hint.textContent = full ? '接口数量已达到上限（' + sourceLimitValue + '），请删除至上限以下后再添加。'
@@ -474,7 +491,7 @@ function sourceCapacityFeedback(data) {
     updateSourceCapacityControls();
   }
   if (data.code === 'source_limit_exceeded' || (data.capacity && data.capacity.rejected > 0)) {
-    toast('接口数量已达到上限（' + data.capacity.limit + '），超出的接口未添加。', 'error');
+    toast('接口数量超出上限（' + data.capacity.limit + '），未添加接口。', 'error');
   }
 }
 
@@ -531,7 +548,7 @@ async function loadSources() {
     list.innerHTML = sources.map((s, index) => {
       const h = limit > 0 && index >= limit ? null : healthMap[s.url];
       // Plan 03.1 D-10: 后端已分类，直接使用 h.status
-      const level = h && h.aggregation && h.aggregation.latest && h.aggregation.latest.reason ? 'error' : !h ? 'unknown'
+      const level = h && h.waiting ? 'unknown' : h && h.aggregation && h.aggregation.latest && h.aggregation.latest.reason ? 'error' : !h ? 'unknown'
         : h.status === 'ERR' ? 'error'
         : h.status === 'WARN' ? 'warn'
         : 'ok';
@@ -541,10 +558,11 @@ async function loadSources() {
       const reason = (latest && latest.reason) || (h && h.status !== 'OK' && h.lastFailReason) || '';
       const cached = !!(reason && latest && latest.mode === 'restored');
       const status = !h ? '暂无数据'
+        : h.waiting ? '等待聚合'
         : h.local ? (reason || h.status !== 'OK' ? '本地配置不可用' : '本地配置正常')
         : h.status === 'OK' && reason ? '配置不可用（获取 OK）' : h.label || h.status;
       const statusLine = '<div class="source-status">状态：' + esc(status) +
-        (h && !h.local && h.status !== 'OK' ? ' · 连续失败 ' + esc(String(h.consecutiveFailures || 0)) : '') + '</div>';
+        (h && !h.waiting && !h.local && h.status !== 'OK' ? ' · 连续失败 ' + esc(String(h.consecutiveFailures || 0)) : '') + '</div>';
       const reasonLine = reason ? '<div class="source-reason">原因：' + esc(reason) + (cached ? ' · 已缓存' : '') + '</div>' : '';
       const cacheTime = cached && saved && saved.fallbackApplied && saved.snapshotTime
         ? '<div class="source-cache-time">已缓存的最后成功聚合时间：' + esc(saved.snapshotTime) + '</div>' : '';
@@ -552,12 +570,12 @@ async function loadSources() {
       return \`<div class="source-item">
         <span class="source-health-dot \${level}"></span>
         <div class="source-info">
-          <div class="source-name">\${esc(s.name || 'Unnamed')}\${s.configKey ? ' 🔑' : ''}</div>
+          <div class="source-name">\${esc(s.name || s.url)}\${s.configKey ? ' 🔑' : ''}</div>
           <div class="source-url">\${esc(s.url)}</div>
           \${statusLine}\${reasonLine}\${cacheTime}
         </div>
         <div class="source-actions">
-          <button class="btn btn-sm btn-danger" onclick="removeSource('\${esc(s.url)}')">\${"删除"}</button>
+          <button class="btn btn-sm btn-danger" data-source-delete data-url="\${esc(s.url)}" onclick="removeSource(this.dataset.url)" \${sourceOperationBusy ? 'disabled' : ''}>\${"删除"}</button>
         </div>
       </div>\`;
     }).join('');
@@ -571,38 +589,39 @@ async function loadSources() {
 // --- Final operation results ---
 function renderSourceImportResult(element, data) {
   element.className = 'source-operation-result' + (data.error || data.outcome === 'none' ? ' error' : ' success');
-  if (data.error) { element.textContent = data.error; return; }
-  const lines = [(data.type === 'multi' ? '多仓导入' : '单仓检查') + '：新增 ' + data.added + '，重复 ' + data.duplicates + '，跳过 ' + (data.skipped || []).length];
+  if (data.error) { element.textContent = '导入出错：' + data.error; return; }
+  const lines = [(data.type === 'multi' ? '多仓导入：' : '') + '新增 ' + data.added + '，重复 ' + data.duplicates + '，跳过 ' + (data.skipped || []).length];
+  if (data.outcome === 'none') lines.unshift('导入出错：未能导入任何接口');
   for (const item of data.skipped || []) lines.push([item.name, item.url].filter(Boolean).join(' · ') + '：' + item.reason);
   element.textContent = lines.join('\\n');
 }
 // --- Add source ---
 async function addSource() {
   const btn = $('addBtn');
-  if (btn.disabled) return;
+  if (btn.disabled || sourceOperationBusy) return;
   const url = $('addUrl').value.trim();
   if (!url) { $('addUrl').focus(); return; }
   const name = $('addName').value.trim() || '';
-  const configKey = $('addConfigKey').value.trim() || '';
   const result = $('addResult');
   sourceOperationBusy = true;
   updateSourceCapacityControls();
-  btn.textContent = '检查中...';
+  btn.textContent = '检查中';
   btn.className = 'btn loading';
   result.className = 'source-operation-result';
   result.textContent = '检查中，请等待完成';
   try {
     const res = await auth.authFetch('/admin/sources', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, url, configKey })
+      body: JSON.stringify({ name, url })
     });
     const d = await res.json();
     sourceCapacityFeedback(d);
     renderSourceImportResult(result, res.ok ? d : { error: d.error || '添加失败' });
     if (res.ok && d.added > 0) {
       if (!(d.skipped || []).length) {
-        $('addUrl').value = ''; $('addName').value = ''; $('addConfigKey').value = '';
+        $('addUrl').value = ''; $('addName').value = '';
       }
+      await loadSourceHealth();
       await loadSources();
     }
     else if (res.status === 409) await loadSources();
@@ -612,6 +631,9 @@ async function addSource() {
 
 // --- Remove source ---
 async function removeSource(url) {
+  if (sourceOperationBusy) return;
+  sourceOperationBusy = true;
+  updateSourceCapacityControls();
   try {
     const res = await auth.authFetch('/admin/sources', {
       method: 'DELETE',
@@ -628,7 +650,7 @@ async function removeSource(url) {
     }
   } catch {
     toast("网络错误", 'error');
-  }
+  } finally { sourceOperationBusy = false; updateSourceCapacityControls(); }
 }
 
 // --- MacCMS ---
@@ -832,13 +854,13 @@ async function removeLive(url) {
 // --- Import Config ---
 async function importConfig() {
   const btn = $('importBtn');
-  if (btn.disabled) return;
+  if (btn.disabled || sourceOperationBusy) return;
   const input = $('importInput').value.trim();
   if (!input) { $('importInput').focus(); return; }
   const result = $('importResult');
   sourceOperationBusy = true;
   updateSourceCapacityControls();
-  btn.textContent = '检查中...';
+  btn.textContent = '检查中';
   btn.className = 'btn btn-sm loading';
   result.className = 'source-operation-result';
   result.textContent = '检查中，请等待完成';
@@ -851,6 +873,7 @@ async function importConfig() {
     renderSourceImportResult(result, res.ok ? d : { error: d.error || '解析失败' });
     if (res.ok && d.added > 0) {
       if (!(d.skipped || []).length) $('importInput').value = '';
+      await loadSourceHealth();
       await loadSources();
     }
     else if (res.status === 409) await loadSources();

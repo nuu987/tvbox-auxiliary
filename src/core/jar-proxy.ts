@@ -4,6 +4,7 @@ import type { TVBoxConfig, TVBoxSite, TVBoxParse } from './types';
 import type { Storage } from '../storage/interface';
 import { safeFileName } from './site-store';
 import { logger } from './logger';
+import { retryDownload, DOWNLOAD_DEADLINE_MS } from './download-retry';
 import * as fs from 'fs';
 
 const JAR_PREFIX = 'jar:';
@@ -82,6 +83,47 @@ function buildRewrittenSpider(
   return `${parsed.prefix}${proxyUrl}`;
 }
 
+export interface JarResource {
+  url: string;
+  key: string;
+  md5: string | null;
+  index: number;
+}
+
+/** Plan original JAR identities once, before any URL is rewritten. */
+export async function createJarResourcePlan(config: TVBoxConfig, storage: Storage): Promise<JarResource[]> {
+  const declarations = new Map<string, { md5: string | null; index: number }>();
+  const add = (value: string | undefined, index: number) => {
+    if (!value) return;
+    const { url, md5 } = parseSpiderString(value);
+    if ((url.startsWith('http://') || url.startsWith('https://')) && !declarations.has(url)) {
+      declarations.set(url, { md5, index });
+    }
+  };
+  // The shared spider has no required site.jar declaration; give it a cache directory too.
+  add(config.spider, 0);
+  (config.sites || []).forEach((site, index) => add(site.jar, index));
+
+  const resources: JarResource[] = [];
+  for (const [url, declaration] of declarations) {
+    const { md5 } = declaration;
+    const key = md5 || await urlToKey(url);
+    let index = declaration.index;
+    const previous = await storage.get(`jar-source:${key}`);
+    if (previous) {
+      try {
+        const mapping: unknown = JSON.parse(previous);
+        if (mapping && typeof mapping === 'object' && 'index' in mapping
+          && typeof mapping.index === 'number' && Number.isSafeInteger(mapping.index) && mapping.index >= 0) {
+          index = mapping.index;
+        }
+      } catch { /* Use the current owner when the previous mapping is malformed. */ }
+    }
+    resources.push({ url, key, md5, index });
+  }
+  return resources;
+}
+
 /**
  * 改写合并后配置中的所有 JAR URL
  *
@@ -93,30 +135,11 @@ export async function rewriteJarUrls(
   config: TVBoxConfig,
   baseUrl: string,
   storage: Storage,
-  sourceIndexMap?: Map<string, number>,
+  resources?: readonly JarResource[],
 ): Promise<TVBoxConfig> {
-  // Step 1: 收集所有唯一 JAR URL
-  const uniqueJars = new Map<string, { md5: string | null }>(); // url → {md5}
+  const planned = resources ?? await createJarResourcePlan(config, storage);
 
-  if (config.spider) {
-    const parsed = parseSpiderString(config.spider);
-    if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
-      uniqueJars.set(parsed.url, { md5: parsed.md5 });
-    }
-  }
-
-  for (const site of config.sites || []) {
-    if (site.jar) {
-      const parsed = parseSpiderString(site.jar);
-      if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
-        if (!uniqueJars.has(parsed.url)) {
-          uniqueJars.set(parsed.url, { md5: parsed.md5 });
-        }
-      }
-    }
-  }
-
-  if (uniqueJars.size === 0) {
+  if (planned.length === 0) {
     logger.info('jar-proxy', 'No JAR URLs to rewrite');
     return config;
   }
@@ -124,15 +147,11 @@ export async function rewriteJarUrls(
   // Step 2: 为每个唯一 URL 生成 key + 批量写 KV + jar-source 映射
   const urlKeyMap = new Map<string, string>(); // url → key
 
-  for (const [url, { md5 }] of uniqueJars) {
-    const key = md5 || (await urlToKey(url));
+  for (const { url, key, index } of planned) {
     urlKeyMap.set(url, key);
     await storage.put(`${JAR_PREFIX}${key}`, url);
-    if (sourceIndexMap?.has(url)) {
-      const index = sourceIndexMap.get(url)!;
-      const name = safeFileName(url);
-      await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name }));
-    }
+    const name = safeFileName(url);
+    await storage.put(`jar-source:${key}`, JSON.stringify({ index, hash: key.substring(0, 8), name }));
     logger.info('jar-proxy', `Mapped ${key} → ${url.substring(0, 60)}...`);
   }
 
@@ -217,56 +236,69 @@ export function getResourceUrlType(url: string): string | null {
 }
 
 /**
- * Collects all static resource URLs (JAR, JS, PY, JSON, TXT) from TVBoxSite[] + TVBoxParse[].
+ * Collect original resource URLs and owner indices, including the shared spider.
  * Inspects site.jar (via parseSpiderString), site.api (type detection via extension
  * or HTTP URL), site.ext (string or object), parse.url, parse.ext.
- * Deduplicates via URL set.
+ * Deduplicates by URL while retaining the index used by proxy mappings.
  */
-export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[]): Array<{ url: string; type: string }> {
-  const seen = new Set<string>();
-  const resources: Array<{ url: string; type: string }> = [];
+export interface SiteResource {
+  url: string;
+  type: string;
+  index: number;
+}
 
-  for (const site of sites) {
+export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[], spider?: string): SiteResource[] {
+  const seen = new Map<string, SiteResource>();
+  const resources: SiteResource[] = [];
+  const add = (url: string, type: string, index: number) => {
+    const existing = seen.get(url);
+    if (existing) {
+      // Non-JAR rewriting writes mappings in traversal order; the last owner wins.
+      if (existing.type !== 'jar' && type !== 'jar') existing.index = index;
+      return;
+    }
+    const resource = { url, type, index };
+    seen.set(url, resource);
+    resources.push(resource);
+  };
+
+  if (spider) {
+    const { url } = parseSpiderString(spider);
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      add(url, 'jar', 0);
+    }
+  }
+
+  for (const [index, site] of sites.entries()) {
     // site.jar via parseSpiderString
     if (site.jar) {
       const parsed = parseSpiderString(site.jar);
       if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
-        if (!seen.has(parsed.url)) {
-          seen.add(parsed.url);
-          resources.push({ url: parsed.url, type: 'jar' });
-        }
+        add(parsed.url, 'jar', index);
       }
     }
 
     // site.api: type detection via extension
     if (site.api) {
-      if (!seen.has(site.api)) {
-        const type = getResourceUrlType(site.api);
-        if (type) {
-          seen.add(site.api);
-          resources.push({ url: site.api, type });
-        }
-      }
+      const type = getResourceUrlType(site.api);
+      if (type) add(site.api, type, index);
     }
 
     // site.ext: String or Object
     if (site.ext) {
-      extractExtUrls(site.ext, seen, resources);
+      extractExtUrls(site.ext, (url, type) => add(url, type, index));
     }
   }
 
   // parse.url / parse.ext
   if (parses) {
-    for (const parse of parses) {
-      if (parse.url && !seen.has(parse.url)) {
+    for (const [index, parse] of parses.entries()) {
+      if (parse.url) {
         const type = getResourceUrlType(parse.url);
-        if (type) {
-          seen.add(parse.url);
-          resources.push({ url: parse.url, type });
-        }
+        if (type) add(parse.url, type, index);
       }
       if (parse.ext) {
-        extractExtUrls(parse.ext, seen, resources);
+        extractExtUrls(parse.ext, (url, type) => add(url, type, index));
       }
     }
   }
@@ -279,30 +311,21 @@ export function collectAllSiteResources(sites: TVBoxSite[], parses?: TVBoxParse[
  */
 function extractExtUrls(
   ext: string | Record<string, unknown>,
-  seen: Set<string>,
-  resources: Array<{ url: string; type: string }>,
+  add: (url: string, type: string) => void,
 ): void {
   if (typeof ext === 'string') {
     const extParts = ext.split(/[\s$;|]+/);
     for (const part of extParts) {
       if (!part.startsWith('http://') && !part.startsWith('https://')) continue;
-      if (seen.has(part)) continue;
       const type = getResourceUrlType(part);
-      if (type) {
-        seen.add(part);
-        resources.push({ url: part, type });
-      }
+      if (type) add(part, type);
     }
   } else if (typeof ext === 'object' && ext !== null) {
     for (const val of Object.values(ext)) {
       if (typeof val !== 'string') continue;
       if (!val.startsWith('http://') && !val.startsWith('https://')) continue;
-      if (seen.has(val)) continue;
       const type = getResourceUrlType(val);
-      if (type) {
-        seen.add(val);
-        resources.push({ url: val, type });
-      }
+      if (type) add(val, type);
     }
   }
 }
@@ -476,15 +499,15 @@ async function rewriteExtFieldAsync(
  * then all other resources in their original order. This ensures the
  * spider JAR is available before any site that depends on it loads.
  */
-export function sortResourcesByPriority(
-  resources: Array<{ url: string; type: string }>,
+export function sortResourcesByPriority<T extends { url: string; type: string }>(
+  resources: T[],
   spiderUrl: string | undefined,
-): Array<{ url: string; type: string }> {
+): T[] {
   if (!spiderUrl) return resources;
 
   const parsed = parseSpiderString(spiderUrl);
-  const priority: Array<{ url: string; type: string }> = [];
-  const rest: Array<{ url: string; type: string }> = [];
+  const priority: T[] = [];
+  const rest: T[] = [];
 
   for (const r of resources) {
     if (r.type === 'jar' && r.url === parsed.url) {
@@ -554,57 +577,34 @@ export async function downloadResource(url: string, timeoutMs: number): Promise<
     logger.security(`downloadResource blocked unsafe URL: ${url.length > 60 ? url.substring(0, 60) + '...' : url}`);
     return null;
   }
-  const MAX_ATTEMPTS = 3;
-  // 总截止时间：每次下载尝试的 timeoutMs 上限，但累计不超过 30s，避免 50 个慢资源串联阻塞 ~27 分钟
-  const HARD_DEADLINE_MS = 30_000;
-  const deadlineStartedAt = Date.now();
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    // 检查总截止时间：剩余预算不足单次 timeoutMs 的 1/2 时放弃后续重试
-    const elapsed = Date.now() - deadlineStartedAt;
-    const remainingBudget = HARD_DEADLINE_MS - elapsed;
-    if (remainingBudget <= Math.min(timeoutMs / 2, 5000) && attempt > 1) {
-      logger.warn('jar-proxy', `Download aborted — exceeded ${HARD_DEADLINE_MS}ms aggregate deadline after ${attempt - 1} attempts: ${url.substring(0, 60)}...`);
-      return null;
-    }
-    // 单次尝试的 timeout 取剩余预算与 timeoutMs 中的较小值，保证不超过总截止
-    const effectiveTimeout = Math.min(timeoutMs, Math.max(remainingBudget, 1000));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
-    try {
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': 'okhttp/3.12.0' },
-        signal: controller.signal,
-      });
-      if (!resp.ok) {
-        if (attempt < MAX_ATTEMPTS) {
-          const delay = Math.pow(2, attempt - 1) * 1000;
-          logger.warn('jar-proxy', `Download attempt ${attempt}/${MAX_ATTEMPTS} failed (HTTP ${resp.status}), retrying in ${delay}ms: ${url.substring(0, 60)}...`);
-          await new Promise(r => setTimeout(r, delay));
-          continue;
-        }
-        return null;
+  const run = await retryDownload<Buffer | null>({
+    timeoutMs,
+    execute: async context => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), context.timeoutMs);
+      try {
+        const resp = await fetch(url, { headers: { 'User-Agent': 'okhttp/3.12.0' }, signal: controller.signal });
+        if (!resp.ok) return { value: null, status: 'failed', reason: `HTTP ${resp.status}` };
+        return { value: Buffer.from(await resp.arrayBuffer()), status: 'ok' };
+      } catch (error) {
+        return { value: null, status: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'failed',
+          reason: error instanceof Error ? error.message : String(error) };
+      } finally {
+        clearTimeout(timer);
       }
-      return Buffer.from(await resp.arrayBuffer());
-    } catch (e) {
-      // CR-04: 超时（AbortError）不重试 — 慢源在重试时不会变快，重试只会浪费墙时
-      const isAbort = e instanceof Error && (e.name === 'AbortError' || (e instanceof DOMException && e.name === 'AbortError'));
-      if (isAbort) {
-        logger.warn('jar-proxy', `Download timed out after ${effectiveTimeout}ms (no retry): ${url.substring(0, 60)}...`);
-        return null;
+    },
+    onFailure: event => {
+      if (event.status === 'timeout') {
+        logger.warn('jar-proxy', `Download timed out after ${event.timeoutMs}ms (no retry): ${url.substring(0, 60)}...`);
+      } else {
+        const retry = event.delayMs ? `, retrying in ${event.delayMs}ms` : '';
+        logger.warn('jar-proxy', `Download attempt ${event.attempt}/${event.maxAttempts} failed (${event.reason})${retry}: ${url.substring(0, 60)}...`);
       }
-      if (attempt < MAX_ATTEMPTS) {
-        const delay = Math.pow(2, attempt - 1) * 1000;
-        logger.warn('jar-proxy', `Download attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay}ms: ${url.substring(0, 60)}...`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      logger.warn('jar-proxy', `Download failed after ${MAX_ATTEMPTS} attempts: ${url.substring(0, 60)}...`);
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  return null;
+    },
+    onDeadline: attempts => logger.warn('jar-proxy',
+      `Download aborted — exceeded ${DOWNLOAD_DEADLINE_MS}ms aggregate deadline after ${attempts} attempts: ${url.substring(0, 60)}...`),
+  });
+  return run.value;
 }
 
 /**

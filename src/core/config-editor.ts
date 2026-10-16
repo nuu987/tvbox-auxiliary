@@ -364,7 +364,7 @@ ${sharedStyles}
     <h2>配置编辑器</h2>
     <p>请输入管理令牌</p>
     <div class="error-msg" id="loginError">无效的令牌</div>
-    <input type="password" id="tokenInput" placeholder="管理令牌" autofocus>
+    <input type="password" id="tokenInput" placeholder="管理令牌">
     <button class="btn" style="width:100%" onclick="auth.doLogin()">登录</button>
   </div>
 </div>

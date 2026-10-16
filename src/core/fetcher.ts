@@ -3,13 +3,9 @@
 import { DEFAULT_FETCH_TIMEOUT_MS, TVBOX_UA, BROWSER_UA } from './config';
 import { decodeConfigResponse } from './decoder';
 import { logger } from './logger';
+import { retryDownload, DOWNLOAD_DEADLINE_MS } from './download-retry';
+import type { DownloadAttemptResult } from './download-retry';
 import type { TVBoxConfig, SourcedConfig, SourceEntry, SourceFetchResult, ParseValidationResult, SourceFetchStatus } from './types';
-
-// Phase 7 同步失败重试机制：逐源失败重试 + 串行化（D-01 ~ D-11）
-// D-04 口径：首轮失败后重试 3 次（exhausted 场景共 4 次 fetch 调用）
-const MAX_RETRY_ATTEMPTS = 3; // 首轮失败后的最大重试次数
-const RETRY_BACKOFF_MS = [5000, 10000, 20000]; // D-04 指数退避档位 5s/10s/20s
-const RETRY_JITTER = 0.2; // D-04 ±20% jitter 系数，防多源节奏整齐对远端聚集
 
 export interface FetchConfigsResult {
   configs: SourcedConfig[];
@@ -18,6 +14,7 @@ export interface FetchConfigsResult {
 
 export interface SourceConfigResolver {
   source(source: SourceEntry): SourceEntry;
+  acquire?(source: SourceEntry): SingleFetchResult | undefined;
   resolve(source: SourceEntry, config: TVBoxConfig | null, result: SourceFetchResult, depth: number): { config: TVBoxConfig; prepared?: boolean } | null;
 }
 
@@ -95,7 +92,8 @@ async function fetchSources(
 
   for (const queuedSource of uniqueSources) {
     const source = resolver ? resolver.source(queuedSource) : queuedSource;
-    const { config: fetchedConfig, fetchResult } = await fetchSingleConfig(source, timeoutMs, proxyConfig, depth);
+    const { config: fetchedConfig, fetchResult } = resolver?.acquire?.(source)
+      || await fetchSingleConfig(source, timeoutMs, proxyConfig, depth);
     fetchResults.push(fetchResult);
     const resolved = resolver ? resolver.resolve(source, fetchedConfig, fetchResult, depth)
       : fetchResult.status === 'ok' && fetchedConfig ? { config: fetchedConfig, prepared: false } : null;
@@ -115,30 +113,21 @@ async function fetchSources(
   }
 }
 
-/** One direct timed request for Add/Import/migration, without UA/proxy/backoff retries. */
+/** Legacy migration only: direct inspection without changing its historical retry policy. */
 export async function inspectSourceOnce(source: SourceEntry, timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS): Promise<SingleFetchResult> {
   return fetchWithUA(source, timeoutMs, 'okhttp/3.12.0', 'import', 0);
 }
 
-interface SingleFetchResult {
+export interface SingleFetchResult {
   config: TVBoxConfig | null;
   fetchResult: SourceFetchResult;
 }
 
 /**
- * 退避 sleep 工具：baseMs ± RETRY_JITTER 比例抖动（D-04 ±20% jitter）。
- * Math.random 运行时可用（CLAUDE.md 禁令仅针对 workflow scripts）。
- */
-function sleepWithJitter(baseMs: number): Promise<void> {
-  const offset = baseMs * RETRY_JITTER * (2 * Math.random() - 1); // ±baseMs*0.2
-  const delay = Math.round(baseMs + offset);
-  return new Promise(resolve => setTimeout(resolve, delay));
-}
-
-/**
  * 获取单个配置 JSON（不重试）——从原 fetchSingleConfig 体抽取的内层核心拉取函数。
  * 双 UA 回退 + 边缘代理回退逻辑全部保留不变。
- * 内部已 try/catch 返回结构化 SingleFetchResult，永不 reject。
+ * HTTP helpers return structured results; retain the primary failure while
+ * reporting any unrecovered fallback timeout to the shared retry owner.
  * 模块私有不 export——重试包装器调用之避免递归（Pitfall 1）。
  */
 async function fetchSingleConfigNoRetry(
@@ -146,25 +135,34 @@ async function fetchSingleConfigNoRetry(
   timeoutMs: number,
   proxyConfig?: FetchProxyConfig,
   depth = 0,
-): Promise<SingleFetchResult> {
+  remainingMs?: () => number,
+): Promise<DownloadAttemptResult<SingleFetchResult>> {
+  const requestTimeout = () => Math.min(timeoutMs, Math.max(remainingMs?.() ?? timeoutMs, 1));
+  const hasBudget = () => !remainingMs || remainingMs() > 0;
+  let timeoutResult: SingleFetchResult | undefined;
+  const trackTimeout = (value: SingleFetchResult) => {
+    if (value.fetchResult.status === 'timeout') timeoutResult = value;
+    return value;
+  };
   // 双 UA 回退：先用 okhttp（TVBox 原生），解析失败换浏览器 UA 重试
-  const result = await fetchWithUA(source, timeoutMs, TVBOX_UA, 'tvbox', depth);
-  if (result.config) return result;
+  const result = trackTimeout(await fetchWithUA(source, requestTimeout(), TVBOX_UA, 'tvbox', depth));
+  if (result.config) return { value: result, status: 'ok' };
 
   // okhttp 失败 → 浏览器 UA 重试（部分源只接受浏览器 UA）
-  if (result.fetchResult.status === 'parse_error' || result.fetchResult.status === 'decode_error') {
+  if (hasBudget() && (result.fetchResult.status === 'parse_error' || result.fetchResult.status === 'decode_error')) {
     logger.debugFields('fetcher', 'retry-browser-ua', {
       name: source.name,
       url: source.url,
       previousStatus: result.fetchResult.status,
     });
-    const browserResult = await fetchWithUA(source, timeoutMs, BROWSER_UA, 'browser', depth);
-    if (browserResult.config) return browserResult;
+    const browserResult = trackTimeout(await fetchWithUA(source, requestTimeout(), BROWSER_UA, 'browser', depth));
+    if (browserResult.config) return { value: browserResult, status: 'ok' };
   }
 
   // 直连失败（timeout/network_error/http_error）→ 通过边缘代理重试
   if (proxyConfig?.urls.length && isProxyRetriable(result.fetchResult.status)) {
     for (let i = 0; i < proxyConfig.urls.length; i++) {
+      if (!hasBudget()) break;
       const proxyUrl = proxyConfig.urls[i];
       logger.debugFields('fetcher', 'retry-proxy', {
         name: source.name,
@@ -173,8 +171,8 @@ async function fetchSingleConfigNoRetry(
         proxyHost: safeHost(proxyUrl),
         previousStatus: result.fetchResult.status,
       });
-      const proxyResult = await fetchViaProxy(source, timeoutMs, proxyUrl, proxyConfig.token);
-      if (proxyResult.config) return proxyResult;
+      const proxyResult = trackTimeout(await fetchViaProxy(source, requestTimeout(), proxyUrl, proxyConfig.token));
+      if (proxyResult.config) return { value: proxyResult, status: 'ok' };
     }
   } else {
     logger.debugFields('fetcher', 'retry-skipped', {
@@ -185,66 +183,47 @@ async function fetchSingleConfigNoRetry(
     });
   }
 
-  return result;
+  return { value: result, status: timeoutResult ? 'timeout' : 'failed',
+    reason: timeoutResult?.fetchResult.errorMessage || result.fetchResult.errorMessage || result.fetchResult.status };
 }
 
 /**
  * 获取单个配置 JSON，返回结构化结果（成功或失败原因）
  *
- * Phase 7 重试包装器：首轮失败后按 RETRY_BACKOFF_MS=[5s,10s,20s] + ±20% jitter 重试
- * MAX_RETRY_ATTEMPTS=3 次（D-04 口径：exhausted 场景共 4 次 fetch 调用 = 首轮 1 + 重试 3）。
- *
- * 触发判据：status !== 'ok'（D-02，含 timeout/parse_error/http_404 等全部 fail/warn 子类型——
- * D-03 不区分瞬时 vs 确定性错误，Q5 有意偏离 downloadResource 的 AbortError 不重试守卫）。
- *
- * 日志事件（D-10，通过 emitSink → log-buffer → Phase 6 /admin/logs SSE 实时可见）：
- * - source-retry-attempt: 每次重试前发出，字段含 attempt/reason
- * - source-retry-recovered: 重试成功时发出
- * - source-retry-exhausted: 重试耗尽时发出
- *
- * 关键设计（Pitfall 1/2）：重试包装器只调 fetchSingleConfigNoRetry，永不调自身（避免无限递归）；
- * 每次 attempt 的 AbortController 由 fetchWithUA/fetchViaProxy 内部各自新建，跨 attempt 不复用。
+ * Uses the shared static-resource retry policy: three rounds, 1s/2s waits,
+ * no outer retry after timeout and a 30s overall budget. Each round keeps the
+ * existing UA/proxy fallbacks, constrained by the remaining budget.
  */
-async function fetchSingleConfig(
+export async function fetchSingleConfig(
   source: SourceEntry,
   timeoutMs: number,
   proxyConfig?: FetchProxyConfig,
   depth = 0,
 ): Promise<SingleFetchResult> {
-  let result = await fetchSingleConfigNoRetry(source, timeoutMs, proxyConfig, depth);
-  if (result.fetchResult.status === 'ok') return result;
-
-  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
-    // 退避基准值：jitter 前的固定档位（5s/10s/20s），同时用于日志展示与 sleepWithJitter 入参，
-    // 保证用户在 /admin/logs 看到的 backoffMs 与实际 sleep 同源（jitter 仅作用于实际 sleep）。
-    const backoffMs = RETRY_BACKOFF_MS[attempt - 1];
-    logger.infoFields('fetcher', 'source-retry-attempt', {
-      name: source.name,
-      url: source.url,
-      attempt,
-      reason: result.fetchResult.errorMessage || result.fetchResult.status,
-      backoffMs,
-    });
-    await sleepWithJitter(backoffMs);
-    result = await fetchSingleConfigNoRetry(source, timeoutMs, proxyConfig, depth);
-    if (result.fetchResult.status === 'ok') {
-      logger.infoFields('fetcher', 'source-retry-recovered', {
-        name: source.name,
-        url: source.url,
-        attempt,
-        recovered: true,
+  const run = await retryDownload<SingleFetchResult>({
+    timeoutMs,
+    execute: context => fetchSingleConfigNoRetry(source, context.timeoutMs, proxyConfig, depth, context.remainingMs),
+    onFailure: event => {
+      logger.warnFields('fetcher', 'source-download-attempt-failed', {
+        name: source.name, url: source.url, attempt: event.attempt, maxAttempts: event.maxAttempts,
+        status: event.status, reason: event.reason,
       });
-      return result;
-    }
-  }
-
-  logger.infoFields('fetcher', 'source-retry-exhausted', {
-    name: source.name,
-    url: source.url,
-    attempts: MAX_RETRY_ATTEMPTS,
-    finalReason: result.fetchResult.errorMessage || result.fetchResult.status,
+      if (event.delayMs) logger.infoFields('fetcher', 'source-retry-attempt', {
+        name: source.name, url: source.url, attempt: event.attempt, reason: event.reason, backoffMs: event.delayMs,
+      });
+    },
+    onDeadline: attempts => logger.warnFields('fetcher', 'source-download-deadline', {
+      name: source.name, url: source.url, attempts, deadlineMs: DOWNLOAD_DEADLINE_MS,
+    }),
   });
-  return result;
+  if (run.outcome === 'success' && run.attempts > 1) logger.infoFields('fetcher', 'source-retry-recovered', {
+    name: source.name, url: source.url, attempt: run.attempts - 1, recovered: true,
+  });
+  if (run.outcome === 'exhausted') logger.infoFields('fetcher', 'source-retry-exhausted', {
+    name: source.name, url: source.url, attempts: run.attempts,
+    finalReason: run.value.fetchResult.errorMessage || run.value.fetchResult.status,
+  });
+  return run.value;
 }
 
 function isProxyRetriable(status: string): boolean {
@@ -574,7 +553,7 @@ export function parseConfigJson(text: string): ParseValidationResult {
   let result = tryParseJsonWithMessage(cleaned);
   let compatibility: JsonCompatibilityResult | undefined;
 
-  // 仅语法失败时兼容注释和字符串内的实际换行，不改变字段字符值。
+  // Syntax-only fallback: preserve string values, normalize supported comments/wrappers.
   if (!result.ok) {
     compatibility = normalizeJsonCompatibility(cleaned);
     if (compatibility.error) {
@@ -605,6 +584,8 @@ export function parseConfigJson(text: string): ParseValidationResult {
     logger.infoFields('parser', 'config-compatibility-applied', {
       lineComments: compatibility.lineComments,
       blockComments: compatibility.blockComments,
+      hashComments: compatibility.hashComments,
+      htmlTrailers: compatibility.htmlTrailers,
       lfEscapes: compatibility.lfEscapes,
       crEscapes: compatibility.crEscapes,
     });
@@ -672,28 +653,50 @@ interface JsonCompatibilityResult {
   text: string;
   lineComments: number;
   blockComments: number;
+  hashComments: number;
+  htmlTrailers: number;
   lfEscapes: number;
   crEscapes: number;
   error?: string;
 }
 
-/** Normalize only comments and raw in-string LF/CR; JSON.parse checks syntax. */
+/** String-aware syntax compatibility; JSON.parse remains the only value parser. */
 function normalizeJsonCompatibility(text: string): JsonCompatibilityResult {
   const chunks: string[] = [];
-  const result: JsonCompatibilityResult = { text: '', lineComments: 0, blockComments: 0, lfEscapes: 0, crEscapes: 0 };
+  const result: JsonCompatibilityResult = { text: '', lineComments: 0, blockComments: 0, hashComments: 0, htmlTrailers: 0, lfEscapes: 0, crEscapes: 0 };
   let state: 'normal' | 'string' | 'escape' | 'line-comment' | 'block-comment' = 'normal';
+  let lineWhitespace = true;
+  let root: 'pending' | 'object' | 'other' = 'pending';
+  let depth = 0;
+  const htmlStart = /<(?:!--|!doctype(?:\s|>)|\/?[a-z][\w:-]*(?:\s|\/?>))/iy;
 
-  for (let i = 0; i < text.length; i++) {
+  scan: for (let i = 0; i < text.length; i++) {
     const ch = text[i];
 
     switch (state) {
       case 'normal':
-        if (ch === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+        // Some hosts append HTML to an otherwise complete JSON object. Never
+        // search inside strings, accept an HTML page, or repair an unfinished root.
+        if (root === 'object' && depth === 0 && ch === '<') {
+          htmlStart.lastIndex = i;
+          if (htmlStart.test(text)) {
+            result.htmlTrailers++;
+            break scan;
+          }
+        }
+        if (ch === '#' && lineWhitespace) {
+          state = 'line-comment'; result.hashComments++; chunks.push(' ');
+        } else if (ch === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
           if (text[i + 1] === '/') { state = 'line-comment'; result.lineComments++; }
           else { state = 'block-comment'; result.blockComments++; }
           chunks.push('  ');
           i++;
         } else {
+          if (root === 'pending' && !/\s/.test(ch)) root = ch === '{' ? 'object' : 'other';
+          if (root === 'object') {
+            if (ch === '{' || ch === '[') depth++;
+            else if (ch === '}' || ch === ']') depth--;
+          }
           chunks.push(ch);
           if (ch === '"') state = 'string';
         }
@@ -723,6 +726,8 @@ function normalizeJsonCompatibility(text: string): JsonCompatibilityResult {
         } else chunks.push(ch === '\n' || ch === '\r' ? ch : ' ');
         break;
     }
+    if (ch === '\r' || ch === '\n') lineWhitespace = true;
+    else if (!/\s/.test(ch)) lineWhitespace = false;
   }
   if (state === 'string' || state === 'escape') result.error = 'Unterminated JSON string in compatibility input';
   else if (state === 'block-comment') result.error = 'Unterminated block comment in compatibility input';

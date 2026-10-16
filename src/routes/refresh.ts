@@ -3,13 +3,13 @@
 import { Hono } from 'hono';
 import type { RuntimeState } from './admin-auth';
 import type { Storage } from '../storage/interface';
-import type { AppConfig } from '../core/types';
+import type { AppConfig, SyncRunResult } from '../core/types';
 
 export interface RefreshRouteDeps {
   storage: Storage;
   config: AppConfig;
   runtime: RuntimeState;
-  triggerRefresh: (opts?: { source?: 'cron' | 'manual' }) => Promise<{ ran: boolean }>;
+  triggerRefresh: (opts?: { source?: 'cron' | 'manual' }) => Promise<SyncRunResult>;
 }
 
 export function createRefreshRouter(deps: RefreshRouteDeps): Hono {
@@ -26,18 +26,17 @@ export function createRefreshRouter(deps: RefreshRouteDeps): Hono {
     }
 
     if (runtime.getPatchLock()) {
-      return c.json({ error: 'Patch in progress' }, 409);
+      return c.json({ success: false, ran: false, outcome: 'busy', message: '正在应用屏蔽设置，请稍后重试',
+        syncRunning: runtime.isSyncing() }, 409);
     }
 
     try {
       const result = await deps.triggerRefresh({ source: 'manual' });
-      if (!result.ran) {
-        return c.json({ success: false, message: 'Already running, skipped' });
-      }
-      return c.json({ success: true, message: 'Refresh completed' });
+      const status = result.outcome === 'timeout' ? 504 : result.outcome === 'failed' ? 500 : 200;
+      return c.json({ ...result, success: result.outcome === 'saved', syncRunning: runtime.isSyncing() }, status);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      return c.json({ success: false, error: msg }, 500);
+      return c.json({ success: false, ran: true, outcome: 'failed', message: msg, syncRunning: runtime.isSyncing() }, 500);
     }
   });
 

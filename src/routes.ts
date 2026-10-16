@@ -2,7 +2,7 @@
 
 import { Hono } from 'hono';
 import type { Storage } from './storage/interface';
-import type { AppConfig, SyncSchedule } from './core/types';
+import type { AppConfig, SyncSchedule, SyncRunResult } from './core/types';
 import type { RuntimeState } from './routes/admin-auth';
 import { createConfigOutputRouter } from './routes/config-output';
 import { createDashboardRouter } from './routes/dashboard';
@@ -22,11 +22,12 @@ import { createMaccmsProxyRouter } from './routes/maccms-proxy';
 import { createJarProxyRouter } from './routes/jar-proxy';
 import { createRefreshRouter } from './routes/refresh';
 import { createLiveCacheRouter } from './routes/live-cache';
+import { sourceActivity } from './core/source-activity';
 
 export interface AppDeps {
   storage: Storage;
   config: AppConfig;
-  triggerRefresh: (opts?: { source?: 'cron' | 'manual' }) => Promise<{ ran: boolean }>;
+  triggerRefresh: (opts?: { source?: 'cron' | 'manual' }) => Promise<SyncRunResult>;
   onCronScheduleChange?: (schedule: SyncSchedule) => void;
   cronEnvSchedule?: SyncSchedule | null;
   runtime: RuntimeState;
@@ -43,7 +44,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route('/', createStaticAssetsRouter());
 
   // ─── Admin sub-apps ───────────────────────────────────────
-  app.route('/', createSourceMgmtRouter({ storage, config }));
+  app.route('/', createSourceMgmtRouter({ storage, config, activity: sourceActivity(storage) }));
   app.route('/', createSettingsRouter({
     storage, config, runtime,
     onCronScheduleChange: deps.onCronScheduleChange,

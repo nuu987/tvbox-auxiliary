@@ -51,7 +51,7 @@ export async function decodeConfigResponse(
   }
 
   // 格式 2：AES CBC 自解密（2423 前缀）
-  if (text.startsWith('2423')) {
+  if (text.trim().startsWith('2423')) {
     logger.debugFields('decoder', 'decode-attempt', { ...sourceFields, method: 'aes-cbc' });
     try {
       const cbcResult = await decryptAesCbc(text);
@@ -118,6 +118,8 @@ function decodeImageWrapped(text: string): string | null {
  * - key 和 iv 都右补 "0" 到 16 位
  */
 async function decryptAesCbc(hexContent: string): Promise<string | null> {
+  // Transport whitespace is outside the hex envelope, never part of its IV.
+  hexContent = hexContent.trim();
   // 提取密文数据：从 "2324"（"#$" 的 hex）之后到倒数 26 字符
   const separatorIndex = hexContent.indexOf('2324');
   if (separatorIndex === -1) return null;

@@ -22,5 +22,5 @@ export function selectDataSources<T>(sources: T[], limit: number): T[] {
 }
 
 export function sourceLimitMessage(limit: number): string {
-  return `接口数量已达到上限（${limit}），超出的接口未添加。`;
+  return `接口数量已达到上限（${limit}），跳过添加`;
 }

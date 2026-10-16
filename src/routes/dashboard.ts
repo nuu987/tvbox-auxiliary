@@ -101,7 +101,10 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
     });
 
     const aggregation = await sourceAggregationStatuses(storage);
-    const withLabels: Array<SourceHealthRecord & { label: string; aggregation?: SourceAggregationStatus; local?: boolean }> = normalized.map(r => ({
+    const withLabels: Array<Omit<SourceHealthRecord, 'generation'> & { label: string; aggregation?: SourceAggregationStatus; local?: boolean }> = normalized.filter(r => {
+      const state = aggregation.get(r.url);
+      return !state?.waiting && (!state?.generation || state.generation === r.generation);
+    }).map(({ generation: _generation, ...r }) => ({
       ...r,
       label: STATUS_LABELS[r.fetchStatus] || 'ERR',
       aggregation: aggregation.get(r.url)?.aggregation,
@@ -115,14 +118,17 @@ export function createDashboardRouter(deps: DashboardRouteDeps): Hono {
         label: value.aggregation.latest?.reason ? 'LOCAL UNAVAILABLE' : 'LOCAL OK',
         aggregation: value.aggregation,
       }));
-    const responseRecords = [...withLabels, ...localRecords];
+    const waitingRecords = [...aggregation.entries()].filter(([, value]) => value.waiting).map(([url, value]) => ({
+      url, name: value.name, waiting: true, status: 'WAITING', label: '等待聚合', consecutiveFailures: 0,
+    }));
+    const responseRecords = [...withLabels, ...localRecords, ...waitingRecords];
 
     // Compute summary
     let ok = 0, warn = 0, err = 0;
     for (const r of responseRecords) {
       if (r.status === 'OK') ok++;
       else if (r.status === 'WARN') warn++;
-      else err++;
+      else if (r.status === 'ERR') err++;
     }
 
     return c.json({

@@ -191,6 +191,8 @@ ${sharedStyles}
 .health-dot.ok{background:var(--green);box-shadow:0 0 6px var(--green-glow)}
 .health-dot.warn{background:var(--amber);box-shadow:0 0 6px var(--amber-dim)}
 .health-dot.error{background:var(--red);box-shadow:0 0 6px var(--red-dim)}
+.health-dot.unknown{background:var(--text-dim)}
+.health-table .status-unknown{color:var(--text-dim)}
 
 .health-table-wrap{
   overflow-x:auto;
@@ -476,21 +478,41 @@ const auth = initAuth('loginInput', 'loginError', 'loginOverlay', 'mainContent',
   setInterval(loadSourceHealth, 60000);
 });
 
-// CR-03: 60s loadStatus interval fired toast() every cycle on steady-state warnings
-// (syncSuccess===false or syncFailedDownloads>0). Track last-shown signature so
-// the toast only fires when the underlying state changes, not on every poll.
-let lastSyncWarnKey = null;
+let refreshPending = false;
+let dashboardSyncRunning = false;
+let exportPending = false;
+let statusRequestId = 0;
+let healthRequestId = 0;
+let quotaRequestId = 0;
+
+function invalidateDashboardLoads() {
+  statusRequestId++;
+  healthRequestId++;
+  quotaRequestId++;
+}
+
+function updateDashboardControls() {
+  const busy = refreshPending || dashboardSyncRunning;
+  const refreshBtn = $('refreshBtn');
+  if (refreshBtn) {
+    refreshBtn.disabled = busy;
+    refreshBtn.textContent = busy ? "运行中..." : "立即聚合";
+    refreshBtn.className = 'btn btn-sm' + (busy ? ' loading' : '');
+  }
+  const exportBtn = $('exportBtn');
+  if (exportBtn) exportBtn.disabled = busy || exportPending;
+}
 
 async function loadStatus() {
+  const requestId = ++statusRequestId;
   try {
     const res = await auth.authFetch('/status-data');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const d = await res.json();
+    if (requestId !== statusRequestId) return null;
 
-    // D-08: 同步进行时禁用导出按钮（仅管理员会话能看到 syncRunning 字段；
-    // 非管理员会话 auth.authFetch 退化为普通 fetch，d.syncRunning 为 undefined，
-    // 按钮保持可点击 — 后端 409 是真正的保护）
-    const exportBtn = $('exportBtn');
-    if (exportBtn) exportBtn.disabled = !!d.syncRunning;
+    if (typeof d.syncRunning === 'boolean') dashboardSyncRunning = d.syncRunning;
+    updateDashboardControls();
 
     $('statSites').textContent = d.sites ?? '—';
     $('statLives').textContent = d.lives ?? '—';
@@ -501,16 +523,21 @@ async function loadStatus() {
 
     if (d.lastUpdate && d.lastUpdate !== 'never') {
       const date = new Date(d.lastUpdate);
-      const now = new Date();
-      const diffH = (now - date) / 3.6e6;
-      const fmt = date.toLocaleString('zh-CN', {
-        year:'numeric', month:'2-digit', day:'2-digit',
-        hour:'2-digit', minute:'2-digit', second:'2-digit',
-        hour12: false
-      });
+      if (Number.isNaN(date.getTime())) {
+        time.textContent = "上次聚合失败";
+        time.className = 'update-time never';
+      } else {
+        const now = new Date();
+        const diffH = (now - date) / 3.6e6;
+        const fmt = date.toLocaleString('zh-CN', {
+          year:'numeric', month:'2-digit', day:'2-digit',
+          hour:'2-digit', minute:'2-digit', second:'2-digit',
+          hour12: false
+        });
 
-      time.textContent = fmt;
-      time.className = 'update-time' + (diffH > 26 ? ' stale' : '');
+        time.textContent = fmt;
+        time.className = 'update-time' + (diffH > 26 ? ' stale' : '');
+      }
     } else {
       time.textContent = "从未更新";
       time.className = 'update-time never';
@@ -532,30 +559,16 @@ async function loadStatus() {
       banner.innerHTML = '';
     }
 
-    // 同步失败或部分失败时弹 toast 通知
-    // CR-03: 仅当告警签名（状态+计数+lastUpdate）变化时才弹 toast，避免每分钟重复
-    if (d.syncSuccess === false) {
-      const key = 'fail:' + d.lastUpdate;
-      if (key !== lastSyncWarnKey) {
-        toast("上次同步失败，请检查日志", 'error');
-        lastSyncWarnKey = key;
-      }
-    } else if (d.syncFailedDownloads > 0) {
-      const key = 'downloads:' + d.syncFailedDownloads + ':' + d.lastUpdate;
-      if (key !== lastSyncWarnKey) {
-        toast(d.syncFailedDownloads + " 个资源下载失败", 'warn');
-        lastSyncWarnKey = key;
-      }
-    } else {
-      lastSyncWarnKey = null;
-    }
+    return d;
   } catch (e) {
+    if (requestId !== statusRequestId) return null;
     // WR-09: loadStatus is called every 60s via setInterval — a silently swallowed
     // error gives operators no signal beyond the displayed "获取状态失败" text.
     // Log the actual error so the browser console has a diagnostic trail.
     console.warn('loadStatus failed:', e instanceof Error ? e.message : String(e));
     $('updateTime').textContent = "获取状态失败";
     $('updateTime').className = 'update-time never';
+    return null;
   }
 }
 
@@ -594,10 +607,12 @@ function fallbackCopy(text) {
 }
 
 async function loadSearchQuotaSummary() {
+  const requestId = ++quotaRequestId;
   try {
     const res = await fetch('/search-quota/summary');
     if (!res.ok) return;
     const d = await res.json();
+    if (requestId !== quotaRequestId) return;
     if (!d.enabled) {
       $('searchQuotaSection').style.display = 'none';
       return;
@@ -619,10 +634,12 @@ async function loadSearchQuotaSummary() {
 function escDash(s) { const d = document.createElement('div'); d.textContent = s || '-'; return d.innerHTML; }
 
 async function loadSourceHealth() {
+  const requestId = ++healthRequestId;
   try {
     const res = await fetch('/source-status');
     // Plan 03.1 D-11: 后端返回 { records, summary }，前端不再自行分类
     const { records, summary } = await res.json();
+    if (requestId !== healthRequestId) return;
 
     $('healthOk').textContent = summary.ok;
     $('healthWarn').textContent = summary.warn;
@@ -639,6 +656,7 @@ async function loadSourceHealth() {
       body.classList.add('open');
     }
   } catch (e) {
+    if (requestId !== healthRequestId) return;
     console.warn('loadSourceHealth failed:', e instanceof Error ? e.message : String(e));
     $('healthTableBody').innerHTML =
       '<tr><td colspan="6" class="empty">' + "获取状态失败" + '</td></tr>';
@@ -657,7 +675,7 @@ function renderHealthTable(records) {
     const latest = r.aggregation && r.aggregation.latest;
     const reason = (latest && latest.reason) || (r.status !== 'OK' && r.lastFailReason) || '';
     const cached = !!(reason && latest && latest.mode === 'restored');
-    const level = latest && latest.reason ? 'error' : r.status === 'ERR' ? 'error'
+    const level = r.waiting ? 'unknown' : latest && latest.reason ? 'error' : r.status === 'ERR' ? 'error'
                : r.status === 'WARN' ? 'warn' : 'ok';
     // Plan 03.1 D-12: 标签单元格悬浮显示具体错误（lastFailReason）
     // 标签优先使用后端返回的 label，否则按 fetchStatus 映射
@@ -674,12 +692,12 @@ function renderHealthTable(records) {
 
     return '<tr class="row-' + level + '">' +
       '<td><span class="health-dot ' + level + '"></span></td>' +
-      '<td>' + esc(r.name || 'Unnamed') + '</td>' +
+      '<td>' + esc(r.name || r.url) + '</td>' +
       '<td class="url-cell" title="' + esc(r.url) + '">' + esc(r.url) + '</td>' +
       '<td class="status-' + level + '"' +
         (r.status === 'OK' ? '' : ' title="' + esc(r.lastFailReason || '') + '"') +
         '>' + esc(statusLabel) + processing + '</td>' +
-      '<td>' + (r.local ? '--' : r.consecutiveFailures) + '</td>' +
+      '<td>' + (r.local || r.waiting ? '--' : r.consecutiveFailures) + '</td>' +
       '<td>' + lastOk + '</td>' +
     '</tr>';
   }).join('');
@@ -702,8 +720,10 @@ function labelFor(fetchStatus) {
 }
 
 async function triggerExport() {
+  if (exportPending || refreshPending || dashboardSyncRunning) return;
   const btn = $('exportBtn');
-  btn.disabled = true;
+  exportPending = true;
+  updateDashboardControls();
   btn.textContent = "导出中...";
   try {
     // D-10: auth.authFetch 带 Bearer Token
@@ -740,37 +760,42 @@ async function triggerExport() {
   } catch {
     toast("网络错误", 'error');
   } finally {
-    btn.disabled = false;
+    exportPending = false;
+    updateDashboardControls();
     btn.textContent = "导出配置";
   }
 }
 
 async function triggerRefresh() {
-  const btn = $('refreshBtn');
-  btn.textContent = "运行中...";
-  btn.className = 'btn btn-sm loading';
-  // 04-06: 同步触发期间禁用导出按钮（前端时序竞态修复）
-  // /refresh 阻塞到同步完成才返回，await 前同步禁用，finally 恢复
-  const exportBtn = $('exportBtn');
-  if (exportBtn) exportBtn.disabled = true;
+  if (refreshPending || dashboardSyncRunning) return;
+  refreshPending = true;
+  invalidateDashboardLoads();
+  updateDashboardControls();
+  toast("开始聚合");
   try {
     const res = await auth.authFetch('/refresh', { method: 'POST' });
+    if (res.status === 401) {
+      dashboardSyncRunning = false;
+      toast("登录已失效，请重新登录", 'error');
+      return;
+    }
     const d = await res.json();
-    if (d.success) {
-      toast("同步已开始");
-      setTimeout(loadStatus, 3000);
+    invalidateDashboardLoads();
+    if (typeof d.syncRunning === 'boolean') dashboardSyncRunning = d.syncRunning;
+    if (res.ok && d.success === true && d.outcome === 'saved') {
+      toast("聚合完成");
     } else {
-      toast("刷新失败", 'error');
+      const type = ['timeout', 'busy', 'no_sources', 'no_configs'].includes(d.outcome) ? 'warn' : 'error';
+      toast(d.message || d.error || "聚合失败", type);
     }
   } catch {
-    toast("网络错误", 'error');
+    toast("网络错误，无法确认聚合结果，请稍后查看状态", 'error');
   } finally {
-    if (exportBtn) exportBtn.disabled = false;
+    invalidateDashboardLoads();
+    refreshPending = false;
+    updateDashboardControls();
+    await Promise.allSettled([loadStatus, loadSourceHealth, loadSearchQuotaSummary].map(load => Promise.resolve().then(load)));
   }
-  setTimeout(() => {
-    btn.textContent = "立即聚合";
-    btn.className = 'btn btn-sm';
-  }, 3000);
 }
 
 applyTheme(getTheme());

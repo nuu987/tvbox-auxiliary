@@ -77,8 +77,14 @@ function initAuth(tokenInputId, errorId, overlayId, contentId, verifyUrl, onSucc
         overlay.style.display = 'none';
         content.style.display = 'block';
         onSuccess();
+      } else {
+        tokenInput.focus();
       }
+    }).catch(() => {
+      tokenInput.focus();
     });
+  } else {
+    tokenInput.focus();
   }
 
   return { doLogin, authFetch, getToken };

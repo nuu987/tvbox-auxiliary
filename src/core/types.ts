@@ -115,6 +115,7 @@ export interface NameTransformConfig {
 
 // JSON 导入结果
 export interface ImportResult {
+  inputKind?: 'single' | 'single_urls' | 'multi_urls' | 'multi_json';
   capacity?: SourceCapacity;
   success: boolean;
   type: 'multi' | 'single';
@@ -185,6 +186,8 @@ export type SourceFetchStatus =
   | 'fetch_failed';
 
 export interface SourceFetchResult {
+  acquisition?: 'remote' | 'import-cache';
+  acquiredAt?: string;
   url: string;
   name: string;
   status: SourceFetchStatus;
@@ -196,6 +199,8 @@ export interface SourceFetchResult {
 // 持久化的源健康记录
 // D-10: latestStatus 替换为 status (OK/WARN/ERR 分类级别) + fetchStatus (原始细分状态)
 export interface SourceHealthRecord {
+  acquisition?: 'remote' | 'import-cache';
+  generation?: string;
   url: string;
   name: string;
   status: 'OK' | 'WARN' | 'ERR';
@@ -286,6 +291,15 @@ export interface SearchQuotaReport {
 }
 
 // ═══ 聚合日志 ══════════════════════════════════════════
+
+export interface SyncResult {
+  outcome: 'saved' | 'no_sources' | 'no_configs' | 'failed';
+  message: string;
+}
+
+export type SyncRunResult = (SyncResult & { ran: true })
+  | { ran: false; outcome: 'busy'; message: string }
+  | { ran: true; outcome: 'timeout'; message: string };
 
 export interface AggLogFailedSource {
   url: string;

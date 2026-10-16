@@ -13,6 +13,7 @@ import {
   deduplicateStrings,
 } from './dedup';
 import { logger } from './logger';
+import { sourceDisplayName } from './source-name';
 
 /**
  * 将多个 TVBox 配置合并成一个
@@ -69,8 +70,8 @@ export function mergeConfigs(sourcedConfigs: SourcedConfig[]): MergeResult {
           sourceGroups.set(groupKey, origins);
         }
         const identity = sourced.sourceIdentity || sourced.sourceUrl;
-        if (typeof sourced.sourceName === 'string' && sourced.sourceName && !origins.has(identity)) {
-          origins.set(identity, sourced.sourceName);
+        if (!origins.has(identity)) {
+          origins.set(identity, sourceDisplayName({ name: sourced.sourceName, url: sourced.sourceUrl }));
         }
         siteGroups.set(siteCopy, origins);
         allSites.push(siteCopy);

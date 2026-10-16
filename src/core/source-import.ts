@@ -1,139 +1,168 @@
-import { randomUUID } from 'crypto';
 import type { ImportResult, ImportSkip, SourceEntry, TVBoxConfig } from './types';
-import { INLINE_PREFIX } from './config';
-import { extractMultiRepoEntries, inspectSourceOnce, isMultiRepoConfig, parseConfigJson } from './fetcher';
+import { fetchSingleConfig, isMultiRepoConfig, parseConfigJson, type FetchProxyConfig, type SingleFetchResult } from './fetcher';
 import { prepareSourceLeaf } from './source-leaf';
 import { sourceCapacity, sourceLimit, sourceLimitMessage } from './source-capacity';
+import { externalSourceEntry, SourceImportError } from './source-import-input';
+import type { AcceptedImport } from './source-import-cache';
+export { SourceImportError, importSourceEntry, externalSourceEntry } from './source-import-input';
 
-export class SourceImportError extends Error {
-  constructor(message: string, readonly status: 400 | 409 | 500 | 502 | 504) { super(message); }
-}
-export interface InspectionContext {
-  sources: SourceEntry[];
-  knownLeaves: Set<string>;
-  timeoutMs: number;
-  maxDataSources?: number;
-}
-export interface SourceImportInput { source?: SourceEntry; text?: string; config?: TVBoxConfig }
-export interface SourceImportPlan {
-  entries: SourceEntry[];
-  result: ImportResult;
-  /** Temporary inline content, never a successful snapshot. */
-  inline?: { key: string; text: string };
-  usable: number;
-}
-
-export function importSourceEntry(source: SourceEntry): SourceEntry {
-  const [url, ...keys] = source.url.trim().split(';pk;');
-  let parsed: URL;
-  try { parsed = new URL(url); } catch { throw new SourceImportError('Invalid URL format', 400); }
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new SourceImportError('Only HTTP(S) source URLs are supported', 400);
-  const configKey = source.configKey?.trim() || keys.join(';pk;');
-  return { name: source.name, url, ...(configKey ? { configKey } : {}) };
-}
-
-function fetchFailure(result: Awaited<ReturnType<typeof inspectSourceOnce>>['fetchResult']): ImportSkip {
-  return { url: result.url, name: result.name, reason: result.errorMessage || result.status,
-    stage: result.status === 'decode_error' ? 'decode' : result.status === 'parse_error' ? 'parse' : 'acquisition' };
-}
+interface ImportContext { sources: SourceEntry[]; timeoutMs: number; maxDataSources?: number; proxyConfig?: FetchProxyConfig }
+export interface SourceImportPlan { entries: SourceEntry[]; accepted: AcceptedImport[]; result: ImportResult }
+export interface SourceImportInput { source?: SourceEntry; text?: string }
+type Acquired = SingleFetchResult & { acquiredAt: number };
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
+const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+function kind(config: TVBoxConfig | null): 'multi' | 'single' | 'invalid' {
+  if (!config) return 'invalid';
+  return isMultiRepoConfig(config) ? 'multi' : Array.isArray(config.sites) ? 'single' : 'invalid';
+}
+async function mapFour<T, R>(values: T[], work: (value: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(values.length);
+  let cursor = 0;
+  const workers = await Promise.allSettled(Array.from({ length: Math.min(4, values.length) }, async () => {
+    while (cursor < values.length) { const index = cursor++; results[index] = await work(values[index]); }
+  }));
+  const failed = workers.find((worker): worker is PromiseRejectedResult => worker.status === 'rejected');
+  if (failed) throw failed.reason;
+  return results;
+}
 
-/** Memory-only, one-level inspection; never publishes cache, health or output. */
-export async function planSourceImport(input: SourceImportInput, context: InspectionContext): Promise<SourceImportPlan> {
+/** Memory-only plan; each acquisition promise serves classification and staging. */
+export async function planSourceImport(input: SourceImportInput, context: ImportContext): Promise<SourceImportPlan> {
   const result: ImportResult = { success: false, type: 'single', outcome: 'none', checked: 0,
-    added: 0, duplicates: 0, sources: [], skipped: [] };
-  const plan: SourceImportPlan = { entries: [], result, usable: 0 };
+    added: 0, duplicates: 0, sources: [], skipped: [], inputKind: input.source ? 'single' : undefined };
+  const plan: SourceImportPlan = { entries: [], accepted: [], result };
+  const existing = new Set(context.sources.map(s => s.url));
   const limit = sourceLimit(context);
-  const available = sourceCapacity(context.sources.length, limit).remaining;
-  if (available === 0 && !input.config) throw new SourceImportError(sourceLimitMessage(limit), 409);
-  const source = input.source ? importSourceEntry(input.source) : undefined;
-  let config = input.config;
-  if (!config && source) {
-    result.checked++;
-    const acquired = await inspectSourceOnce(source, context.timeoutMs);
-    if (!acquired.config) {
-      const failure = fetchFailure(acquired.fetchResult);
-      throw new SourceImportError(failure.reason, acquired.fetchResult.status === 'timeout' ? 504
-        : failure.stage === 'acquisition' ? 502 : 400);
+  const remaining = sourceCapacity(context.sources.length, limit).remaining;
+  if (remaining === 0) throw new SourceImportError(sourceLimitMessage(limit), 409);
+  const preferred = new Map<string, SourceEntry>();
+  const acquisitions = new Map<string, Promise<Acquired>>();
+  const select = (source: SourceEntry) => {
+    const first = preferred.get(source.url);
+    if (first) return first;
+    preferred.set(source.url, source); return source;
+  };
+  const acquire = (source: SourceEntry): Promise<Acquired> => {
+    source = select(source);
+    let pending = acquisitions.get(source.url);
+    if (!pending) {
+      result.checked++;
+      pending = fetchSingleConfig(source, context.timeoutMs, context.proxyConfig).then(value => ({ ...value, acquiredAt: Date.now() }));
+      acquisitions.set(source.url, pending);
     }
-    config = acquired.config;
-  } else if (!config) {
-    result.checked++;
-    const parsed = parseConfigJson(input.text || '');
-    if (!parsed.ok) throw new SourceImportError(`${parsed.errorCategory}: ${parsed.message}`, 400);
-    config = parsed.config!;
+    return pending;
+  };
+  const failure = (entry: SourceEntry, acquired: Acquired): ImportSkip => ({ url: entry.url, name: entry.name,
+    reason: acquired.fetchResult.errorMessage || acquired.fetchResult.status,
+    stage: acquired.fetchResult.status === 'decode_error' ? 'decode' : acquired.fetchResult.status === 'parse_error' ? 'parse' : 'acquisition' });
+  const capacity = (candidates: SourceEntry[]) => {
+    const count = new Set(candidates.filter(s => !existing.has(s.url)).map(s => s.url)).size;
+    if (remaining !== null && count > remaining) throw new SourceImportError(`${sourceLimitMessage(limit)}`, 409,
+      sourceCapacity(context.sources.length, limit, count - remaining));
+  };
+  const accepted = new Set<string>();
+  const checkLeaf = (entry: SourceEntry, acquired: Acquired): ImportSkip | undefined => {
+    if (!acquired.config) return failure(entry, acquired);
+    const type = kind(acquired.config);
+    if (type === 'multi') return { url: entry.url, name: entry.name, reason: '嵌套多仓已忽略，不支持', stage: 'directory' };
+    if (type === 'invalid') return { url: entry.url, name: entry.name, reason: '无法识别接口类型，需要单仓配置', stage: 'parse' };
+    try { prepareSourceLeaf(entry, copy(acquired.config)); }
+    catch (error) { return { url: entry.url, name: entry.name, reason: message(error), stage: 'preparation' }; }
+    accepted.add(entry.url);
+    plan.entries.push(entry);
+    plan.accepted.push({ entry, config: copy(acquired.config), acquiredAt: acquired.acquiredAt });
+  };
+  const finish = () => {
+    result.added = plan.entries.length;
+    result.sources = plan.entries.map(s => s.url);
+    result.success = result.added > 0;
+    result.outcome = result.added ? result.skipped.length ? 'partial' : 'added'
+      : result.duplicates && !result.skipped.length ? 'duplicates_only' : 'none';
+    result.capacity = sourceCapacity(context.sources.length + result.added, limit);
+    return plan;
+  };
+  if (input.source) {
+    // External validation precedes normalization at the route boundary.
+    const source = select(input.source);
+    if (existing.has(source.url)) { result.duplicates++; return finish(); }
+    capacity([source]);
+    const acquired = await acquire(source);
+    if (kind(acquired.config) === 'multi') throw new SourceImportError('此地址为多仓接口，请使用高级添加', 400);
+    const error = checkLeaf(source, acquired);
+    if (error) throw new SourceImportError(error.reason, acquired.fetchResult.status === 'timeout' ? 504
+      : error.stage === 'acquisition' ? 502 : 400);
+    return finish();
   }
-  const existing = new Map(context.sources.map(entry => [entry.url, entry]));
-  if (!isMultiRepoConfig(config!)) {
-    const entry = source || { name: 'Inline Config', url: `inline://${INLINE_PREFIX}${randomUUID()}` };
-    try { prepareSourceLeaf(entry, config!); }
-    catch (error) { throw new SourceImportError(message(error), 400); }
-    plan.usable = 1;
-    if (existing.has(entry.url)) result.duplicates++;
-    else if (available === 0) result.skipped.push({ url: entry.url, name: entry.name, reason: sourceLimitMessage(limit), stage: 'capacity' });
-    else {
-      plan.entries.push(entry);
-      if (!source) plan.inline = { key: entry.url.slice('inline://'.length), text: input.text! };
-    }
+
+  const text = (input.text || '').trim();
+  if (!text) throw new SourceImportError('请输入接口地址或多仓JSON', 400);
+  const rootInputs: Array<SourceEntry | ImportSkip> = [];
+  const directories: Array<{ config: TVBoxConfig; name: string }> = [];
+  if (/^[{\[]|^\/\//.test(text) || text.startsWith('/*')) {
+    const parsed = parseConfigJson(text); result.checked++;
+    if (!parsed.ok || !parsed.config || kind(parsed.config) !== 'multi') throw new SourceImportError('仅支持一份完整多仓JSON，或每行一条单仓/多仓地址；不可混合粘贴', 400);
+    result.type = 'multi'; result.inputKind = 'multi_json';
+    directories.push({ config: parsed.config, name: 'Imported' });
   } else {
-    result.type = 'multi';
-    const entries = extractMultiRepoEntries(config!, source?.name || 'Imported');
-    if (!entries.length) result.skipped.push({ reason: '多仓目录没有可导入的单仓地址', stage: 'directory' });
-    const seen = new Set<string>();
-    type Outcome = { entry?: SourceEntry; skip?: ImportSkip; duplicate?: boolean; usable?: boolean };
-    const outcomes: Outcome[] = new Array(entries.length);
-    const queued: Array<{ entry: SourceEntry; index: number }> = [];
-    entries.forEach((raw, index) => {
-      let entry: SourceEntry;
-      try { entry = importSourceEntry(raw); }
-      catch (error) { outcomes[index] = { skip: { name: raw.name, url: raw.url.split(';pk;')[0], reason: message(error), stage: 'input' } }; return; }
-      if (entry.url === source?.url) {
-        outcomes[index] = { skip: { name: entry.name, url: entry.url, reason: '跳过目录自引用', stage: 'directory' } }; return;
-      }
-      if (seen.has(entry.url)) { outcomes[index] = { duplicate: true }; return; }
-      seen.add(entry.url);
-      if (existing.has(entry.url) && context.knownLeaves.has(entry.url)) {
-        outcomes[index] = { duplicate: true, usable: true }; return;
-      }
-      queued.push({ entry: existing.get(entry.url) || entry, index });
-    });
-    let cursor = 0;
-    let accepted = 0;
-    while (cursor < queued.length) {
-      const slots = available === null ? 4 : available - accepted;
-      if (slots <= 0) {
-        for (const { entry, index } of queued.slice(cursor)) outcomes[index] = existing.has(entry.url)
-          ? { duplicate: true } : { skip: { url: entry.url, name: entry.name, reason: sourceLimitMessage(limit), stage: 'capacity' } };
-        break;
-      }
-      const batch = queued.slice(cursor, cursor + Math.min(4, slots));
-      cursor += batch.length;
-      await Promise.all(batch.map(async ({ entry, index }) => {
-        result.checked++;
-        const acquired = await inspectSourceOnce(entry, context.timeoutMs);
-        if (!acquired.config) { outcomes[index] = { skip: fetchFailure(acquired.fetchResult) }; return; }
-        if (isMultiRepoConfig(acquired.config)) {
-          outcomes[index] = { skip: { url: entry.url, name: entry.name, reason: '不支持嵌套多仓，已跳过', stage: 'directory' } }; return;
-        }
-        try {
-          prepareSourceLeaf(entry, acquired.config);
-          outcomes[index] = existing.has(entry.url) ? { duplicate: true, usable: true } : { entry, usable: true };
-        } catch (error) { outcomes[index] = { skip: { url: entry.url, name: entry.name, reason: message(error), stage: 'preparation' } }; }
-      }));
-      accepted += batch.filter(({ index }) => !!outcomes[index].entry).length;
+    // Never extract URLs from malformed JSON, or split suffix keys/punctuation.
+    if (/[\r\n]\s*[{\[]/.test(text)) throw new SourceImportError('JSON内容与接口地址不可混合粘贴', 400);
+    for (const [i, line] of text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).entries()) {
+      try { rootInputs.push(select(externalSourceEntry({ url: line }))); }
+      catch (error) { rootInputs.push({ name: `第${i + 1}条`, url: line.split(';pk;')[0], reason: message(error), stage: 'input' }); }
     }
-    for (const outcome of outcomes) {
-      if (outcome.entry) plan.entries.push(outcome.entry);
-      if (outcome.duplicate) result.duplicates++;
-      if (outcome.skip) result.skipped.push(outcome.skip);
-      if (outcome.usable) plan.usable++;
+    const unique = [...new Map(rootInputs.filter((s): s is SourceEntry => !('stage' in s)).map(s => [s.url, s])).values()];
+    const values = await mapFour(unique, acquire);
+    const byUrl = new Map(unique.map((s, i) => [s.url, values[i]]));
+    const types = new Set(values.map(a => kind(a.config)).filter(t => t !== 'invalid'));
+    if (types.size > 1) throw new SourceImportError('单仓地址与多仓地址不可混合导入，本批未添加任何接口', 400);
+    result.type = types.has('multi') ? 'multi' : 'single';
+    result.inputKind = result.type === 'multi' ? 'multi_urls' : 'single_urls';
+    if (types.has('single')) capacity(unique);
+    const seenRoots = new Set<string>();
+    for (const root of rootInputs) {
+      if ('stage' in root) { result.skipped.push(root); continue; }
+      if (seenRoots.has(root.url)) { result.duplicates++; continue; }
+      seenRoots.add(root.url);
+      const acquired = byUrl.get(root.url)!;
+      if (!acquired.config) { result.skipped.push(failure(root, acquired)); continue; }
+      if (kind(acquired.config) === 'invalid') {
+        result.skipped.push({ url: root.url, name: root.name, reason: '无法识别接口类型', stage: 'parse' }); continue;
+      }
+      if (result.type === 'multi') directories.push({ config: acquired.config, name: root.name });
+      else if (existing.has(root.url)) result.duplicates++;
+      else { const error = checkLeaf(root, acquired); if (error) result.skipped.push(error); }
     }
   }
-  result.added = plan.entries.length;
-  result.sources = plan.entries.map(entry => entry.url);
-  result.success = result.added > 0;
-  result.capacity = sourceCapacity(context.sources.length + result.added, limit, result.skipped.filter(item => item.stage === 'capacity').length);
-  result.outcome = result.added ? result.skipped.length ? 'partial' : 'added'
-    : result.duplicates && !result.skipped.length ? 'duplicates_only' : 'none';
-  return plan;
+  if (directories.length) {
+    const children: Array<SourceEntry | ImportSkip> = [];
+    for (const directory of directories) {
+      const raw = directory.config as Record<string, unknown>;
+      const storeHouse = Array.isArray(raw.storeHouse);
+      const items = (storeHouse ? raw.storeHouse : raw.urls) as unknown[];
+      if (!items.length) children.push({ name: directory.name, reason: '多仓目录没有可导入的单仓地址', stage: 'directory' });
+      items.forEach((item, i) => {
+        const value = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : {};
+        const url = storeHouse ? value.sourceUrl : value.url;
+        const name = storeHouse ? value.sourceName : value.name;
+        try { children.push(select(externalSourceEntry({ url, name, configKey: value.configKey }))); }
+        catch (error) { children.push({ name: typeof name === 'string' ? name : `${directory.name} 第${i + 1}条`,
+          url: typeof url === 'string' ? url.split(';pk;')[0] : undefined, reason: message(error), stage: 'input' }); }
+      });
+    }
+    const candidates = [...new Map(children.filter((s): s is SourceEntry => !('stage' in s)).map(s => [s.url, s])).values()];
+    capacity(candidates);
+    const fresh = candidates.filter(s => !existing.has(s.url));
+    const values = await mapFour(fresh, acquire);
+    const byUrl = new Map(fresh.map((s, i) => [s.url, values[i]]));
+    const seen = new Set<string>();
+    for (const child of children) {
+      if ('stage' in child) { result.skipped.push(child); continue; }
+      if (seen.has(child.url) || existing.has(child.url) || accepted.has(child.url)) { result.duplicates++; continue; }
+      seen.add(child.url);
+      const error = checkLeaf(child, byUrl.get(child.url)!);
+      if (error) result.skipped.push(error);
+    }
+  }
+  return finish();
 }

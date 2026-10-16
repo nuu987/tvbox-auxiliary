@@ -1,12 +1,12 @@
 import test, { beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, existsSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import type { Storage } from '../src/storage/interface';
 import type { SourceEntry, TVBoxConfig, TVBoxSite, AppConfig } from '../src/core/types';
 import { SourceFallbackRound, withSourceGate, saveSourceRoots, sourceAggregationStatuses } from '../src/core/source-fallback';
-import { fetchConfigs, parseConfigJson } from '../src/core/fetcher';
+import { fetchConfigs, fetchSingleConfig, parseConfigJson } from '../src/core/fetcher';
 import { decodeConfigResponse } from '../src/core/decoder';
 import { mergeConfigs } from '../src/core/merger';
 import { JsonFileStorage } from '../src/storage/json-file';
@@ -19,6 +19,9 @@ import { createConfigEditorRouter } from '../src/routes/config-editor';
 import { createExportConfigRouter } from '../src/routes/export-config';
 import { createCloudCredRouter } from '../src/routes/cloud-credentials';
 import { createRefreshRouter } from '../src/routes/refresh';
+import { createJarProxyRouter } from '../src/routes/jar-proxy';
+import { downloadResource, parseSpiderString, urlToKey } from '../src/core/jar-proxy';
+import { getSiteResourceDir } from '../src/core/site-store';
 import { createLiveSourcesRouter } from '../src/routes/live-sources';
 import { createSettingsRouter } from '../src/routes/settings';
 import { readAggregateOutputs, publishAggregatePatch } from '../src/core/aggregate-output';
@@ -37,16 +40,19 @@ import { normalizePlaylist } from '../src/core/live-playlist';
 import { loadLivePolicy } from '../src/core/live-policy';
 import { cacheableLive } from '../src/core/live-source';
 import { parseMaxDataSources, sourceLimit } from '../src/core/source-capacity';
+import { createSyncRunner, sourceActivity, SourceActivity } from '../src/core/source-activity';
+import { ImportCacheRound, IMPORT_CACHE_TTL_MS } from '../src/core/source-import-cache';
 import { adminHtml } from '../src/core/admin';
 import { dashboardHtml } from '../src/core/dashboard';
 import { configEditorHtml } from '../src/core/config-editor';
 import { encodeSiteSourceAttribution } from '../src/core/site-source-attribution';
 import { Script, createContext } from 'node:vm';
+import { createCipheriv } from 'node:crypto';
 import { BLACKLIST, MANUAL_SOURCES, MERGED_CONFIG, LAST_UPDATE, SOURCE_CONFIG_SNAPSHOTS,
   SOURCE_PROCESSING_REPORT, SOURCE_HEALTH, MACCMS_SOURCES,
   MERGED_CONFIG_FULL, EXPORT_CONFIG, SOURCE_OUTPUT_STATE, SOURCE_IMPORT_POLICY_STATE, SOURCE_URLS,
   SITE_SOURCE_ATTRIBUTION, EDGE_PROXIES, LIVE_DISABLED, LIVE_SOURCES, SMART_JAR_URL_ENABLED,
-  LIVE_CACHE_STATE, NAME_TRANSFORM } from '../src/core/config';
+  LIVE_CACHE_STATE, NAME_TRANSFORM, SOURCE_IMPORT_CACHE } from '../src/core/config';
 
 class MemoryStorage implements Storage {
   data = new Map<string, string>();
@@ -76,13 +82,21 @@ const adminHeaders = { Authorization: 'Bearer test-token' };
 let directory: string;
 let restoreMocks: (() => void)[] = [];
 const realTimeout = globalThis.setTimeout;
+function clock(value: number) {
+  const original = Date.now;
+  let now = value;
+  Date.now = () => now;
+  restoreMocks.push(() => { Date.now = original; });
+  return (next: number) => { now = next; };
+}
+async function importCache(storage: Storage) { return JSON.parse((await storage.get(SOURCE_IMPORT_CACHE)) || '{"version":1,"entries":{}}'); }
 
 beforeEach(() => {
   directory = mkdtempSync(path.join(tmpdir(), 'tvbox-fallback-case-'));
   process.env.DATA_DIR = directory;
   // Preserve production retries but eliminate real backoff waits in mocked regressions.
   globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) =>
-    realTimeout(fn, ms && ms >= 4000 && ms <= 24000 ? 0 : ms, ...args)) as typeof setTimeout;
+    realTimeout(fn, ms && ms >= 800 && ms <= 6000 ? 0 : ms, ...args)) as typeof setTimeout;
   for (const method of ['log', 'warn', 'error'] as const) {
     const original = console[method]; console[method] = () => {};
     restoreMocks.push(() => { console[method] = original; });
@@ -261,13 +275,14 @@ test('URL and pasted imports plus stored inline reads preserve compatible conten
   const { input, text } = compatibleFixture();
   mockFetch(url => url === A.url ? new Response(text) : response(leaf('B1')));
   const router = createSourceMgmtRouter({ storage, config });
-  for (const importInput of [A.url, text]) {
+  for (const importInput of [A.url]) {
     const result = await router.request('/admin/sources/import', { method: 'POST',
       headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
       body: JSON.stringify({ input: importInput }) });
     assert.equal(result.status, 200);
   }
-  const local = JSON.parse((await storage.get(MANUAL_SOURCES))!).find((s: SourceEntry) => s.url.startsWith('inline://'));
+  const local = { name: 'Existing inline', url: 'inline://inline_config_compatible' };
+  await roots(storage, [A, local]); await storage.put('inline_config_compatible', text);
   assert.equal(await storage.get(local.url.replace('inline://', '')), text);
   await runSync(storage, config);
   assert.deepEqual((await snapshot(storage, A)).config, input);
@@ -360,16 +375,12 @@ test('fresh TVBox field variants pass existing normalization and survive saved f
   assert.equal(record.aggregation.lastSuccessful.snapshotTime, cached.savedAt);
 });
 
-test('inline import preserves object style through normalization, merge and missing-content fallback', async () => {
+test('existing inline preserves object style through normalization, merge and missing-content fallback', async () => {
   const storage = new MemoryStorage(); await roots(storage, [B]);
   const input: TVBoxConfig = { sites: [{ key: 'local-compatible', name: 'Local compatible', type: 3, api: 'csp_local',
     style: { type: 'rect', ratio: 1.597 } }] };
-  const router = createSourceMgmtRouter({ storage, config });
-  const result = await router.request('/admin/sources/import', { method: 'POST',
-    headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ input: JSON.stringify(input) }) });
-  assert.equal(result.status, 200);
-  const local = JSON.parse((await storage.get(MANUAL_SOURCES))!).find((s: SourceEntry) => s.url.startsWith('inline://'));
+  const local = { name: 'Existing inline', url: 'inline://inline_config_style' };
+  await roots(storage, [B, local]); await storage.put('inline_config_style', JSON.stringify(input));
   mockFetch(() => response(leaf('B1')));
   await runSync(storage, config);
   const cached = await snapshot(storage, local);
@@ -438,7 +449,7 @@ test('no TTL or restore-count limit; more than 50 real failing rounds keep true 
     assert.equal(health.lastSuccessTime, healthBefore.lastSuccessTime);
     assert.equal(JSON.parse((await storage.get(MERGED_CONFIG))!).sites[0].key, 'A1');
   }
-  assert.equal(attempts, 2 + 4 * 51); // First upgrade run classifies once before ordinary acquisition.
+  assert.equal(attempts, 2 + 3 * 51); // First upgrade run classifies once before ordinary acquisition.
   assert.equal((await snapshot(storage)).savedAt, '2020-01-01T00:00:00.000Z');
   assert.deepEqual((await snapshot(storage)).config, before.config);
   const api = await status(storage); const a = api.records.find((s: any) => s.url === A.url);
@@ -554,6 +565,7 @@ test('real deletion/key change during awaited fetch rejects old final output and
 
   await seed(storage, [A]);
   const keyWaiting = new Promise<void>(r => { acquired = r; });
+  await storage.delete(SOURCE_IMPORT_CACHE); // This case exercises an actual awaited download, not import reuse.
   holdNext = true;
   const keySyncing = runSync(storage, config); await keyWaiting;
   await roots(storage, [{ ...A, configKey: 'new-key' }]);
@@ -722,7 +734,7 @@ test('fresh and restored sites are not probed, filtered or tagged regardless of 
 test('retired setting routes return 404 while other settings, MacCMS validation and retired channel probes stay unavailable', async () => {
   const storage = new MemoryStorage(); await storage.put('speed_test_enabled', 'true');
   const app = createApp({ storage, config: { ...config, siteTimeoutMs: 5 }, runtime: idleRuntime,
-    triggerRefresh: async () => ({ ran: false }) });
+    triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: '正在聚合' }) });
   for (const method of ['GET', 'PUT']) {
     const res = await app.request('/admin/speed-test', { method, headers: adminHeaders,
       ...(method === 'PUT' ? { body: JSON.stringify({ enabled: false }) } : {}) });
@@ -826,11 +838,10 @@ test('source import routes establish membership but eligibility waits for a save
   assert.equal((await request(JSON.stringify(index(A, B)))).status, 200);
   assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!).map((s: SourceEntry) => s.url), [A.url, B.url]);
   assert.equal(await snapshot(storage), undefined);
-  assert.equal((await request(JSON.stringify(leaf('local-import')))).status, 200);
-  const local = JSON.parse((await storage.get(MANUAL_SOURCES))!).find((s: SourceEntry) => s.url.startsWith('inline://'));
-  assert.equal(await snapshot(storage, local), undefined);
+  assert.equal((await request(JSON.stringify(leaf('local-import')))).status, 400);
+  assert.equal(await snapshot(storage), undefined);
   mockFetch(() => response(leaf('remote'))); await runSync(storage, config);
-  assert.equal((await snapshot(storage, local)).config.sites[0].key, 'local-import');
+  assert.equal((await snapshot(storage)).config.sites[0].key, 'remote');
 });
 
 test('MacCMS-only aggregation still saves output and mixed rounds do not give MacCMS VOD fallback snapshots', async () => {
@@ -871,7 +882,7 @@ test('sources and health details render truthful acquisition plus escaped round-
     const tableStart = script.indexOf('function renderHealthTable(records)');
     const tableEnd = script.indexOf('// Plan 03.1 D-06:', tableStart);
     const elements: Record<string, { innerHTML: string; textContent?: unknown }> = {};
-    const context = createContext({ input: record, healthMap: {},
+    const context = createContext({ input: record, healthMap: {}, document: { querySelectorAll: () => [] },
       $: (id: string) => elements[id] ||= { innerHTML: '' },
       esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
       auth: { authFetch: async () => ({ ok: true, headers: new Headers({ 'X-Max-Data-Sources': '6' }), json: async () => [A] }) },
@@ -906,7 +917,7 @@ async function renderSourceRow(record?: object, source: SourceEntry = A) {
   const start = script.indexOf('async function loadSources()');
   const end = script.indexOf('// --- Add source ---', start);
   const elements: Record<string, { innerHTML: string; textContent?: unknown }> = {};
-  const context = createContext({ healthMap: record ? { [source.url]: record } : {},
+  const context = createContext({ healthMap: record ? { [source.url]: record } : {}, document: { querySelectorAll: () => [] },
     $: (id: string) => elements[id] ||= { innerHTML: '' },
     esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
@@ -1073,7 +1084,8 @@ test('deleting the only source keeps output pending across restart, then blocks 
   assert.deepEqual(await rawOutputs(storage), previous);
   storage = new JsonFileStorage(file);
   assert.ok((await readAggregateOutputs(storage))?.merged?.includes('A1'));
-  const skipped = createRefreshRouter({ storage, config, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  const skipped = createRefreshRouter({ storage, config, runtime: idleRuntime,
+    triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: '正在聚合' }) });
   assert.equal((await skipped.request('/refresh', { method: 'POST', headers: adminHeaders })).status, 200);
   assert.equal((await outputState(storage)).pending, true);
   await runSync(storage, config);
@@ -1248,7 +1260,7 @@ test('all final output keys publish together and injected batch failures preserv
   assert.equal(await snapshot(storage), undefined);
 });
 
-test('timed-out late aggregation cannot overwrite newer outputs even when the newer snapshot publication failed', async () => {
+test('timed-out aggregation retains ownership until actual completion and blocks import and another run', async () => {
   const storage = new MemoryStorage(); await roots(storage, [A]);
   mockFetch(() => response(leaf('baseline'))); await runSync(storage, config);
   let acquired!: () => void; let resume!: () => void;
@@ -1258,32 +1270,21 @@ test('timed-out late aggregation cannot overwrite newer outputs even when the ne
     storage.failPut = SOURCE_CONFIG_SNAPSHOTS;
     return response(leaf('newest'));
   });
-  // Execute the real timeout wrapper without starting a server or waiting five minutes.
-  const source = readFileSync(path.join(process.cwd(), 'src/node-entry.ts'), 'utf8');
-  const wrapper = source.slice(source.indexOf('const runWithGuard = async'), source.indexOf('// 动态 cron 管理'))
-    .replace('opts?: { source?: \'cron\' | \'manual\' }', 'opts')
-    .replace(': Promise<{ ran: boolean }>', '').replace('catch (err: unknown)', 'catch (err)');
-  const timers: (() => void)[] = []; const runs: Promise<void>[] = [];
-  const context = createContext({ storage, config, SYNC_TIMEOUT_MS: 300_000,
-    logger: { info: () => {}, warn: () => {}, error: () => {} }, getDirtyMarker: async () => null, clearDirtyMarker: async () => {},
-    setTimeout: (fn: () => void) => { timers.push(fn); return 0; },
-    runSync: (s: Storage, c: AppConfig) => { const run = runSync(s, c); runs.push(run); return run; } });
-  const guard = new Script('let refreshRunning = false; ' + wrapper + '\nrunWithGuard;').runInContext(context) as () => Promise<{ ran: boolean }>;
+  const runs: ReturnType<typeof runSync>[] = [];
+  const activity = sourceActivity(storage);
+  const guard = createSyncRunner(activity, () => { const running = runSync(storage, config); runs.push(running); return running; }, 5);
   const first = guard(); await waiting;
   assert.equal((await guard()).ran, false); // Skipped requests do not start a new ticket.
   const firstRun = (await outputState(storage)).activeRun;
-  timers[0](); assert.equal((await first).ran, true);
+  assert.equal((await first).ran, true);
   assert.equal((await outputState(storage)).activeRun, firstRun);
+  assert.equal((await guard()).ran, false);
+  assert.equal((await sourceRequest(storage, B, '/admin/sources')).status, 409);
+  assert.equal(requests, 1);
+  resume(); await runs[0]; await Promise.resolve();
+  assert.equal(activity.kind, undefined);
   assert.equal((await guard()).ran, true);
-  const newestOutputs = await rawOutputs(storage); const newestTime = await storage.get(LAST_UPDATE);
-  const newestAttribution = await storage.get(SITE_SOURCE_ATTRIBUTION);
-  assert.ok(newestOutputs.every(raw => raw!.includes('newest')));
-  assert.equal((await snapshot(storage)).config.sites[0].key, 'baseline');
-  storage.failPut = undefined; resume(); await runs[0];
-  assert.deepEqual(await rawOutputs(storage), newestOutputs);
-  assert.equal(await storage.get(SITE_SOURCE_ATTRIBUTION), newestAttribution);
-  assert.equal(await storage.get(LAST_UPDATE), newestTime);
-  assert.equal((await readAggregateOutputs(storage))!.full!.includes('late-old'), false);
+  assert.ok((await readAggregateOutputs(storage))!.full!.includes('newest'));
 });
 
 test('a newer started but failed round still prevents an older candidate from publishing any view', async () => {
@@ -1441,8 +1442,8 @@ test('deletion with unreadable registry after restart persists revoked eligibili
   await assertUnavailableViews(restarted);
 });
 
-test('ordinary Add and URL/paste Import share one-layer inspection, child keys and deterministic sibling results', async () => {
-  for (const mode of ['add', 'url', 'paste']) {
+test('advanced URL/paste Import shares acquisition, child suffix keys and deterministic sibling results', async () => {
+  for (const mode of ['url', 'paste']) {
     const storage = new MemoryStorage(); const requests: string[] = [];
     const directory = { storeHouse: [{ sourceName: 'Child A', sourceUrl: A.url + ';pk;child-key' },
       { sourceName: 'Nested', sourceUrl: N.url }, { sourceName: 'Bad', sourceUrl: B.url }] } as TVBoxConfig;
@@ -1451,9 +1452,7 @@ test('ordinary Add and URL/paste Import share one-layer inspection, child keys a
       return url === M.url ? response(directory) : url === A.url ? response(leaf('good'))
         : url === N.url ? response(index({ name: 'Never', url: 'https://never.test/config.json' })) : new Response('', { status: 404 });
     });
-    const res = await sourceRequest(storage, mode === 'add' ? { ...M, configKey: 'parent-key' }
-      : { input: mode === 'url' ? M.url + ';pk;parent-key' : JSON.stringify(directory) },
-      mode === 'add' ? '/admin/sources' : '/admin/sources/import');
+    const res = await sourceRequest(storage, { input: mode === 'url' ? M.url + ';pk;parent-key' : JSON.stringify(directory) });
     assert.equal(res.status, 200); const result = await res.json() as any;
     assert.deepEqual([result.success, result.outcome, result.added, result.duplicates, result.skipped.length], [true, 'partial', 1, 0, 2]);
     assert.deepEqual(result.skipped.map((skip: any) => skip.url), [N.url, B.url]);
@@ -1466,7 +1465,7 @@ test('ordinary Add and URL/paste Import share one-layer inspection, child keys a
   }
 });
 
-test('Add/Import reject initial failures once and never save unverified inputs or update health', async () => {
+test('Add/Import keep normal retries and never save unverified inputs or update health', async () => {
   const cases: Array<[() => Response | Promise<Response>, number]> = [
     [() => new Response('', { status: 403 }), 502],
     [() => new Response('{broken'), 400], [() => response({}), 400],
@@ -1476,8 +1475,10 @@ test('Add/Import reject initial failures once and never save unverified inputs o
     const storage = new MemoryStorage(); let requests = 0;
     mockFetch(() => { requests++; return handler(); });
     const res = await sourceRequest(storage, path.endsWith('/import') ? { input: A.url } : A, path);
-    assert.equal(res.status, code); assert.equal(requests, 1);
-    assert.ok((await res.json() as any).error);
+    assert.equal(res.status, path.endsWith('/import') ? 200 : code);
+    assert.equal(requests, code === 400 ? handler === cases[2][0] ? 1 : 6 : 3);
+    const detail = await res.json() as any;
+    assert.ok(path.endsWith('/import') ? detail.skipped.length : detail.error);
     assert.equal(await storage.get(MANUAL_SOURCES), null); assert.equal(await storage.get(SOURCE_HEALTH), null);
     assert.equal(await storage.get(SOURCE_CONFIG_SNAPSHOTS), null);
   }
@@ -1495,8 +1496,8 @@ test('all-skipped empty and duplicate-only results are truthful; known duplicate
   const d = await duplicate.json() as any;
   assert.deepEqual([d.success, d.outcome, d.added, d.duplicates, requests], [false, 'duplicates_only', 0, 2, 1]);
   assert.deepEqual(await snapshot(storage), before);
-  const addDuplicate = await sourceRequest(storage, { ...A, name: 'replace', configKey: 'changed' }, '/admin/sources');
-  assert.equal(addDuplicate.status, 409); assert.equal(requests, 1);
+  const addDuplicate = await sourceRequest(storage, { ...A, name: 'replace' }, '/admin/sources');
+  assert.equal(addDuplicate.status, 200); assert.equal(requests, 1);
   assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!), [A]);
   mockFetch(url => response(url === M.url ? index(N, M) : index(B)));
   const none = await sourceRequest(storage, { input: M.url }); const result = await none.json() as any;
@@ -1506,7 +1507,7 @@ test('all-skipped empty and duplicate-only results are truthful; known duplicate
   assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!), [A]);
 });
 
-test('unclassified duplicate directories are inspected and rejected; parsing failures isolate normal siblings', async () => {
+test('existing URLs are skipped unchanged; parsing failures isolate normal siblings', async () => {
   const storage = new MemoryStorage(); await roots(storage, [N]); const requests: string[] = [];
   const unusable: SourceEntry = { name: 'Unusable', url: 'https://empty.test/config.json' };
   mockFetch(url => {
@@ -1515,9 +1516,9 @@ test('unclassified duplicate directories are inspected and rejected; parsing fai
       : url === B.url ? new Response('{broken') : response({});
   });
   const res = await sourceRequest(storage, { input: M.url }); const result = await res.json() as any;
-  assert.equal(result.added, 1); assert.equal(result.skipped.length, 4);
-  assert.deepEqual(result.skipped.map((skip: any) => skip.stage), ['directory', 'parse', 'preparation', 'input']);
-  assert.equal(requests.filter(url => url === N.url).length, 1);
+  assert.equal(result.added, 1); assert.equal(result.skipped.length, 3); assert.equal(result.duplicates, 1);
+  assert.deepEqual(result.skipped.map((skip: any) => skip.stage), ['parse', 'parse', 'input']);
+  assert.equal(requests.filter(url => url === N.url).length, 0);
   assert.ok(!JSON.stringify(result).includes('private'));
   assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!).map((entry: SourceEntry) => entry.url), [N.url, A.url]);
 });
@@ -1527,16 +1528,16 @@ test('interactive inspection leaves all aggregate views, success times, snapshot
   const outputs = await rawOutputs(storage); const time = await storage.get(LAST_UPDATE);
   const health = await storage.get(SOURCE_HEALTH); const before = await snapshot(storage);
   mockFetch(url => response(url === M.url ? index(A, B) : leaf('B-inspected')));
-  const res = await sourceRequest(storage, M, '/admin/sources');
+  const res = await sourceRequest(storage, { input: M.url });
   assert.equal((await res.json() as any).added, 1);
   assert.deepEqual(await rawOutputs(storage), outputs); assert.equal(await storage.get(LAST_UPDATE), time);
   assert.equal(await storage.get(SOURCE_HEALTH), health); assert.deepEqual(await snapshot(storage), before);
   assert.equal(await snapshot(storage, B), undefined);
   mockFetch(() => response(leaf('fresh-next-round'))); await runSync(storage, config);
-  assert.equal((await snapshot(storage, B)).config.sites[0].key, 'fresh-next-round');
+  assert.equal((await snapshot(storage, B)).config.sites[0].key, 'B-inspected');
 });
 
-test('inspection uses at most four requests at once, preserves declaration order and does not retry', async () => {
+test('import uses at most four acquisitions at once, preserves declaration order and retries normally', async () => {
   const storage = new MemoryStorage();
   const entries = Array.from({ length: 11 }, (_, n) => ({ name: String(n), url: `https://source${n}.test/config.json` }));
   let active = 0; let maxActive = 0; let requests = 0;
@@ -1546,7 +1547,7 @@ test('inspection uses at most four requests at once, preserves declaration order
     return url === entries[5].url ? new Response('', { status: 404 }) : response(leaf(url));
   });
   const res = await sourceRequest(storage, { input: JSON.stringify(index(...entries)) }, '/admin/sources/import', { ...config, maxDataSources: 0 }); const result = await res.json() as any;
-  assert.equal(requests, 11); assert.equal(maxActive, 4);
+  assert.equal(requests, 13); assert.equal(maxActive, 4);
   assert.deepEqual(result.sources, entries.filter((_, n) => n !== 5).map(entry => entry.url));
 });
 
@@ -1565,11 +1566,11 @@ test('concurrent delete/re-add/key edits reject stale interactive import rather 
   }
 });
 
-test('inline and remote import batches expose no partial source content or success qualification after write failure', async () => {
-  for (const mode of ['inline', 'remote']) {
+test('directory and remote import batches expose no partial staging or qualification after write failure', async () => {
+  for (const mode of ['directory', 'remote']) {
     const storage = new MemoryStorage(); await seed(storage, [A]); const before = new Map(storage.data);
     storage.failPut = SOURCE_CONFIG_SNAPSHOTS; mockFetch(() => response(leaf('new')));
-    const res = await sourceRequest(storage, { input: mode === 'inline' ? compatibleFixture().text : B.url });
+    const res = await sourceRequest(storage, { input: mode === 'directory' ? JSON.stringify(index(B)) : B.url });
     assert.equal(res.status, 500); assert.deepEqual(storage.data, before);
     assert.equal([...storage.data.keys()].some(key => key.startsWith('inline_')), false);
   }
@@ -1586,7 +1587,7 @@ test('v1 directory migration preserves original qualified child payload/time acr
   await legacyOutputs(storage);
   await runSync(storage, config);
   assert.equal(requests.filter(url => url === M.url).length, 1);
-  assert.equal(requests.filter(url => url === A.url).length, 5);
+  assert.equal(requests.filter(url => url === A.url).length, 4);
   for (const source of [A, B]) {
     const restored = await snapshot(storage, source); const original = old.nodes[source.url].snapshot;
     assert.deepEqual(restored.config, original.config); assert.equal(restored.savedAt, original.savedAt);
@@ -1611,7 +1612,7 @@ test('confirmed failed old directories are deleted once; unknown failed old sing
   await legacyOutputs(storage); await runSync(storage, config);
   assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!), [B]);
   assert.equal(requests.filter(url => url === M.url).length, 1);
-  assert.equal(requests.filter(url => url === B.url).length, 5);
+  assert.equal(requests.filter(url => url === B.url).length, 4);
   const state = JSON.parse((await storage.get(SOURCE_IMPORT_POLICY_STATE))!);
   assert.equal(state.completedAt, undefined); assert.deepEqual(state.remaining.map((i: any) => i.url), [B.url]);
   assert.equal((await sourceMigrationReport(storage))!.removed[0].url, M.url);
@@ -1741,7 +1742,7 @@ test('generated Admin actions wait once, render full inert text, retain partial 
     }
     let resolve!: (value: unknown) => void; let calls = 0;
     let request: Promise<unknown> = new Promise(r => { resolve = r; });
-    const context = createContext({ $: (id: string) => elements[id], loadSources() {},
+    const context = createContext({ $: (id: string) => elements[id], loadSources() {}, loadSourceHealth() {}, document: { querySelectorAll: () => [] },
       auth: { authFetch: () => { calls++; return request; } } });
     new Script(selected).runInContext(context);
     const running = new Script(`${action}()`).runInContext(context);
@@ -1762,7 +1763,7 @@ test('generated Admin actions wait once, render full inert text, retain partial 
     elements[action === 'addSource' ? 'addUrl' : 'importInput'].value = 'retry input';
     request = Promise.resolve({ ok: false, json: async () => ({ error: reason }) });
     await new Script(`${action}()`).runInContext(context);
-    assert.equal(result.textContent, reason); assert.equal(button.disabled, false);
+    assert.equal(result.textContent, '导入出错：' + reason); assert.equal(button.disabled, false);
     assert.equal(elements[action === 'addSource' ? 'addUrl' : 'importInput'].value, 'retry input');
   }
 });
@@ -1873,7 +1874,8 @@ test('full aggregation publishes fresh restored and inline origins without pollu
   // An active newer run must not hide the attribution belonging to still-readable prior output.
   await beginSourceOutputRun(storage);
   assert.deepEqual((await editorSites(storage))[0].sourceNames, ['A', 'B', 'Local interface']);
-  const app = createApp({ storage, config, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  const app = createApp({ storage, config, runtime: idleRuntime,
+    triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: '正在聚合' }) });
   assert.equal((await app.request('/admin/config-data')).status, 401);
 });
 
@@ -3111,7 +3113,8 @@ test('live file router is mounted without Admin auth and extensionless TXT plus 
   const storage = new MemoryStorage(); await seedLegacyLives(storage);
   const entry = { name: '无后缀', url: 'https://plain.test/playlist' }; await liveMutation(storage, entry);
   let calls = 0; mockFetch(() => { calls++; return new Response('分组,#genre#\n频道,./video.ts\n'); });
-  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime,
+    triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: '正在聚合' }) });
   const uri = '/live/' + liveCacheKey({ ...entry, type: 0 }) + '.txt';
   const res = await app.request(uri); assert.equal(res.status, 200);
   assert.equal(await res.text(), '分组,#genre#\n频道,https://plain.test/video.ts\n'); assert.equal(calls, 1);
@@ -3131,7 +3134,8 @@ test('live file router is mounted without Admin auth and extensionless TXT plus 
 test('flat live URLs project exact paths, redirect format changes and reject old paths without fetching', async () => {
   const storage = new MemoryStorage(); await seedLegacyLives(storage); await liveMutation(storage, cachedManual);
   const entry = { ...cachedManual, type: 0 }; const key = liveCacheKey(entry);
-  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime, triggerRefresh: async () => ({ ran: false }) });
+  const app = createApp({ storage, config: cacheConfig, runtime: idleRuntime,
+    triggerRefresh: async () => ({ ran: false, outcome: 'busy', message: '正在聚合' }) });
   let body = '分组,#genre#\n频道,https://channel.test/live.ts\n'; let calls = 0;
   mockFetch(() => { calls++; return new Response(body); });
   const first = await app.request('/live/' + key + '.m3u');
@@ -3220,32 +3224,30 @@ test('capacity API preserves list arrays, refuses full requests before fetch and
   assert.equal(unlimited.status, 200); assert.equal((await unlimited.json() as any).capacity.remaining, null);
 });
 
-test('capacity import fills valid distinct candidates in order and never downloads excess URLs', async () => {
+test('capacity import rejects the complete candidate upper bound before any child download', async () => {
   const storage = new MemoryStorage(); const old = capacityEntries(4); await seed(storage, old);
   const bad = { name: 'bad', url: 'https://bad-capacity.test/config.json' };
   const calls: string[] = [];
   mockFetch(url => { calls.push(url); return url === bad.url ? new Response('', { status: 404 }) : response(leaf('same-content')); });
   const result = await sourceRequest(storage, { input: JSON.stringify(index(old[0], bad, A, B, N)) });
-  assert.equal(result.status, 200); const data = await result.json() as any;
-  assert.deepEqual(data.sources, [A.url, B.url]); assert.equal(data.duplicates, 1); assert.equal(data.outcome, 'partial');
-  assert.deepEqual(data.capacity, { limit: 6, current: 6, remaining: 0, rejected: 1 });
-  assert.deepEqual(new Set(calls), new Set([bad.url, A.url, B.url])); assert.equal(calls.length, 3);
-  assert.equal(data.skipped.find((entry: any) => entry.url === N.url).stage, 'capacity');
-  assert.equal((JSON.parse((await storage.get(MANUAL_SOURCES))!) as SourceEntry[]).length, 6);
+  assert.equal(result.status, 409); const error = await result.json() as any;
+  assert.match(error.error, /上限/); assert.equal(error.capacity.current, 4); assert.equal(error.capacity.limit, 6);
+  assert.equal(calls.length, 0);
+  assert.equal((JSON.parse((await storage.get(MANUAL_SOURCES))!) as SourceEntry[]).length, 4);
   assert.equal(await snapshot(storage, A), undefined); assert.equal(await snapshot(storage, N), undefined);
 });
 
-test('concurrent last-slot additions cannot exceed capacity and failed inline batches save nothing', async () => {
+test('concurrent last-slot additions cannot overlap and failed source batches save nothing', async () => {
   const storage = new MemoryStorage(); await seed(storage, capacityEntries(5));
   const release = deferred<void>(); const started = deferred<void>(); let calls = 0;
-  mockFetch(async url => { if (++calls === 2) started.resolve(); await release.promise; return response(leaf(new URL(url).hostname.split('.')[0])); });
+  mockFetch(async url => { ++calls; started.resolve(); await release.promise; return response(leaf(new URL(url).hostname.split('.')[0])); });
   const pending = [sourceRequest(storage, A, '/admin/sources'), sourceRequest(storage, B, '/admin/sources')];
   await started.promise; release.resolve(); const results = await Promise.all(pending);
   assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
   assert.equal(JSON.parse((await storage.get(MANUAL_SOURCES))!).length, 6);
   const fresh = new MemoryStorage(); await roots(fresh, []); const before = new Map(fresh.data);
   fresh.failBatch = values => MANUAL_SOURCES in values;
-  const failure = await sourceRequest(fresh, { input: JSON.stringify(leaf('inline')) });
+  const failure = await sourceRequest(fresh, A, '/admin/sources');
   assert.equal(failure.status, 500); assert.deepEqual(fresh.data, before);
 });
 
@@ -3311,7 +3313,7 @@ function sourceCapacityFixture(handler: (url: string, options?: RequestInit) => 
   const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]).find(text => text.includes('async function loadSources()'))!;
   const elements: Record<string, { value: string; textContent: unknown; innerHTML: string; disabled: boolean; hidden: boolean; focus(): void }> = {};
   const toasts: string[] = [];
-  const context = createContext({ healthMap: {},
+  const context = createContext({ healthMap: {}, document: { querySelectorAll: () => [] }, loadSourceHealth() {},
     $: (id: string) => elements[id] ||= { value: '', textContent: '', innerHTML: '', disabled: false, hidden: false, focus() {} },
     esc: (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
     toast: (text: string) => toasts.push(text), auth: { authFetch: handler },
@@ -3347,7 +3349,7 @@ test('capacity page preserves full state across stale GETs, errors and neutraliz
   assert.equal(fixture.elements.addBtn.disabled, false); assert.equal(fixture.elements.sourceCapacityHint.hidden, true);
 });
 
-test('actual partial import pops one capacity error, retains input and stays disabled if list reload fails; deletion restores controls', async () => {
+test('actual over-capacity import retains input and reports whole-batch rejection; deletion restores controls', async () => {
   const storage = new MemoryStorage(); await seed(storage, capacityEntries(4));
   const router = createSourceMgmtRouter({ storage, config }); let failGet = false;
   const fixture = sourceCapacityFixture(async (url, options) => {
@@ -3358,11 +3360,11 @@ test('actual partial import pops one capacity error, retains input and stays dis
   fixture.elements.importInput = { value: JSON.stringify(index(A, B, N)), textContent: '', innerHTML: '', disabled: false, hidden: false, focus() {} };
   const input = fixture.elements.importInput.value; mockFetch(() => response(leaf('same'))); failGet = true;
   await fixture.run('importConfig()');
-  assert.equal(fixture.elements.sourceCount.textContent, '6/6'); assert.equal(fixture.elements.addBtn.disabled, true); assert.equal(fixture.elements.importBtn.disabled, true);
-  assert.equal(fixture.elements.importInput.value, input); assert.match(String(fixture.elements.importResult.textContent), /新增 2/);
+  assert.equal(fixture.elements.sourceCount.textContent, '4/6'); assert.equal(fixture.elements.addBtn.disabled, false); assert.equal(fixture.elements.importBtn.disabled, false);
+  assert.equal(fixture.elements.importInput.value, input); assert.match(String(fixture.elements.importResult.textContent), /^导入出错：.*上限/);
   assert.equal(fixture.toasts.length, 1); assert.match(fixture.toasts[0], /上限（6）/);
-  failGet = false; await fixture.run('removeSource(' + JSON.stringify(A.url) + ')');
-  assert.equal(fixture.elements.sourceCount.textContent, '5/6'); assert.equal(fixture.elements.importBtn.disabled, false);
+  failGet = false; await fixture.run('removeSource(' + JSON.stringify(capacityEntries(4)[0].url) + ')');
+  assert.equal(fixture.elements.sourceCount.textContent, '3/6'); assert.equal(fixture.elements.importBtn.disabled, false);
 });
 
 
@@ -3377,4 +3379,1093 @@ test('all selected sources failing cannot borrow an out-of-range snapshot or rev
   assert.deepEqual(new Set(calls), new Set(entries.slice(0, 6).map(entry => entry.url)));
   assert.deepEqual(await rawOutputs(storage), old); assert.ok(await readAggregateOutputs(storage));
   assert.ok(await snapshot(storage, entries[7]));
+});
+
+test('ordinary Add stages raw configuration, waits neutrally, and first real aggregation consumes it without downloading again', async () => {
+  const storage = new MemoryStorage(); let requests = 0;
+  const { input, text } = compatibleFixture();
+  mockFetch(() => { requests++; return new Response(text); });
+  const res = await sourceRequest(storage, A, '/admin/sources');
+  assert.equal(res.status, 200); assert.equal(requests, 1);
+  const cached = (await importCache(storage)).entries[A.url];
+  assert.deepEqual(cached.config, input); assert.equal(cached.expiresAt - cached.cachedAt, IMPORT_CACHE_TTL_MS);
+  assert.equal(await snapshot(storage), undefined); assert.equal(await storage.get(SOURCE_HEALTH), null);
+  assert.equal(await storage.get(MERGED_CONFIG), null);
+  let record = (await status(storage)).records[0];
+  assert.equal(record.waiting, true); assert.equal(record.label, '等待聚合');
+  assert.equal((await status(storage)).summary.ok, 0);
+  assert.doesNotMatch(JSON.stringify(record), /generation|fingerprint|recordId|configKey/);
+  assert.match(await renderSourceRow(record), /source-health-dot unknown/);
+  assert.doesNotMatch(await renderSourceRow(record), /连续失败|source-cache-time/);
+  await runSync(storage, config);
+  assert.equal(requests, 1); assert.deepEqual((await snapshot(storage)).config, input);
+  assert.deepEqual((await importCache(storage)).entries, {});
+  record = (await status(storage)).records[0];
+  assert.equal(record.status, 'OK'); assert.equal(record.acquisition, 'import-cache');
+  assert.equal(record.lastSuccessTime, new Date(cached.acquiredAt).toISOString()); assert.equal(record.lastSpeedMs, undefined);
+  await runSync(storage, config); assert.equal(requests, 2);
+});
+
+test('ordinary Add rejects directories without children and external independent keys before downloading', async () => {
+  const storage = new MemoryStorage(); const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(index(A)); });
+  const directory = await sourceRequest(storage, M, '/admin/sources');
+  assert.equal(directory.status, 400); assert.match((await directory.json() as any).error, /高级添加/);
+  for (const source of [{ ...A, configKey: 'secret' }, { ...A, url: A.url + ';pk;suffix', configKey: 'secret' }]) {
+    const res = await sourceRequest(storage, source, '/admin/sources');
+    assert.equal(res.status, 400); assert.equal((await res.json() as any).error, '不支持独立解密的接口');
+  }
+  assert.deepEqual(calls, [M.url]); assert.equal(await storage.get(MANUAL_SOURCES), null);
+  const unsupported = await sourceRequest(storage, { input: A.url, configKey: 'secret' });
+  assert.equal(unsupported.status, 400); assert.equal((await unsupported.json() as any).error, '不支持独立解密的接口');
+  assert.deepEqual(calls, [M.url]);
+  assert.equal(await storage.get(SOURCE_IMPORT_CACHE), null);
+});
+
+test('suffix keys survive normalization and restart while rejected child keys and relative directory URLs never download', async () => {
+  const file = path.join(directory, 'suffix-import.json'); const storage = new JsonFileStorage(file);
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(leaf('suffix')); });
+  const multi = { urls: [{ name: 'Good', url: A.url + ';pk;suffix-secret' },
+    { name: 'Unsupported', url: B.url, configKey: 'standalone-secret' },
+    { name: 'Relative', url: './child.json' }, { name: 'Bad item' }] } as TVBoxConfig;
+  const res = await sourceRequest(storage, { input: JSON.stringify(multi) }); const data = await res.json() as any;
+  assert.equal(res.status, 200); assert.equal(data.added, 1); assert.equal(data.skipped.length, 3);
+  assert.equal(data.skipped[0].reason, '不支持独立解密的接口'); assert.match(data.skipped[1].reason, /完整HTTP/);
+  assert.deepEqual(calls, [A.url]);
+  assert.doesNotMatch((await storage.get(SOURCE_IMPORT_CACHE))!, /suffix-secret|standalone-secret|configKey/);
+  const restarted = new JsonFileStorage(file); await runSync(restarted, config);
+  assert.deepEqual(calls, [A.url]); assert.equal((await snapshot(restarted)).config.sites[0].key, 'suffix');
+  assert.equal(JSON.parse((await restarted.get(MANUAL_SOURCES))!)[0].configKey, 'suffix-secret');
+});
+
+test('advanced URL lines reuse responses, keep original order and accept partial eligible sources', async () => {
+  const storage = new MemoryStorage(); const calls: string[] = [];
+  mockFetch(async url => { calls.push(url); if (url === A.url) await new Promise(r => realTimeout(r, 8));
+    return response(url === N.url ? { sites: [] } : leaf(url === A.url ? 'A' : 'B')); });
+  const res = await sourceRequest(storage, { input: `\r\n${A.url}\r\n${B.url}\r\n${A.url}\r\n${N.url}\r\n` });
+  const data = await res.json() as any;
+  assert.deepEqual(data.sources, [A.url, B.url]); assert.equal(data.duplicates, 1); assert.equal(data.outcome, 'partial');
+  assert.equal(data.inputKind, 'single_urls'); assert.equal(data.checked, 3); assert.equal(calls.length, 3);
+  assert.equal(data.skipped[0].stage, 'preparation'); assert.equal(Object.keys((await importCache(storage)).entries).length, 2);
+});
+
+test('advanced inputs reject mixed roots, raw single JSON and mixed JSON/URLs without publishing any temporary data', async () => {
+  for (const bad of [A.url + '\n' + M.url, JSON.stringify(leaf('raw')), JSON.stringify(index(A)) + '\n' + A.url,
+    A.url + '\n' + JSON.stringify(index(B)), '{broken\n' + A.url]) {
+    const storage = new MemoryStorage(); mockFetch(url => response(url === M.url ? index(B) : leaf('valid')));
+    assert.equal((await sourceRequest(storage, { input: bad })).status, 400);
+    assert.equal(await storage.get(MANUAL_SOURCES), null); assert.equal(await storage.get(SOURCE_IMPORT_CACHE), null);
+  }
+  const storage = new MemoryStorage(); mockFetch(url => response(url === M.url ? index(B) : { sites: [] }));
+  assert.equal((await sourceRequest(storage, { input: M.url + '\n' + A.url })).status, 400);
+  assert.equal(await storage.get(SOURCE_CONFIG_SNAPSHOTS), null); // Empty sites still proves a single root type.
+});
+
+test('an invalid root is skipped without inventing mixed types and nested directories never request grandchildren', async () => {
+  const storage = new MemoryStorage(); const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(url === M.url ? index(A, N) : url === B.url ? {}
+    : url === N.url ? index({ name: 'Never', url: 'https://never.test/grandchild' }) : leaf('A')); });
+  const res = await sourceRequest(storage, { input: M.url + '\n' + B.url }); const data = await res.json() as any;
+  assert.equal(res.status, 200); assert.deepEqual(data.sources, [A.url]); assert.equal(data.skipped.length, 2);
+  assert.equal(data.skipped[1].reason, '嵌套多仓已忽略，不支持');
+  assert.ok(!calls.some(url => url.includes('never.test'))); assert.equal(calls.length, 4);
+});
+
+test('root and direct-child roles share one acquisition but only independent roots expand', async () => {
+  const storage = new MemoryStorage(); const calls: string[] = [];
+  mockFetch(url => { calls.push(url); return response(url === M.url ? index(N, A) : url === N.url ? index(B) : leaf(url)); });
+  const data = await (await sourceRequest(storage, { input: M.url + '\n' + N.url })).json() as any;
+  assert.deepEqual(data.sources, [A.url, B.url]); assert.equal(data.skipped[0].url, N.url);
+  assert.equal(calls.filter(url => url === N.url).length, 1); assert.equal(calls.length, 4);
+});
+
+test('candidate capacity includes failed single URLs and never relies on successes to fit', async () => {
+  const storage = new MemoryStorage(); await seed(storage, capacityEntries(4)); const before = new Map(storage.data);
+  let requests = 0; mockFetch(url => { requests++; return url === N.url ? new Response('', { status: 404 }) : response(leaf('valid')); });
+  const res = await sourceRequest(storage, { input: [A.url, B.url, N.url].join('\n') });
+  assert.equal(res.status, 409); assert.equal(requests, 5); assert.deepEqual(storage.data, before);
+});
+
+test('batch save shares a TTL origin and duplicates never renew or replace stored metadata', async () => {
+  const storage = new MemoryStorage(); const base = Date.now(); const advance = clock(base);
+  mockFetch(async url => { if (url === B.url) await new Promise(r => realTimeout(r, 8));
+    advance(url === A.url ? base + 1_000 : base + 180_000); return response(leaf(url)); });
+  const res = await sourceRequest(storage, { input: A.url + '\n' + B.url }); assert.equal(res.status, 200);
+  const cache = await importCache(storage); const a = cache.entries[A.url], b = cache.entries[B.url];
+  assert.equal(a.cachedAt, b.cachedAt); assert.equal(a.expiresAt, b.expiresAt); assert.equal(a.cachedAt, base + 180_000);
+  assert.equal(a.expiresAt, base + 480_000); assert.notEqual(a.acquiredAt, b.acquiredAt);
+  const before = new Map(storage.data); advance(base + 200_000);
+  mockFetch(() => response(leaf('replacement')));
+  const duplicate = await sourceRequest(storage, { ...A, name: 'Changed', url: A.url + ';pk;new' }, '/admin/sources');
+  assert.equal((await duplicate.json() as any).outcome, 'duplicates_only'); assert.deepEqual(storage.data, before);
+  await sourceRequest(storage, { input: JSON.stringify(index({ ...A, name: 'Changed' })) });
+  assert.deepEqual(storage.data, before);
+});
+
+test('round-start TTL uses exact expiry and frozen copies remain eligible after five minutes', async () => {
+  for (const offset of [299_999, 300_000]) {
+    const storage = new MemoryStorage(); const base = Date.now(); const advance = clock(base);
+    mockFetch(() => response(leaf('cached'))); await sourceRequest(storage, A, '/admin/sources');
+    const cached = (await importCache(storage)).entries[A.url];
+    advance(cached.cachedAt + offset);
+    const frozen = await withSourceGate(storage, async () => ImportCacheRound.begin(storage, (await captureSourceBaseline(storage)).registry, Date.now()));
+    const identity = (await registry(storage)).nodes[A.url];
+    advance(cached.cachedAt + 400_000);
+    assert.equal(!!frozen.acquire(A, identity), offset < IMPORT_CACHE_TTL_MS);
+    assert.equal(cached.expiresAt, cached.cachedAt + IMPORT_CACHE_TTL_MS);
+    advance(cached.cachedAt + offset); let requests = 0;
+    mockFetch(() => { requests++; return response(leaf('fresh')); });
+    await runSync(storage, config);
+    assert.equal(requests, offset < IMPORT_CACHE_TTL_MS ? 0 : 1);
+    assert.equal((await snapshot(storage)).config.sites[0].key, offset < IMPORT_CACHE_TTL_MS ? 'cached' : 'fresh');
+  }
+});
+
+test('expired and corrupt import records miss normally; waiting state outlives cache TTL', async () => {
+  for (const damage of ['expired', 'json', 'version', 'payload', 'read']) {
+    const storage = new MemoryStorage(); const base = Date.now(); const advance = clock(base);
+    mockFetch(() => response(leaf('cached'))); await sourceRequest(storage, A, '/admin/sources');
+    const cache = await importCache(storage);
+    if (damage === 'expired') advance(cache.entries[A.url].expiresAt);
+    else if (damage === 'json') await storage.put(SOURCE_IMPORT_CACHE, '{broken');
+    else if (damage === 'read') storage.failGet = SOURCE_IMPORT_CACHE;
+    else { if (damage === 'version') cache.version = 99; else cache.entries[A.url].config = { sites: 'bad' }; await storage.put(SOURCE_IMPORT_CACHE, JSON.stringify(cache)); }
+    assert.equal((await status(storage)).records[0].waiting, true);
+    let requests = 0; mockFetch(() => { requests++; return response(leaf('fresh')); });
+    await runSync(storage, config); assert.equal(requests, 1); assert.equal((await snapshot(storage)).config.sites[0].key, 'fresh');
+    storage.failGet = undefined;
+  }
+});
+
+test('unsuccessful output retains staged payload, then real publication consumes it', async () => {
+  const storage = new MemoryStorage(); let requests = 0;
+  mockFetch(() => { requests++; return response(leaf('staged')); }); await sourceRequest(storage, A, '/admin/sources');
+  const before = await storage.get(SOURCE_IMPORT_CACHE);
+  storage.failPut = LAST_UPDATE; await assert.rejects(runSync(storage, config), /write failed/);
+  storage.failPut = undefined;
+  assert.equal(await storage.get(SOURCE_IMPORT_CACHE), before); assert.equal(await snapshot(storage), undefined);
+  await runSync(storage, config); assert.equal(requests, 1); assert.deepEqual((await importCache(storage)).entries, {});
+  assert.equal((await snapshot(storage)).config.sites[0].key, 'staged');
+});
+
+test('successful publication only consumes staged inputs actually accepted into the merge', async () => {
+  const storage = new MemoryStorage(); mockFetch(url => response(leaf(url === A.url ? 'A' : 'B')));
+  await sourceRequest(storage, { input: A.url + '\n' + B.url }); const cache = await importCache(storage);
+  // Structurally readable but now unpreparable payload: a hit fails locally, never refetches.
+  cache.entries[B.url].config = { sites: [{ key: '', api: '' }] }; await storage.put(SOURCE_IMPORT_CACHE, JSON.stringify(cache));
+  let requests = 0; mockFetch(() => { requests++; return response(leaf('unexpected')); });
+  await runSync(storage, config); assert.equal(requests, 0);
+  const remaining = (await importCache(storage)).entries;
+  assert.equal(remaining[A.url], undefined); assert.equal(remaining[B.url].recordId, cache.entries[B.url].recordId);
+  assert.equal(await snapshot(storage, B), undefined); assert.ok(await snapshot(storage));
+});
+
+test('deletion and key changes revoke staging and re-add never inherits old health or payload', async () => {
+  const storage = new MemoryStorage(); mockFetch(() => response(leaf('first')));
+  await sourceRequest(storage, A, '/admin/sources'); const old = (await importCache(storage)).entries[A.url];
+  await runSync(storage, config); await roots(storage, []);
+  await storage.put(SOURCE_IMPORT_CACHE, JSON.stringify({ version: 1, entries: { [A.url]: old } }));
+  mockFetch(() => response(leaf('new'))); await sourceRequest(storage, A, '/admin/sources');
+  assert.equal((await status(storage)).records[0].waiting, true);
+  const current = (await importCache(storage)).entries[A.url]; assert.notEqual(current.generation, old.generation);
+  await roots(storage, [{ ...A, configKey: 'different' }]); assert.deepEqual((await importCache(storage)).entries, {});
+  let requests = 0; mockFetch(() => { requests++; return response(leaf('fresh-key')); });
+  await runSync(storage, config); assert.equal(requests, 1); assert.equal((await snapshot(storage)).config.sites[0].key, 'fresh-key');
+});
+
+test('import holds shared runtime ownership through download and save; manual and cron sync do not start', async () => {
+  const storage = new MemoryStorage(); const started = deferred<void>(), release = deferred<void>(); let requests = 0;
+  mockFetch(async () => { requests++; started.resolve(); await release.promise; return response(leaf('new')); });
+  const pending = sourceRequest(storage, A, '/admin/sources'); await started.promise;
+  let runs = 0; const runner = createSyncRunner(sourceActivity(storage), async () => {
+    runs++; return { outcome: 'saved', message: '聚合完成' };
+  });
+  assert.equal((await runner({ source: 'manual' })).ran, false); assert.equal((await runner({ source: 'cron' })).ran, false);
+  assert.equal((await sourceRequest(storage, B, '/admin/sources')).status, 409);
+  assert.equal(requests, 1); assert.equal(runs, 0);
+  release.resolve(); assert.equal((await pending).status, 200); assert.equal((await runner()).ran, true);
+  assert.equal(sourceActivity(storage).kind, undefined);
+  const activity = new SourceActivity(); const failing = createSyncRunner(activity, async () => { throw new Error('failed'); });
+  await failing(); assert.equal(activity.kind, undefined);
+});
+
+test('a real round freezes import eligibility before an earlier source takes it past expiry', async () => {
+  const storage = new MemoryStorage(); await seed(storage, [A]); const base = Date.now(); const advance = clock(base);
+  mockFetch(() => response(leaf('B-staged'))); await sourceRequest(storage, B, '/admin/sources');
+  advance(base + 240_000); const calls: string[] = [];
+  mockFetch(url => { calls.push(url); advance(base + 360_000); return response(leaf('A-fresh')); });
+  await runSync(storage, config); assert.deepEqual(calls, [A.url]);
+  assert.equal((await snapshot(storage, B)).config.sites[0].key, 'B-staged');
+});
+
+test('import and aggregation share direct UA fallback and configured proxy acquisition', async () => {
+  for (const mode of ['ua', 'proxy']) {
+    const storage = new MemoryStorage(); const calls: Array<{ url: string; options?: RequestInit }> = [];
+    if (mode === 'proxy') await storage.put(EDGE_PROXIES, JSON.stringify({ fetchProxy: 'https://proxy.test' }));
+    mockFetch((url, options) => {
+      calls.push({ url, options });
+      if (mode === 'ua') return calls.length % 2 === 1 ? new Response('{bad') : new Response(compatibleFixture().text);
+      return url === A.url ? new Response('', { status: 403 }) : response(leaf('proxied'));
+    });
+    assert.equal((await sourceRequest(storage, A, '/admin/sources')).status, 200);
+    assert.equal(calls.length, 2);
+    const importCalls = calls.splice(0);
+    await storage.delete(SOURCE_IMPORT_CACHE); await runSync(storage, config);
+    assert.deepEqual(calls.map(c => c.url), importCalls.map(c => c.url));
+    assert.deepEqual(calls.map(c => c.options?.headers), importCalls.map(c => c.options?.headers));
+    if (mode === 'proxy') assert.match(JSON.stringify(importCalls[1].options), /test-token/);
+  }
+});
+
+test('multiple directory roots share a global four-acquisition budget with stable children and full retries', async () => {
+  const storage = new MemoryStorage();
+  const children = capacityEntries(10); const calls = new Map<string, number>(); let active = 0, maximum = 0;
+  mockFetch(async url => {
+    active++; maximum = Math.max(maximum, active); calls.set(url, (calls.get(url) || 0) + 1);
+    await new Promise(r => realTimeout(r, url === M.url ? 8 : 2)); active--;
+    if (url === M.url) return response(index(...children.slice(0, 6)));
+    if (url === N.url) return response(index(...children.slice(4)));
+    if (url === children[3].url && calls.get(url) === 1) return new Response('', { status: 503 });
+    return response(leaf(url));
+  });
+  const res = await sourceRequest(storage, { input: M.url + '\n' + N.url }, '/admin/sources/import', { ...config, maxDataSources: 0 });
+  const data = await res.json() as any;
+  assert.deepEqual(data.sources, children.map(c => c.url)); assert.equal(data.duplicates, 2);
+  assert.equal(maximum, 4); assert.equal(calls.get(children[3].url), 2);
+  assert.equal(data.checked, 12); assert.equal(calls.get(children[4].url), 1);
+});
+
+test('post-publication cache cleanup failure preserves successful output and record IDs protect replacements', async () => {
+  const storage = new MemoryStorage(); mockFetch(() => response(leaf('staged')));
+  await sourceRequest(storage, A, '/admin/sources');
+  const initial = await storage.get(SOURCE_IMPORT_CACHE);
+  storage.failBatch = values => SOURCE_IMPORT_CACHE in values && !(MANUAL_SOURCES in values);
+  // MemoryStorage.put has its own failure hook, used by cleanup.
+  storage.failPut = SOURCE_IMPORT_CACHE;
+  await runSync(storage, config); storage.failPut = undefined; storage.failBatch = undefined;
+  assert.ok((await readAggregateOutputs(storage))!.merged!.includes('staged'));
+  assert.equal(await storage.get(SOURCE_IMPORT_CACHE), initial);
+  const baseline = await withSourceGate(storage, () => captureSourceBaseline(storage));
+  const frozen = await ImportCacheRound.begin(storage, baseline.registry, Date.now());
+  assert.ok(frozen.acquire(A, baseline.registry.nodes[A.url])); frozen.accepted(A);
+  const changed = await importCache(storage); changed.entries[A.url].recordId = 'replacement';
+  await storage.put(SOURCE_IMPORT_CACHE, JSON.stringify(changed)); await frozen.consume();
+  assert.equal((await importCache(storage)).entries[A.url].recordId, 'replacement');
+});
+
+test('capacity-excluded import entries remain staged and a no-snapshot failed round never qualifies them', async () => {
+  const storage = new MemoryStorage(); mockFetch(url => response(leaf(url)));
+  await sourceRequest(storage, { input: A.url + '\n' + B.url }); const cache = await importCache(storage);
+  await runSync(storage, { ...config, maxDataSources: 1 });
+  assert.equal((await importCache(storage)).entries[B.url].recordId, cache.entries[B.url].recordId);
+  assert.equal(await snapshot(storage, B), undefined);
+  const unused = new MemoryStorage(); mockFetch(() => response(leaf('unpublished')));
+  await sourceRequest(unused, A, '/admin/sources');
+  const damaged = await importCache(unused); damaged.entries[A.url].config.sites = [{ key: '', api: '' }];
+  await unused.put(SOURCE_IMPORT_CACHE, JSON.stringify(damaged));
+  let requests = 0; mockFetch(() => { requests++; return response(leaf('unexpected')); }); await runSync(unused, config);
+  assert.equal(requests, 0); assert.equal(await snapshot(unused), undefined);
+  assert.equal(await unused.get(MERGED_CONFIG), null); assert.ok((await importCache(unused)).entries[A.url]);
+});
+
+test('actual generated actions lock deletion during import and reload current status once before rendering saved rows', async () => {
+  for (const failStatus of [false, true]) {
+    const storage = new MemoryStorage(); await seed(storage, [A]);
+    const router = createSourceMgmtRouter({ storage, config }); const started = deferred<void>(), release = deferred<void>();
+    mockFetch(async () => { started.resolve(); await release.promise; return response(leaf('B')); });
+    let deletes = 0, posts = 0, statuses = 0;
+    const fixture = sourceCapacityFixture(async (url, options) => {
+      if (options?.method === 'DELETE') deletes++;
+      if (options?.method === 'POST') posts++;
+      return router.request(url, { ...options, headers: { ...adminHeaders, 'Content-Type': 'application/json' } });
+    });
+    const deleteButton = { disabled: false };
+    fixture.context.document = { querySelectorAll: () => [deleteButton] };
+    fixture.context.fetch = async () => { statuses++; if (failStatus) throw new Error('status offline');
+      return createDashboardRouter({ storage, config, runtime: idleRuntime }).request('/source-status'); };
+    const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).find(s => s.includes('async function loadSourceHealth'))!;
+    fixture.run(script.slice(script.indexOf('async function loadSourceHealth'), script.indexOf('// --- Load data ---')));
+    await fixture.run('loadSources()'); fixture.elements.addUrl = { value: B.url } as any; fixture.elements.addName = { value: '' } as any;
+    fixture.elements.addResult = { textContent: '', innerHTML: '' } as any;
+    fixture.context.healthMap = { [B.url]: { status: 'OK', label: 'STALE HEALTH' } };
+    const importing = fixture.run('addSource()'); await started.promise;
+    assert.equal(deleteButton.disabled, true); assert.equal(fixture.elements.importBtn.disabled, true);
+    await fixture.run('removeSource(' + JSON.stringify(A.url) + ')'); await fixture.run('addSource()');
+    assert.equal(deletes, 0); assert.equal(posts, 1);
+    release.resolve(); await importing;
+    assert.equal(statuses, 1); assert.equal(deleteButton.disabled, false); assert.equal(fixture.elements.addBtn.disabled, false);
+    assert.match(String(fixture.elements.addResult.textContent), /新增 1/);
+    assert.doesNotMatch(fixture.elements.sourceList.innerHTML, /STALE HEALTH/);
+    if (!failStatus) assert.match(fixture.elements.sourceList.innerHTML, /状态：等待聚合/);
+    else assert.match(fixture.elements.sourceList.innerHTML, /状态：暂无数据/);
+    assert.equal(JSON.parse((await storage.get(MANUAL_SOURCES))!).length, 2);
+  }
+});
+
+test('hash line comments preserve URL fragments, quoted hashes and original multiline string values', () => {
+  const logs: string[] = []; restoreMocks.push(subscribeLogSink(entry => { if (entry.scope === 'parser') logs.push(entry.message); }));
+  const text = '# configuration\r\n{\n  ## json sources\n  "sites":[{"key":"hash","type":3,"api":"csp_hash",\n'
+    + '  "ext":{"url":"https://example.test/a#fragment","value":"literal # and ##", "lines":"first\n# text inside string\nlast"}}]\r\n  # end\r\n}';
+  const parsed = parseConfigJson(text);
+  assert.equal(parsed.ok, true);
+  const ext = parsed.config!.sites![0].ext; assert.ok(ext && typeof ext === 'object');
+  assert.equal(ext.url, 'https://example.test/a#fragment');
+  assert.equal(ext.lines, 'first\n# text inside string\nlast');
+  assert.equal(logs.length, 1); assert.match(logs[0], /hashComments=3/); assert.doesNotMatch(logs[0], /fragment|csp_hash/);
+  assert.equal(parseConfigJson('# only').errorCategory, 'empty');
+  assert.equal(parseConfigJson('{"value":1 # not a standalone comment\n}').errorCategory, 'syntax');
+  assert.equal(parseConfigJson('{"value":tru# broken\ne}').errorCategory, 'syntax');
+});
+
+test('HTML suffix compatibility requires a complete object and preserves markup-looking string data', () => {
+  const expected = { value: 'quoted }<div> inside', nested: [{ brackets: '[]{}', html: '<script>never()</script>' }] };
+  const suffixes = ['\n<div style="text-align:center"><div></div></div>', '<!-- injected -->\n<div>tail</div>',
+    '\r\n<!DOCTYPE html><html>tail</html>', '\n<script>globalThis.shouldNeverRun=1</script>'];
+  const logs: string[] = []; restoreMocks.push(subscribeLogSink(e => { if (e.scope === 'parser') logs.push(e.message); }));
+  for (const suffix of suffixes) assert.deepEqual(parseConfigJson(JSON.stringify(expected) + suffix), { ok: true, config: expected });
+  assert.equal(logs.length, suffixes.length); assert.ok(logs.every(log => /htmlTrailers=1/.test(log)));
+  for (const bad of ['<html>{"value":1}</html>', '{"value":1<div></div>', '{"value":1}<diversion',
+    '{"value":1} trailing words<div></div>', '{"value":1}{"value":2}<div></div>', '{"value":1};evil()', '{"value":[1,]}<div></div>']) {
+    assert.equal(parseConfigJson(bad).ok, false, bad);
+  }
+});
+
+function cbcEnvelope(text: string): string {
+  const key = '347', iv = '1792027989718';
+  const cipher = createCipheriv('aes-128-cbc', Buffer.from(key.padEnd(16, '0')), Buffer.from(iv.padEnd(16, '0')));
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]).toString('hex');
+  return Buffer.from('$#' + key + '#$').toString('hex') + encrypted + Buffer.from(iv).toString('hex');
+}
+
+test('CBC self-decoding ignores only outer transport whitespace and preserves the real first block and plaintext comments', async () => {
+  const config = leaf('first-block');
+  const text = '// UTF-8 配置说明与较长的首块内容\n' + JSON.stringify(config);
+  for (const whitespace of ['', '\n', '\r\n', ' \t\r\n']) {
+    const bytes = new TextEncoder().encode(whitespace + cbcEnvelope(text) + whitespace);
+    const decoded = await decodeConfigResponse(bytes.buffer);
+    assert.equal(decoded, text); assert.deepEqual(parseConfigJson(decoded!), { ok: true, config });
+  }
+});
+
+test('new syntax and CBC responses pass actual direct, proxy, Add and inline aggregation without resource probes', async () => {
+  const original = leaf('compatible-round1');
+  const plain = '# source metadata\n' + JSON.stringify(original) + '\n<div class="injected"></div>';
+  for (const payload of [plain, cbcEnvelope(plain) + '\n']) {
+    const storage = new MemoryStorage(); const calls: string[] = [];
+    mockFetch(url => { calls.push(url); return new Response(payload); });
+    const added = await sourceRequest(storage, A, '/admin/sources'); assert.equal(added.status, 200);
+    assert.equal(calls.length, 1); await runSync(storage, config); assert.equal(calls.length, 1);
+    assert.deepEqual((await snapshot(storage)).config, original);
+    const inline = { name: 'Existing', url: 'inline://inline_config_round1' };
+    await roots(storage, [inline]); await storage.put('inline_config_round1', plain); await runSync(storage, config);
+    assert.deepEqual((await snapshot(storage, inline)).config, original);
+    calls.length = 0;
+    mockFetch(url => { calls.push(url); return url === B.url ? new Response('', { status: 403 }) : new Response(payload); });
+    const fetched = await fetchConfigs([B], 200, { urls: ['https://proxy.test/fetch-proxy'] });
+    assert.equal(calls.length, 2); assert.deepEqual(fetched.configs[0].config, original);
+  }
+});
+
+test('actual result renderer removes the single check label and prefixes inert failure details once', () => {
+  const script = [...adminHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).find(s => s.includes('function renderSourceImportResult'))!;
+  const renderer = script.slice(script.indexOf('function renderSourceImportResult'), script.indexOf('// --- Add source ---'));
+  const el = { textContent: '', className: '', innerHTML: '' };
+  const context = createContext({ el }); new Script(renderer).runInContext(context);
+  new Script("renderSourceImportResult(el,{type:'single',outcome:'added',added:1,duplicates:0,skipped:[]})").runInContext(context);
+  assert.equal(String(el.textContent), '新增 1，重复 0，跳过 0'); assert.doesNotMatch(el.textContent, /单仓检查/);
+  new Script("renderSourceImportResult(el,{error:'syntax: <b>bad</b> & reason'})").runInContext(context);
+  assert.equal(String(el.textContent), '导入出错：syntax: <b>bad</b> & reason'); assert.equal(el.innerHTML, '');
+  new Script("renderSourceImportResult(el,{type:'single',outcome:'none',added:0,duplicates:0,skipped:[{reason:'offline'}]})").runInContext(context);
+  assert.match(el.textContent, /^导入出错：/); assert.match(el.textContent, /offline/);
+  assert.equal(el.textContent.split('导入出错：').length, 2);
+});
+
+test('Add and ordinary aggregation share three total rounds and exact 1s/2s waits', async () => {
+  const storage = new MemoryStorage(); await seed(storage, [B]);
+  const delays: number[] = [], bases: number[] = [];
+  const previousTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    if (ms && ms >= 800 && ms <= 6000) delays.push(ms);
+    return previousTimeout(fn, ms, ...args);
+  }) as typeof setTimeout;
+  restoreMocks.push(() => { globalThis.setTimeout = previousTimeout; });
+  restoreMocks.push(subscribeLogSink(entry => {
+    if (entry.scope === 'fetcher' && entry.message.includes('source-retry-attempt')) {
+      bases.push(Number(entry.message.match(/backoffMs=(\d+)/)![1]));
+    }
+  }));
+  let requests = 0; mockFetch(() => { requests++; return new Response('', { status: 503 }); });
+  assert.equal((await sourceRequest(storage, A, '/admin/sources')).status, 502);
+  assert.equal(requests, 3); assert.deepEqual(bases, [1000, 2000]);
+  await runSync(storage, config);
+  assert.equal(requests, 6); assert.deepEqual(bases, [1000, 2000, 1000, 2000]);
+  assert.deepEqual(delays, bases);
+  assert.equal((await snapshot(storage, B)).config.sites[0].key, 'B1');
+});
+
+test('editor keeps all source names across cached imports, fresh downloads and qualified fallback', async () => {
+  const storage = new MemoryStorage(); const first = { ...A, name: '王二小放牛娃' }, second = { ...B, name: '另一个接口' };
+  let requests = 0;
+  mockFetch(() => { requests++; return response(leaf('shared-origin')); });
+  assert.equal((await sourceRequest(storage, first, '/admin/sources')).status, 200);
+  assert.equal((await sourceRequest(storage, second, '/admin/sources')).status, 200);
+  assert.deepEqual((await editorSites(storage)).map(s => s.sourceNames), []);
+  await runSync(storage, config); assert.equal(requests, 2);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [first.name, second.name]);
+  await runSync(storage, config); assert.equal(requests, 4);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [first.name, second.name]);
+  mockFetch(() => new Response('', { status: 503 })); await runSync(storage, config);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [first.name, second.name]);
+  for (const raw of await rawOutputs(storage)) assert.doesNotMatch(raw!, /sourceNames|siteSourceNames|王二小放牛娃|另一个接口/);
+});
+
+test('unnamed source contributions use the source URL instead of losing attribution or changing site names', async () => {
+  const storage = new MemoryStorage(); mockFetch(() => response(leaf('unnamed-origin')));
+  assert.equal((await sourceRequest(storage, { url: A.url }, '/admin/sources')).status, 200);
+  await runSync(storage, config);
+  assert.equal(JSON.parse((await storage.get(MANUAL_SOURCES))!)[0].name, A.url);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [A.url]);
+  assert.equal((await editorSites(storage))[0].name, 'unnamed-origin');
+  for (const raw of await rawOutputs(storage)) {
+    assert.doesNotMatch(raw!, /sourceNames/); assert.ok(!raw!.includes(A.url));
+  }
+  const merged = mergeConfigs([{ sourceUrl: A.url, sourceName: '', config: leaf('same') },
+    { sourceUrl: B.url, sourceName: 'Named', config: leaf('same') }]);
+  assert.deepEqual(merged.siteSourceNames, [[A.url, 'Named']]);
+});
+
+test('existing unnamed sources display URL names and regain editor origins on the next successful publication', async () => {
+  const storage = new MemoryStorage(); const unnamed = { ...A, name: '' };
+  await seed(storage, [unnamed]); const original = await snapshot(storage); const before = await storage.get(MANUAL_SOURCES);
+  const res = await createSourceMgmtRouter({ storage, config }).request('/admin/sources', { headers: adminHeaders });
+  assert.deepEqual(await res.json(), [{ ...A, name: A.url }]);
+  assert.equal(await storage.get(MANUAL_SOURCES), before); // Display does not revoke or rewrite an old source.
+  mockFetch(() => response(leaf('current'))); await runSync(storage, config);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [A.url]);
+  assert.equal((await snapshot(storage)).generation, original.generation);
+  assert.equal((await status(storage)).records[0].name, A.url);
+  assert.equal(await storage.get(MANUAL_SOURCES), before);
+  mockFetch(() => new Response('', { status: 503 })); await runSync(storage, config);
+  assert.deepEqual((await editorSites(storage))[0].sourceNames, [A.url]);
+});
+
+test('URL-line and nameless directory children persist URL names without inheriting a parent name or suffix key', async () => {
+  for (const input of [A.url + ';pk;private-key', JSON.stringify({ urls: [{ url: A.url + ';pk;private-key' }] })]) {
+    const storage = new MemoryStorage(); mockFetch(() => response(leaf('child')));
+    const res = await sourceRequest(storage, { input }); assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse((await storage.get(MANUAL_SOURCES))!), [{ url: A.url, name: A.url, configKey: 'private-key' }]);
+    await runSync(storage, config);
+    assert.deepEqual((await editorSites(storage))[0].sourceNames, [A.url]);
+    assert.doesNotMatch((await storage.get(SITE_SOURCE_ATTRIBUTION))!, /private-key/);
+  }
+});
+
+const sharedJarUrl = 'https://resources.test/shared.jar?version=1';
+const declaredJarMd5 = '0123456789abcdef0123456789abcdef';
+
+function captureDownloadTimers(): number[] {
+  const timers: number[] = [];
+  const previousTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    if (ms !== undefined) timers.push(ms);
+    return previousTimeout(fn, ms, ...args);
+  }) as typeof setTimeout;
+  restoreMocks.push(() => { globalThis.setTimeout = previousTimeout; });
+  return timers;
+}
+
+for (const kind of ['configuration', 'resource']) {
+  test(`shared retry stops immediately when ${kind} succeeds in any of its three rounds`, async () => {
+    const timers = captureDownloadTimers();
+    for (const succeedsAt of [1, 2, 3]) {
+      let calls = 0; timers.length = 0;
+      mockFetch(url => {
+        assert.equal(url, A.url); calls++;
+        return calls === succeedsAt ? response(leaf('recovered')) : new Response('', { status: 503 });
+      });
+      if (kind === 'configuration') {
+        assert.deepEqual((await fetchSingleConfig(A, 200)).config, leaf('recovered'));
+      } else {
+        const data = await downloadResource(A.url, 200); assert.ok(data);
+        assert.deepEqual(JSON.parse(data.toString()), leaf('recovered'));
+      }
+      assert.equal(calls, succeedsAt);
+      assert.deepEqual(timers.filter(ms => ms === 1000 || ms === 2000), [1000, 2000].slice(0, succeedsAt - 1));
+    }
+  });
+
+  test(`shared retry does not start another ${kind} round after an actual request timeout`, async () => {
+    let calls = 0; const timers = captureDownloadTimers();
+    mockFetch((_url, options) => {
+      calls++;
+      return new Promise<Response>((_resolve, reject) => options!.signal!.addEventListener('abort',
+        () => reject(new DOMException('Timed out', 'AbortError')), { once: true }));
+    });
+    if (kind === 'configuration') assert.equal((await fetchSingleConfig(A, 5)).fetchResult.status, 'timeout');
+    else assert.equal(await downloadResource(A.url, 5), null);
+    assert.equal(calls, 1); assert.deepEqual(timers, [5]);
+  });
+
+  test(`shared total budget prevents further ${kind} rounds and configuration fallbacks`, async () => {
+    const base = Date.now(); const advance = clock(base);
+    const timers = captureDownloadTimers(); let calls = 0;
+    const messages: string[] = [];
+    restoreMocks.push(subscribeLogSink(entry => { messages.push(entry.message); }));
+    mockFetch(url => {
+      calls++; assert.equal(url, A.url); advance(base + 30_001);
+      return new Response('', { status: 503 });
+    });
+    if (kind === 'configuration') {
+      const result = await fetchSingleConfig(A, 40_000, { urls: ['https://edge.test/proxy'] });
+      assert.equal(result.fetchResult.status, 'http_503');
+      assert.ok(messages.some(message => message.includes('source-download-deadline') && message.includes('attempts=1')));
+    } else {
+      assert.equal(await downloadResource(A.url, 40_000), null);
+      assert.ok(messages.some(message => message.includes('aggregate deadline after 1 attempts')));
+    }
+    assert.equal(calls, 1); assert.deepEqual(timers, [30_000, 1000]);
+  });
+}
+
+test('configuration proxy fallback retains compatibility while using only the remaining shared request budget', async () => {
+  const base = Date.now(); const advance = clock(base);
+  const timers = captureDownloadTimers(); const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url);
+    if (url === A.url) { advance(base + 20_000); return new Response('', { status: 503 }); }
+    assert.equal(url, 'https://edge.test/proxy?url=' + encodeURIComponent(A.url));
+    return response(leaf('proxy-recovered'));
+  });
+  const result = await fetchSingleConfig(A, 40_000, { urls: ['https://edge.test/proxy', 'https://unused.test/proxy'] });
+  assert.equal(result.fetchResult.status, 'ok'); assert.deepEqual(result.config, leaf('proxy-recovered'));
+  assert.equal(calls.length, 2); assert.deepEqual(timers, [30_000, 10_000]);
+});
+
+test('a browser fallback timeout stops outer retries while preserving the primary parse failure', async () => {
+  const timers = captureDownloadTimers(); let calls = 0;
+  mockFetch((_url, options) => {
+    calls++;
+    if (calls === 1) return new Response('{broken');
+    return new Promise<Response>((_resolve, reject) => options!.signal!.addEventListener('abort',
+      () => reject(new DOMException('Timed out', 'AbortError')), { once: true }));
+  });
+  const result = await fetchSingleConfig(A, 5);
+  assert.equal(result.fetchResult.status, 'parse_error');
+  assert.equal(calls, 2); assert.deepEqual(timers, [5, 5]);
+});
+
+test('proxy timeouts cannot hide behind an HTTP failure, but later same-round proxy recovery still succeeds', async () => {
+  const timers = captureDownloadTimers();
+  for (const recovers of [false, true]) {
+    const calls: string[] = []; timers.length = 0;
+    mockFetch((url, options) => {
+      calls.push(url);
+      if (url === A.url) return new Response('', { status: 503 });
+      if (url.startsWith('https://slow-edge.test/')) return new Promise<Response>((_resolve, reject) =>
+        options!.signal!.addEventListener('abort', () => reject(new DOMException('Timed out', 'AbortError')), { once: true }));
+      assert.ok(url.startsWith('https://last-edge.test/'));
+      return recovers ? response(leaf('late-proxy')) : new Response('', { status: 503 });
+    });
+    const result = await fetchSingleConfig(A, 5, { urls: ['https://slow-edge.test/proxy', 'https://last-edge.test/proxy'] });
+    assert.equal(result.fetchResult.status, recovers ? 'ok' : 'http_503');
+    if (recovers) assert.deepEqual(result.config, leaf('late-proxy'));
+    assert.equal(calls.length, 3); assert.deepEqual(timers, [5, 5, 5]);
+  }
+});
+
+for (const failure of ['HTTP 401', 'connection reset']) {
+  test(`static resource failures log all three attempts and only two actual retry waits: ${failure}`, async () => {
+    let calls = 0;
+    const messages: string[] = []; const waits: number[] = [];
+    restoreMocks.push(subscribeLogSink(entry => { if (entry.scope === 'jar-proxy') messages.push(entry.message); }));
+    const previousTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      if (ms === 1000 || ms === 2000 || ms === 5000) waits.push(ms);
+      return previousTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+    restoreMocks.push(() => { globalThis.setTimeout = previousTimeout; });
+    mockFetch(url => {
+      calls++; assert.equal(url, sharedJarUrl);
+      if (failure === 'HTTP 401') return new Response('', { status: 401 });
+      throw new Error(failure);
+    });
+    assert.equal(await downloadResource(sharedJarUrl, 200), null);
+    assert.equal(calls, 3); assert.deepEqual(waits, [1000, 2000]);
+    const address = sharedJarUrl.substring(0, 60) + '...';
+    assert.deepEqual(messages, [
+      `Download attempt 1/3 failed (${failure}), retrying in 1000ms: ${address}`,
+      `Download attempt 2/3 failed (${failure}), retrying in 2000ms: ${address}`,
+      `Download attempt 3/3 failed (${failure}): ${address}`,
+    ]);
+  });
+}
+
+test('import stages original JAR references without downloading files, then aggregation prefetches from the staged config', async () => {
+  const storage = new MemoryStorage();
+  const upstream = { ...leaf('imported-jar'), spider: sharedJarUrl + ';md5;' + declaredJarMd5 };
+  const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url); if (url === A.url) return response(upstream);
+    assert.equal(url, sharedJarUrl); return new Response('imported JAR bytes');
+  });
+  assert.equal((await sourceRequest(storage, A, '/admin/sources')).status, 200);
+  assert.deepEqual(calls, [A.url]);
+  assert.deepEqual(await storage.list('jar:'), []);
+  assert.equal(existsSync(path.join(getSiteResourceDir(0, 'jar'), declaredJarMd5 + '.jar')), false);
+  assert.equal((await importCache(storage)).entries[A.url].config.spider, upstream.spider);
+  await runSync(storage, config);
+  assert.deepEqual(calls, [A.url, sharedJarUrl]);
+  assert.equal((await status(storage)).records[0].acquisition, 'import-cache');
+  assert.equal((await snapshot(storage)).config.spider, upstream.spider);
+  assert.equal((await importCache(storage)).entries[A.url], undefined);
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  assert.equal(res.status, 200); assert.equal(await res.text(), 'imported JAR bytes');
+  assert.deepEqual(calls, [A.url, sharedJarUrl]);
+});
+
+for (const [label, prefix, md5] of [
+  ['URL hash', '', ''],
+  ['declared MD5', '', declaredJarMd5],
+  ['img+ URL hash', 'img+', ''],
+  ['img+ declared MD5', 'img+', declaredJarMd5],
+]) {
+  test(`global-only spider is prefetched and survives cache swaps without proxy re-download: ${label}`, async () => {
+    const storage = new MemoryStorage(); await roots(storage, [A]);
+    const suffix = md5 ? ';md5;' + md5 : '';
+    const declaration = prefix + sharedJarUrl + suffix;
+    const upstream = { ...leaf('shared-jar-user'), spider: declaration };
+    const calls: string[] = [];
+    mockFetch(url => {
+      calls.push(url);
+      if (url === A.url) return response(upstream);
+      assert.equal(url, sharedJarUrl); return new Response('prefetched global JAR bytes');
+    });
+    await runSync(storage, config);
+    assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]); // Legacy inspection precedes first actual acquisition.
+    const key = md5 || await urlToKey(sharedJarUrl);
+    const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
+    assert.equal(merged.spider, prefix + '__TVBOX_BASE_URL__/jar/' + key + suffix);
+    assert.equal(merged.sites![0].jar, undefined);
+    assert.equal(await storage.get('jar:' + key), sharedJarUrl);
+    const mapping = JSON.parse((await storage.get('jar-source:' + key))!);
+    assert.equal(mapping.index, 0);
+    const cachedFile = path.join(getSiteResourceDir(mapping.index, 'jar'), key + '.jar');
+    assert.equal(readFileSync(cachedFile, 'utf8'), 'prefetched global JAR bytes');
+    for (const storedKey of [MERGED_CONFIG_FULL, EXPORT_CONFIG]) {
+      assert.equal(JSON.parse((await storage.get(storedKey))!).spider, declaration);
+    }
+    assert.equal((await snapshot(storage)).config.spider, declaration);
+    assert.deepEqual((await editorSites(storage))[0].sourceNames, [A.name]);
+    const proxy = createJarProxyRouter({ storage, config });
+    const first = await proxy.request('/jar/' + key);
+    assert.equal(first.status, 200); assert.equal(await first.text(), 'prefetched global JAR bytes');
+    assert.equal(calls.length, 3);
+    calls.length = 0;
+    await runSync(storage, config);
+    assert.deepEqual(calls, [A.url]); // Effective cache is copied, rather than lost in the swap.
+    assert.equal(readFileSync(cachedFile, 'utf8'), 'prefetched global JAR bytes');
+    assert.equal(await (await proxy.request('/jar/' + key)).text(), 'prefetched global JAR bytes');
+    assert.deepEqual(calls, [A.url]);
+  });
+}
+
+test('shared and distinct JARs use original URLs once, global priority and matching proxy cache keys', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const alternate = 'https://resources.test/alternate.jar';
+  const plain = 'https://resources.test/plain.jar';
+  const alternateMd5 = 'fedcba9876543210fedcba9876543210';
+  const shared = sharedJarUrl + ';md5;' + declaredJarMd5;
+  const alternateDeclaration = 'img+' + alternate + ';md5;' + alternateMd5;
+  const upstream: TVBoxConfig = { spider: shared, sites: [
+    { ...leaf('alternate-first').sites![0], jar: alternateDeclaration },
+    leaf('implicit-shared').sites![0],
+    { ...leaf('explicit-shared').sites![0], jar: shared },
+    { ...leaf('duplicate-alternate').sites![0], jar: alternateDeclaration },
+    { ...leaf('plain-last').sites![0], jar: plain },
+  ] };
+  const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url); if (url === A.url) return response(upstream);
+    assert.ok([sharedJarUrl, alternate, plain].includes(url)); return new Response('bytes for ' + url);
+  });
+  await runSync(storage, config);
+  assert.deepEqual(calls, [A.url, A.url, sharedJarUrl, alternate, plain]);
+  const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
+  const proxy = createJarProxyRouter({ storage, config });
+  const plainKey = await urlToKey(plain);
+  for (const [url, key, index] of [[sharedJarUrl, declaredJarMd5, 0], [alternate, alternateMd5, 0], [plain, plainKey, 4]] as const) {
+    assert.equal(JSON.parse((await storage.get('jar-source:' + key))!).index, index);
+    assert.equal(readFileSync(path.join(getSiteResourceDir(index, 'jar'), key + '.jar'), 'utf8'), 'bytes for ' + url);
+    const res = await proxy.request('/jar/' + key); assert.equal(res.status, 200);
+    assert.equal(await res.text(), 'bytes for ' + url);
+  }
+  assert.equal(parseSpiderString(merged.sites![2].jar!).url, '__TVBOX_BASE_URL__/jar/' + declaredJarMd5);
+  assert.equal(parseSpiderString(merged.sites![3].jar!).url, '__TVBOX_BASE_URL__/jar/' + alternateMd5);
+  assert.equal((await storage.list('jar:')).length, 3);
+  assert.deepEqual(calls, [A.url, A.url, sharedJarUrl, alternate, plain]);
+});
+
+test('site-only JAR with declared MD5 is downloaded into the same nonzero owner directory as its proxy', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const upstream: TVBoxConfig = { sites: [leaf('without-jar').sites![0],
+    { ...leaf('own-jar').sites![0], jar: sharedJarUrl + ';md5;' + declaredJarMd5 }] };
+  const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url); if (url === A.url) return response(upstream);
+    assert.equal(url, sharedJarUrl); return new Response('site-only bytes');
+  });
+  await runSync(storage, config);
+  assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]);
+  const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
+  assert.equal(merged.spider, undefined);
+  assert.equal(JSON.parse((await storage.get('jar-source:' + declaredJarMd5))!).index, 1);
+  assert.equal(readFileSync(path.join(getSiteResourceDir(1, 'jar'), declaredJarMd5 + '.jar'), 'utf8'), 'site-only bytes');
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  assert.equal(res.status, 200); assert.equal(await res.text(), 'site-only bytes');
+  assert.deepEqual(calls, [A.url, A.url, sharedJarUrl]);
+});
+
+test('an existing JAR directory mapping preserves a valid legacy cache when its site index differs', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const upstream: TVBoxConfig = { sites: [leaf('first').sites![0],
+    { ...leaf('legacy-owner').sites![0], jar: sharedJarUrl + ';md5;' + declaredJarMd5 }] };
+  const previousDir = getSiteResourceDir(0, 'jar'); mkdirSync(previousDir, { recursive: true });
+  writeFileSync(path.join(previousDir, declaredJarMd5 + '.jar'), 'valid legacy bytes');
+  await storage.put('jar-source:' + declaredJarMd5, JSON.stringify({ index: 0, name: 'old.jar', hash: declaredJarMd5.slice(0, 8) }));
+  const calls: string[] = [];
+  mockFetch(url => { calls.push(url); assert.equal(url, A.url); return response(upstream); });
+  await runSync(storage, config);
+  assert.deepEqual(calls, [A.url, A.url]);
+  assert.equal(JSON.parse((await storage.get('jar-source:' + declaredJarMd5))!).index, 0);
+  assert.equal(readFileSync(path.join(previousDir, declaredJarMd5 + '.jar'), 'utf8'), 'valid legacy bytes');
+  const res = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  assert.equal(res.status, 200); assert.equal(await res.text(), 'valid legacy bytes');
+  assert.deepEqual(calls, [A.url, A.url]);
+  const mapping = await storage.get('jar-source:' + declaredJarMd5);
+  assert.equal((await patchMergedConfig(storage)).patched, true);
+  assert.equal(await storage.get('jar-source:' + declaredJarMd5), mapping);
+  const afterPatch = await createJarProxyRouter({ storage, config }).request('/jar/' + declaredJarMd5);
+  assert.equal(afterPatch.status, 200); assert.equal(await afterPatch.text(), 'valid legacy bytes');
+  assert.deepEqual(calls, [A.url, A.url]);
+});
+
+test('failed refresh does not reuse an expired JAR, preserves peers and supports later on-demand caching', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const peer = 'https://resources.test/peer.jar';
+  const upstream: TVBoxConfig = { ...leaf('expired-jar'), spider: sharedJarUrl,
+    sites: [leaf('expired-jar').sites![0], { ...leaf('peer').sites![0], jar: peer }] };
+  let failing = false; const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url); if (url === A.url) return response(upstream);
+    if (url === sharedJarUrl) return failing ? new Response('', { status: 503 }) : new Response('current JAR');
+    assert.equal(url, peer); return new Response('peer bytes');
+  });
+  await runSync(storage, config);
+  const key = await urlToKey(sharedJarUrl);
+  const cachedFile = path.join(getSiteResourceDir(0, 'jar'), key + '.jar');
+  const expired = new Date(Date.now() - 172_800_000);
+  utimesSync(cachedFile, expired, expired);
+  failing = true; calls.length = 0;
+  await runSync(storage, config);
+  assert.equal(calls.filter(url => url === sharedJarUrl).length, 3);
+  assert.equal(calls.filter(url => url === peer).length, 0);
+  assert.equal(existsSync(cachedFile), false);
+  const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
+  assert.equal(merged.sites!.length, 2); assert.ok(await storage.get(LAST_UPDATE));
+  assert.equal((await status(storage)).records[0].status, 'OK');
+  assert.equal((await status(storage)).records[0].consecutiveFailures, 0);
+  const proxy = createJarProxyRouter({ storage, config });
+  const peerKey = await urlToKey(peer);
+  assert.equal(await (await proxy.request('/jar/' + peerKey)).text(), 'peer bytes');
+  assert.equal((await proxy.request('/jar/' + key)).status, 502);
+  assert.equal(existsSync(cachedFile), false);
+  failing = false;
+  assert.equal(await (await proxy.request('/jar/' + key)).text(), 'current JAR');
+  assert.equal(readFileSync(cachedFile, 'utf8'), 'current JAR');
+  const count = calls.length;
+  assert.equal(await (await proxy.request('/jar/' + key)).text(), 'current JAR');
+  assert.equal(calls.length, count);
+});
+
+test('global JAR insertion keeps JS, PY, JSON, TXT and parse cache directories aligned with proxy mappings', async () => {
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  const js = 'https://resources.test/site.js'; const py = 'https://resources.test/site.py';
+  const json = 'https://resources.test/shared.json'; const txt = 'https://resources.test/rules.txt';
+  const parseJs = 'https://resources.test/parse.js';
+  const upstream: TVBoxConfig = { spider: sharedJarUrl, sites: [
+    { ...leaf('js').sites![0], api: js, ext: { rules: json } },
+    { ...leaf('py').sites![0], api: py, ext: txt },
+    { ...leaf('shared-json').sites![0], ext: { rules: json } },
+  ], parses: [{ name: 'parser', type: 1, url: parseJs }] };
+  const calls: string[] = [];
+  mockFetch(url => {
+    calls.push(url); if (url === A.url) return response(upstream);
+    assert.ok([sharedJarUrl, js, py, json, txt, parseJs].includes(url)); return new Response('content ' + url);
+  });
+  await runSync(storage, config);
+  assert.equal(calls.filter(url => url !== A.url)[0], sharedJarUrl);
+  const proxy = createJarProxyRouter({ storage, config });
+  for (const [url, type, index] of [[js, 'js', 0], [py, 'py', 1], [json, 'json', 2], [txt, 'txt', 1], [parseJs, 'js', 0]] as const) {
+    assert.equal(calls.filter(value => value === url).length, 1);
+    const key = await urlToKey(url);
+    assert.equal(JSON.parse((await storage.get('static-source:' + key))!).index, index);
+    assert.equal(readFileSync(path.join(getSiteResourceDir(index, type), key + '.' + type), 'utf8'), 'content ' + url);
+    const count = calls.length; const res = await proxy.request('/' + type + '/' + key + '.' + type);
+    assert.equal(res.status, 200); assert.equal(await res.text(), 'content ' + url); assert.equal(calls.length, count);
+  }
+  const merged = JSON.parse((await storage.get(MERGED_CONFIG))!) as TVBoxConfig;
+  assert.match(merged.sites![0].api, /^__TVBOX_BASE_URL__\/js\//);
+  assert.match(merged.parses![0].url, /^__TVBOX_BASE_URL__\/js\//);
+});
+
+function refreshApi(storage: Storage, timeoutMs?: number) {
+  const activity = sourceActivity(storage);
+  const runtime = { ...idleRuntime, isSyncing: () => activity.kind === 'sync' };
+  const runner = createSyncRunner(activity, () => runSync(storage, config), timeoutMs);
+  return createRefreshRouter({ storage, config, runtime, triggerRefresh: runner });
+}
+const postRefresh = (router: ReturnType<typeof createRefreshRouter>) =>
+  router.request('/refresh', { method: 'POST', headers: adminHeaders });
+
+test('refresh reports actual publication, fallback success, empty inputs and failed output instead of ran alone', async () => {
+  const empty = new MemoryStorage();
+  let res = await postRefresh(refreshApi(empty));
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ran: true, outcome: 'no_sources', message: '没有可聚合的接口，请先添加接口',
+    success: false, syncRunning: false });
+  const invalid = new MemoryStorage(); await roots(invalid, [A]);
+  mockFetch(() => new Response('', { status: 503 }));
+  res = await postRefresh(refreshApi(invalid));
+  assert.equal(res.status, 200); assert.equal((await res.json() as { outcome: string }).outcome, 'no_configs');
+  assert.equal(await invalid.get(MERGED_CONFIG), null);
+
+  const storage = new MemoryStorage(); await roots(storage, [A]);
+  mockFetch(() => response(leaf('published')));
+  const api = refreshApi(storage);
+  res = await postRefresh(api); assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ran: true, outcome: 'saved', message: '聚合完成', success: true, syncRunning: false });
+  const first = await snapshot(storage);
+  mockFetch(() => new Response('', { status: 503 }));
+  res = await postRefresh(api);
+  assert.equal((await res.json() as { success: boolean }).success, true);
+  assert.equal((await status(storage)).records[0].aggregation.latest.mode, 'restored');
+  assert.equal((await snapshot(storage)).savedAt, first.savedAt);
+  storage.failBatch = values => MERGED_CONFIG in values;
+  mockFetch(() => response(leaf('not-published')));
+  res = await postRefresh(api); assert.equal(res.status, 500);
+  assert.deepEqual(await res.json(), { ran: true, outcome: 'failed', message: 'write failed', success: false, syncRunning: false });
+  assert.ok((await readAggregateOutputs(storage))!.merged!.includes('published'));
+  assert.equal((await snapshot(storage)).savedAt, first.savedAt);
+});
+
+test('refresh preserves busy/auth/patch protections and returns work exceptions as failed outcomes', async () => {
+  const storage = new MemoryStorage(); const activity = sourceActivity(storage); let calls = 0;
+  const runtime = { ...idleRuntime, isSyncing: () => activity.kind === 'sync' };
+  const runner = createSyncRunner(activity, async () => { calls++; throw new Error('真实失败 <details>'); });
+  const api = createRefreshRouter({ storage, config, runtime, triggerRefresh: runner });
+  assert.equal((await api.request('/refresh', { method: 'POST' })).status, 401); assert.equal(calls, 0);
+  const release = activity.acquire('import'); assert.ok(release);
+  let res = await postRefresh(api); assert.equal(res.status, 200);
+  const busy = await res.json() as { success: boolean; outcome: string; message: string };
+  assert.equal(busy.success, false); assert.equal(busy.outcome, 'busy'); assert.match(busy.message, /接口正在导入/);
+  assert.equal(calls, 0); release();
+  const locked = createRefreshRouter({ storage, config, runtime: { ...runtime, getPatchLock: () => true }, triggerRefresh: runner });
+  assert.equal((await postRefresh(locked)).status, 409); assert.equal(calls, 0);
+  res = await postRefresh(api); assert.equal(res.status, 500);
+  assert.deepEqual(await res.json(), { ran: true, outcome: 'failed', message: '真实失败 <details>', success: false, syncRunning: false });
+  assert.equal(calls, 1); assert.equal(activity.kind, undefined);
+});
+
+test('refresh timeout is not completion and retains actual task ownership until late work settles', async () => {
+  const storage = new MemoryStorage(); const activity = sourceActivity(storage);
+  const held = deferred<Awaited<ReturnType<typeof runSync>>>();
+  const runtime = { ...idleRuntime, isSyncing: () => activity.kind === 'sync' };
+  const runner = createSyncRunner(activity, () => held.promise, 5);
+  const api = createRefreshRouter({ storage, config, runtime, triggerRefresh: runner });
+  const res = await postRefresh(api); assert.equal(res.status, 504);
+  const data = await res.json() as { success: boolean; outcome: string; syncRunning: boolean; message: string };
+  assert.equal(data.success, false); assert.equal(data.outcome, 'timeout'); assert.equal(data.syncRunning, true);
+  assert.match(data.message, /可能仍在执行/); assert.equal(activity.kind, 'sync');
+  assert.equal((await (await postRefresh(api)).json() as { outcome: string }).outcome, 'busy');
+  assert.equal((await sourceRequest(storage, A, '/admin/sources')).status, 409);
+  held.resolve({ outcome: 'saved', message: '聚合完成' }); await held.promise; await tick();
+  assert.equal(activity.kind, undefined);
+});
+
+interface DashboardElement {
+  textContent: string; className: string; disabled: boolean; innerHTML: string;
+  style: Record<string, string>; classList: { contains: (value: string) => boolean; add: (value: string) => void };
+}
+function dashboardActionFixture(handler: (url: string, options?: RequestInit) => Response | Promise<Response>) {
+  const script = [...dashboardHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map(match => match[1]).find(text => text.includes('async function triggerRefresh'))!;
+  const elements: Record<string, DashboardElement> = {};
+  for (const id of ['refreshBtn', 'exportBtn', 'statSites', 'statLives', 'statParses', 'statSources', 'updateTime',
+    'warningBanner', 'healthOk', 'healthWarn', 'healthError', 'healthTableBody', 'healthToggle', 'healthBody',
+    'searchQuotaSection', 'sqActiveCount', 'sqExcludedCount', 'sqTableBody']) {
+    elements[id] = { textContent: '', className: '', disabled: false, innerHTML: '', style: {},
+      classList: { contains: () => false, add() {} } };
+  }
+  const notices: Array<{ message: string; type: string }> = []; const requests: string[] = [];
+  const request = async (url: string, options?: RequestInit) => { requests.push(url); return handler(url, options); };
+  const context = createContext({ $: (id: string) => elements[id], fetch: request,
+    initAuth: () => ({ authFetch: request }), toast: (message: string, type = 'success') => notices.push({ message, type }),
+    applyTheme() {}, getTheme: () => 'dark', console: { warn() {} },
+    setTimeout() { assert.fail('Refresh actions must not add a delayed result or reset timer'); },
+    esc: (value: unknown) => String(value ?? ''), location: { origin: 'http://local.test' } });
+  new Script(script.replace(sharedUi, '')).runInContext(context);
+  return { elements, notices, requests, run: (code: string) => new Script(code).runInContext(context) };
+}
+function dashboardSummary(url: string, running = false) {
+  if (url === '/status-data') return Response.json({ syncRunning: running, lastUpdate: '2026-10-16T01:00:00.000Z', sites: 7, warnings: [] });
+  if (url === '/source-status') return Response.json({ records: [], summary: { ok: 0, warn: 0, err: 0 } });
+  assert.equal(url, '/search-quota/summary'); return Response.json({ enabled: false });
+}
+
+test('real dashboard action notifies start before response, prevents duplicate posts and reports completion only afterwards', async () => {
+  const held = deferred<Response>();
+  const ui = dashboardActionFixture(url => url === '/refresh' ? held.promise : dashboardSummary(url));
+  const pending = ui.run('triggerRefresh()');
+  assert.deepEqual(ui.notices, [{ message: '开始聚合', type: 'success' }]);
+  assert.equal(ui.elements.refreshBtn.disabled, true); assert.equal(ui.elements.exportBtn.disabled, true);
+  await ui.run('triggerRefresh()'); assert.equal(ui.requests.filter(url => url === '/refresh').length, 1);
+  await ui.run('loadStatus()'); // A false status response cannot unlock an in-flight action.
+  assert.equal(ui.elements.refreshBtn.disabled, true); assert.equal(ui.notices.length, 1);
+  held.resolve(Response.json({ success: true, outcome: 'saved', message: '聚合完成', syncRunning: false }));
+  await pending;
+  assert.deepEqual(ui.notices.map(notice => notice.message), ['开始聚合', '聚合完成']);
+  assert.equal(ui.elements.refreshBtn.disabled, false); assert.equal(ui.elements.exportBtn.disabled, false);
+  assert.equal(ui.elements.refreshBtn.textContent, '立即聚合'); assert.equal(ui.elements.statSites.textContent, 7);
+  assert.ok(ui.requests.includes('/source-status')); assert.ok(ui.requests.includes('/search-quota/summary'));
+});
+
+for (const outcome of ['no_sources', 'no_configs', 'failed', 'busy', 'timeout', 'unauthorized', 'network']) {
+  test(`dashboard renders the real ${outcome} outcome without a false completion notification`, async () => {
+    let running = outcome === 'timeout';
+    const message = outcome === 'timeout' ? '等待聚合结果超时，任务可能仍在执行' : '具体原因 <' + outcome + '>';
+    const ui = dashboardActionFixture(url => {
+      if (url !== '/refresh') return dashboardSummary(url, running);
+      if (outcome === 'network') throw new Error('disconnected');
+      const status = outcome === 'unauthorized' ? 401 : outcome === 'failed' ? 500 : outcome === 'timeout' ? 504 : 200;
+      return Response.json({ success: false, outcome, message, syncRunning: running }, { status });
+    });
+    await ui.run('triggerRefresh()');
+    assert.equal(ui.notices.length, 2); assert.equal(ui.notices[0].message, '开始聚合');
+    assert.equal(ui.notices[1].message, outcome === 'unauthorized' ? '登录已失效，请重新登录'
+      : outcome === 'network' ? '网络错误，无法确认聚合结果，请稍后查看状态' : message);
+    assert.ok(!ui.notices.some(notice => notice.message === '聚合完成'));
+    assert.equal(ui.elements.refreshBtn.disabled, running); assert.equal(ui.elements.exportBtn.disabled, running);
+    if (running) {
+      await ui.run('triggerRefresh()'); assert.equal(ui.requests.filter(url => url === '/refresh').length, 1);
+      running = false; await ui.run('loadStatus()');
+      assert.equal(ui.elements.refreshBtn.disabled, false); assert.equal(ui.elements.exportBtn.disabled, false);
+      assert.equal(ui.notices.length, 2); // Status polling never fabricates an operation result.
+    }
+  });
+}
+
+test('dashboard status refresh failures do not turn confirmed aggregation success into a failed operation', async () => {
+  const ui = dashboardActionFixture(url => {
+    if (url === '/refresh') return Response.json({ success: true, outcome: 'saved', syncRunning: false });
+    throw new Error('status unavailable');
+  });
+  await ui.run('triggerRefresh()');
+  assert.deepEqual(ui.notices.map(notice => notice.message), ['开始聚合', '聚合完成']);
+  assert.equal(ui.elements.refreshBtn.disabled, false); assert.equal(ui.elements.exportBtn.disabled, false);
+  assert.equal(ui.elements.updateTime.textContent, '获取状态失败');
+});
+
+test('a slow post-completion summary does not hold controls or unlock a newer aggregation when it finally returns', async () => {
+  const slowSummary = deferred<Response>(); const secondPost = deferred<Response>();
+  let posts = 0; let firstSummary = true;
+  const ui = dashboardActionFixture(url => {
+    if (url === '/refresh') {
+      posts++;
+      return posts === 1 ? Response.json({ success: true, outcome: 'saved', syncRunning: false }) : secondPost.promise;
+    }
+    if (url === '/status-data' && firstSummary) { firstSummary = false; return slowSummary.promise; }
+    return dashboardSummary(url);
+  });
+  const first = ui.run('triggerRefresh()'); await tick();
+  assert.deepEqual(ui.notices.map(notice => notice.message), ['开始聚合', '聚合完成']);
+  assert.equal(ui.elements.refreshBtn.disabled, false);
+  const second = ui.run('triggerRefresh()'); assert.equal(ui.elements.refreshBtn.disabled, true);
+  slowSummary.resolve(dashboardSummary('/status-data')); await first;
+  assert.equal(ui.elements.refreshBtn.disabled, true); assert.equal(posts, 2);
+  assert.equal(ui.notices.filter(notice => notice.message === '聚合完成').length, 1);
+  secondPost.resolve(Response.json({ success: true, outcome: 'saved', syncRunning: false })); await second;
+  assert.equal(ui.elements.refreshBtn.disabled, false);
+  assert.deepEqual(ui.notices.map(notice => notice.message), ['开始聚合', '聚合完成', '开始聚合', '聚合完成']);
+});
+
+test('dashboard ignores stale statistics, source health and quota replies from before aggregation', async () => {
+  const old = new Map(['/status-data', '/source-status', '/search-quota/summary'].map(url => [url, deferred<Response>()]));
+  const pendingOld = new Set(old.keys());
+  const ui = dashboardActionFixture(url => {
+    if (url === '/refresh') return Response.json({ success: true, outcome: 'saved', syncRunning: false });
+    if (pendingOld.delete(url)) return old.get(url)!.promise;
+    return dashboardSummary(url);
+  });
+  const status = ui.run('loadStatus()'); const health = ui.run('loadSourceHealth()'); const quota = ui.run('loadSearchQuotaSummary()');
+  await ui.run('triggerRefresh()');
+  old.get('/status-data')!.resolve(Response.json({ syncRunning: true, sites: 999, warnings: [] }));
+  old.get('/source-status')!.resolve(Response.json({ records: [], summary: { ok: 999, warn: 999, err: 0 } }));
+  old.get('/search-quota/summary')!.resolve(Response.json({ enabled: true, searchable: 999 }));
+  await Promise.all([status, health, quota]);
+  assert.equal(ui.elements.statSites.textContent, 7); assert.equal(ui.elements.healthOk.textContent, 0);
+  assert.equal(ui.elements.searchQuotaSection.style.display, 'none');
+  assert.equal(ui.elements.refreshBtn.disabled, false); assert.equal(ui.notices.length, 2);
+});
+
+test('dashboard status polling cannot reenable an export while its download request remains pending', async () => {
+  const held = deferred<Response>();
+  const ui = dashboardActionFixture(url => url === '/admin/export-config' ? held.promise : dashboardSummary(url));
+  const pending = ui.run('triggerExport()');
+  assert.equal(ui.elements.exportBtn.disabled, true); await ui.run('loadStatus()');
+  assert.equal(ui.elements.exportBtn.disabled, true);
+  held.resolve(new Response('', { status: 503 })); await pending;
+  assert.equal(ui.elements.exportBtn.disabled, false);
+});
+test('shared login focuses only when authentication requires input and preserves Enter login', async () => {
+  for (const scenario of ['empty', 'valid', 'invalid', 'network'] as const) {
+    let focused = 0;
+    let loaded = 0;
+    const requests: string[] = [];
+    const saved = new Map(scenario === 'empty' ? [] : [['admin_token', 'saved-token']]);
+    let keydown: ((event: { key: string }) => void) | undefined;
+    const elements = {
+      input: { value: '', focus: () => { focused++; }, addEventListener: (_: string, handler: typeof keydown) => { keydown = handler; } },
+      overlay: { style: { display: '' } },
+      content: { style: { display: 'none' } },
+      error: { style: { display: 'none' } },
+    };
+    const context = createContext({
+      document: { getElementById: (id: keyof typeof elements) => elements[id] },
+      sessionStorage: { getItem: (key: string) => saved.get(key), setItem: (key: string, value: string) => saved.set(key, value) },
+      fetch: async (_: string, options: { headers: { Authorization: string } }) => {
+        requests.push(options.headers.Authorization);
+        if (options.headers.Authorization === 'Bearer replacement-token') return { ok: true };
+        if (scenario === 'network') throw new Error('offline');
+        return { ok: scenario === 'valid' };
+      },
+      onSuccess: () => { loaded++; },
+    });
+    new Script(sharedUi + '\ninitAuth("input", "error", "overlay", "content", "/verify", onSuccess);').runInContext(context);
+    assert.equal(focused, scenario === 'empty' ? 1 : 0, scenario);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(focused, scenario === 'valid' ? 0 : 1, scenario);
+    assert.equal(loaded, scenario === 'valid' ? 1 : 0, scenario);
+    assert.equal(elements.overlay.style.display, scenario === 'valid' ? 'none' : '', scenario);
+    assert.equal(elements.content.style.display, scenario === 'valid' ? 'block' : 'none', scenario);
+    if (scenario !== 'valid') {
+      elements.input.value = ' replacement-token ';
+      keydown!({ key: 'Enter' });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(requests.at(-1), 'Bearer replacement-token', scenario);
+      assert.equal(elements.overlay.style.display, 'none', scenario);
+      assert.equal(saved.get('admin_token'), 'replacement-token', scenario);
+      assert.equal(loaded, 1, scenario);
+    }
+  }
 });

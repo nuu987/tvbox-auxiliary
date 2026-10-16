@@ -1,19 +1,19 @@
 // 同步流程编排
 
 import type { Storage } from './storage/interface';
-import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFetchResult, SourceHealthRecord, TVBoxConfig } from './core/types';
+import type { AppConfig, SourceEntry, SourcedConfig, MacCMSSourceEntry, SourceFetchResult, SourceHealthRecord, TVBoxConfig, SyncResult } from './core/types';
 import { fetchConfigs } from './core/fetcher';
 import { classifyStatus } from './core/status-classifier';
 import { mergeConfigs, cleanLocalRefs, cleanEmptyEntries } from './core/merger';
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
-import { rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
+import { createJarResourcePlan, rewriteJarUrls, rewriteNonJarUrls, parseSpiderString, collectAllSiteResources, downloadResource, writeResourceCache, urlToKey, sortResourcesByPriority, isMd5Key } from './core/jar-proxy';
 import { refreshLiveCache, pruneLiveCache, liveCacheProviders } from './core/live-cache';
 import { supportedLives, liveAddress } from './core/live-source';
 import { MERGED_CONFIG, MANUAL_SOURCES, MACCMS_SOURCES, BLACKLIST, INLINE_PREFIX, NAME_TRANSFORM, SOURCE_HEALTH, EDGE_PROXIES, SEARCH_QUOTA_REPORT, BASE_URL_PLACEHOLDER } from './core/config';
 import { loadLivePolicy } from './core/live-policy';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist, generateExportConfig } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
-import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
+import { parseConfigJson } from './core/fetcher';
 import { scrapeSourceList, scrapeMacCMSSources, type ScrapeSourceConfig, type ScrapeMacCMSConfig } from './core/source-scraper';
 import { loadSearchQuota, applySearchQuota } from './core/search-quota';
 import { loadCredentials } from './core/credential-store';
@@ -28,8 +28,11 @@ import { SourceFallbackRound, withSourceGate, saveSourceRoots, beginSourceOutput
 import { selectDataSources, sourceCapacity, sourceLimit } from './core/source-capacity';
 import { publishAggregateOutputs, isCurrentAggregateRun, recordAggregateFailure, type OutputRunTicket } from './core/aggregate-output';
 import { prepareImportOnlyRun } from './core/source-import-policy';
+import { loadFetchProxy } from './core/fetch-proxy';
+import { ImportCacheRound } from './core/source-import-cache';
+import { captureSourceBaseline } from './core/source-fallback';
 
-export async function runSync(storage: Storage, config: AppConfig): Promise<void> {
+export async function runSync(storage: Storage, config: AppConfig): Promise<SyncResult> {
   const startTime = Date.now();
   let round: SourceFallbackRound | undefined;
   let ticket: OutputRunTicket | undefined;
@@ -41,8 +44,10 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
 
   try {
     ticket = await beginSourceOutputRun(storage);
+    const imports = await withSourceGate(storage, () => ImportCacheRound.begin(storage,
+      async () => (await captureSourceBaseline(storage)).registry, startTime));
     ticket = await prepareImportOnlyRun(storage, config, ticket);
-    await _runSync(storage, config, startTime, ticket, value => { round = value; });
+    return await _runSync(storage, config, startTime, ticket, value => { round = value; }, imports);
   } catch (error: unknown) {
     failed = true;
     const msg = error instanceof Error ? error.message : String(error);
@@ -57,12 +62,13 @@ export async function runSync(storage: Storage, config: AppConfig): Promise<void
     } catch (cleanupErr) {
       logger.warn('sync', `Failed to clean temp directory after sync failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
     }
+    return { outcome: 'failed', message: msg };
   } finally {
     await round?.finish(failed ? 'failed' : 'no_configs');
   }
 }
 
-async function _runSync(storage: Storage, config: AppConfig, startTime: number, ticket: OutputRunTicket, registerRound: (round: SourceFallbackRound) => void): Promise<void> {
+async function _runSync(storage: Storage, config: AppConfig, startTime: number, ticket: OutputRunTicket, registerRound: (round: SourceFallbackRound) => void, imports: ImportCacheRound): Promise<SyncResult> {
   const limit = sourceLimit(config);
 
   // Step 0: 自动抓取源（需配置 SCRAPE_SOURCE_URL 环境变量）
@@ -144,7 +150,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
 
   if (sources.length === 0 && !hasMacCMS) {
     logger.warn('sync', 'No sources configured, nothing to do');
-    return;
+    return { outcome: 'no_sources', message: '没有可聚合的接口，请先添加接口' };
   }
 
   logger.infoFields('sync', 'config-sources-loaded', { count: sources.length });
@@ -191,20 +197,17 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
 
   // Step 2: 批量 fetch 配置 JSON（本地模式可通过边缘代理回退）
   logger.info('sync', 'Step 2: Fetching configs...');
-  let proxyConfig: FetchProxyConfig | undefined;
-  // 读取边缘代理配置
-  const edgeRaw = await storage.get(EDGE_PROXIES);
-  if (edgeRaw) {
-    const edge: EdgeProxyConfig = JSON.parse(edgeRaw);
-    const urls: string[] = [];
-    if (edge.fetchProxy) urls.push(`${edge.fetchProxy}/fetch-proxy`);
-    if (edge.vercel) urls.push(`${edge.vercel}/api/proxy`);
-    if (urls.length > 0) {
-      proxyConfig = { urls, token: config.adminToken };
-      logger.info('sync', `Edge proxies configured: ${urls.join(', ')}`);
-    }
-  }
-  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs, proxyConfig, fallback);
+  const proxyConfig = await loadFetchProxy(storage, config);
+  const resolver = {
+    source: fallback.source,
+    acquire: (source: SourceEntry) => imports.acquire(source, fallback.identity(source)),
+    resolve: (source: SourceEntry, raw: TVBoxConfig | null, result: SourceFetchResult) => {
+      const resolved = fallback.resolve(source, raw, result);
+      if (resolved && fallback.fresh(source) && result.acquisition === 'import-cache') imports.accepted(source);
+      return resolved;
+    },
+  };
+  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs, proxyConfig, resolver);
   fetchResults.forEach((result) => {
     logger.infoFields('sync', 'fetch-result', {
       name: result.name,
@@ -228,11 +231,11 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
   });
 
   // 更新源健康状态
-  await updateSourceHealth(storage, fetchResults, fallback.activeUrls());
+  await updateSourceHealth(storage, fetchResults, fallback.activeUrls(), source => fallback.identity(source));
 
   if (sourcedConfigs.length === 0 && inlineConfigs.length === 0 && macCMSConfigs.length === 0) {
     logger.warn('sync', 'No valid configs fetched and no MacCMS/inline sources, keeping previous cache');
-    return;
+    return { outcome: 'no_configs', message: '没有可用的接口配置，本轮未生成聚合结果' };
   }
 
   // Step 4: 合并（包含 MacCMS 源，投票制 spider 分配）
@@ -391,25 +394,16 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     await refreshLiveCache(storage, liveInputs, config.fetchTimeoutMs, () => isCurrentAggregateRun(storage, ticket), providers);
   }
 
-  // Step 6.8: Build JAR URL → source index map
-  const jarSourceIndexMap = new Map<string, number>();
-  if (merged.sites) {
-    for (const site of merged.sites) {
-      if (site.jar) {
-        const parsed = parseSpiderString(site.jar);
-        if (parsed.url.startsWith('http://') || parsed.url.startsWith('https://')) {
-          if (!jarSourceIndexMap.has(parsed.url)) {
-            jarSourceIndexMap.set(parsed.url, jarSourceIndexMap.size);
-          }
-        }
-      }
-    }
-  }
+  // Step 6.8: Capture original URLs and shared JAR identities before proxy rewriting.
+  const jarResources = await createJarResourcePlan(merged, storage);
+  const jarResourceByUrl = new Map(jarResources.map(resource => [resource.url, resource]));
+  const resources = collectAllSiteResources(merged.sites || [], merged.parses, merged.spider);
+  const sorted = sortResourcesByPriority(resources, merged.spider);
 
   // Step 7: JAR URL 改写
   logger.info('sync', 'Step 7: Rewriting JAR URLs for proxy (placeholder)...');
   const beforeJar = configCounts(merged);
-  merged = await rewriteJarUrls(merged, BASE_URL_PLACEHOLDER, storage, jarSourceIndexMap);
+  merged = await rewriteJarUrls(merged, BASE_URL_PLACEHOLDER, storage, jarResources);
   logger.infoFields('sync', 'jar-rewrite-complete', {
     ...beforeJar,
     placeholder: BASE_URL_PLACEHOLDER,
@@ -424,10 +418,6 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     cleanStaleTempDir();
     fs.mkdirSync(getTmpSitesDir(), { recursive: true });
 
-    const resources = collectAllSiteResources(merged.sites, merged.parses);
-    // D-01/D-02: spider JAR 优先下载
-    const sorted = sortResourcesByPriority(resources, merged.spider);
-
     if (sorted.length > 0) {
       logger.infoFields('sync', 'static-resources-found', { count: sorted.length });
       const downloadTimeout = config.fetchTimeoutMs || 10000;
@@ -435,12 +425,13 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
       let failed = 0;
       let copiedFromLive = 0;
 
-      for (const { url, type } of sorted) {
+      for (const { url, type, index } of sorted) {
+        const jarResource = type === 'jar' ? jarResourceByUrl.get(url) : undefined;
         let key: string | null = null;
 
         if (type === 'jar') {
           const parsed = parseSpiderString(url);
-          key = parsed.md5 || (await urlToKey(url));
+          key = jarResource?.key || parsed.md5 || (await urlToKey(url));
         } else {
           key = await urlToKey(url);
         }
@@ -450,38 +441,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
           continue;
         }
 
-        let resourceIndex = 0;
-        if (type === 'jar') {
-          const jarSourceRaw = await storage.get(`jar-source:${key}`);
-          if (jarSourceRaw) {
-            try { resourceIndex = JSON.parse(jarSourceRaw).index; } catch { /* ignore */ }
-          } else {
-            const siteIdx = merged.sites.findIndex(s =>
-              s.jar && parseSpiderString(s.jar).url === url
-            );
-            resourceIndex = siteIdx >= 0 ? siteIdx : 0;
-          }
-        } else {
-          // 非 JAR 资源：优先从 static-source KV 获取 index
-          const staticSourceRaw = await storage.get(`static-source:${key}`);
-          if (staticSourceRaw) {
-            try { resourceIndex = JSON.parse(staticSourceRaw).index; } catch { /* ignore */ }
-          }
-          // KV 中也没有时，从 resources 数组的原始位置确定 index
-          if (!staticSourceRaw) {
-            const originalIdx = resources.findIndex(r => r.url === url);
-            if (originalIdx >= 0 && originalIdx < merged.sites.length) {
-              resourceIndex = originalIdx;
-            } else if (originalIdx >= merged.sites.length) {
-              // WR-04: originalIdx 超过 sites 数量说明 URL 来自 parses（collectAllSiteResources
-              // 先收集 sites 再收集 parses，parse-sourced index 偏移到 sites.length 之后）。
-              // 旧实现静默写回 sites/01 目录，KV mapping.index=0 误导 cleanupZombieFiles 白名单。
-              // 至少记录 warn 便于运维诊断；写回仍兜底为 site 01 以保持原有行为。
-              logger.warn('sync', `Static resource ${url.substring(0, 60)}... is parse-sourced (originalIdx=${originalIdx}, sites=${merged.sites.length}); falling back to site 01 — disk layout may be misleading`);
-            }
-            // 如果还没找到，保持 resourceIndex = 0 作为最后兜底（但不应发生）
-          }
-        }
+        // Owner indices survive sorting and must match the corresponding proxy mapping.
+        const resourceIndex = jarResource?.index ?? index;
 
         // 计算临时目录下的目标路径：data/.tmp-sites/{index}/{type}/
         const tmpDir = path.join(getTmpSitesDir(), siteIndexToDirName(resourceIndex), type);
@@ -601,6 +562,8 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
       { merged: mergedJson, full: fullJson, exported: exportJson, siteSourceNames: mergeResult.siteSourceNames,
         liveDisabled: livePolicy.disabled }, savedAt);
   });
+  try { await imports.consume(); }
+  catch (error) { logger.warn('source-import', `输出已发布，导入暂存清理失败：${error instanceof Error ? error.message : String(error)}`); }
   try { await pruneLiveCache(storage); } catch (error) { logger.warn('live-cache', `缓存清理失败: ${error instanceof Error ? error.message : String(error)}`); }
   logger.infoFields('sync', 'storage-write-complete', {
     key: MERGED_CONFIG,
@@ -617,6 +580,7 @@ async function _runSync(storage: Storage, config: AppConfig, startTime: number, 
     elapsedSeconds: elapsed,
     ...configCounts(merged),
   });
+  return { outcome: 'saved', message: '聚合完成' };
 }
 
 /**
@@ -679,7 +643,7 @@ async function processMacCMSSources(
 /**
  * 更新源健康状态：读取历史 → merge 本次 fetch 结果 → 写回
  */
-async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchResult[], activeUrls: Set<string>): Promise<void> {
+async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchResult[], activeUrls: Set<string>, identity: (source: SourceEntry) => { generation: string; importedAt?: string } | undefined): Promise<void> {
   if (fetchResults.length === 0) return;
 
   const now = new Date().toISOString();
@@ -710,16 +674,20 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
   const newRecords: SourceHealthRecord[] = [];
 
   for (const fr of fetchResults) {
-    const old = oldMap.get(fr.url);
+    const node = identity({ url: fr.url, name: fr.name });
+    const previous = oldMap.get(fr.url);
+    const old = node?.importedAt && previous?.generation !== node.generation ? undefined : previous;
 
     if (fr.status === 'ok') {
       newRecords.push({
         url: fr.url,
+        generation: node?.generation,
         name: fr.name,
         status: classifyStatus(fr.status, 0),
         fetchStatus: fr.status,
         consecutiveFailures: 0,
-        lastSuccessTime: now,
+        lastSuccessTime: fr.acquiredAt || now,
+        acquisition: fr.acquisition || 'remote',
         lastFailTime: old?.lastFailTime,
         lastFailReason: old?.lastFailReason,
         lastSpeedMs: fr.speedMs,
@@ -728,6 +696,7 @@ async function updateSourceHealth(storage: Storage, fetchResults: SourceFetchRes
       const newFailCount = (old?.consecutiveFailures ?? 0) + 1;
       newRecords.push({
         url: fr.url,
+        generation: node?.generation,
         name: fr.name,
         status: classifyStatus(fr.status, newFailCount),
         fetchStatus: fr.status,

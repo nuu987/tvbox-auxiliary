@@ -25,6 +25,7 @@ import type { Storage } from './storage/interface';
 import type { AppConfig, SyncSchedule } from './core/types';
 import type { RuntimeState } from './routes/admin-auth';
 import { getDirtyMarker, clearDirtyMarker } from './core/dirty-marker';
+import { createSyncRunner, sourceActivity } from './core/source-activity';
 
 // 加载 .env
 dotenv.config();
@@ -89,42 +90,23 @@ async function main() {
     logger.securityFields('Starting up with DMZ=0! BE SAFE!', {});
   }
 
-  let refreshRunning = false;
+  const activity = sourceActivity(storage);
   let patchLock = false;
-    const SYNC_TIMEOUT_MS = 300_000; // 同步整体超时 5 分钟
 
   const runtime: RuntimeState = {
     getPatchLock: () => patchLock,
     setPatchLock: (locked: boolean) => { patchLock = locked; },
-    isSyncing: () => refreshRunning,
+    isSyncing: () => activity.kind === 'sync',
   };
 
-  const runWithGuard = async (opts?: { source?: 'cron' | 'manual' }): Promise<{ ran: boolean }> => {
-    if (refreshRunning) {
-      logger.warn('sync', 'Already running, skipping');
-      return { ran: false };
-    }
+  const runWithGuard = createSyncRunner(activity, async () => {
     const dirty = await getDirtyMarker(storage);
     if (dirty) {
       logger.info('sync', 'clearing dirty marker before aggregation');
       await clearDirtyMarker(storage);
     }
-    refreshRunning = true;
-    try {
-      await Promise.race([
-        runSync(storage, config),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Sync timed out')), SYNC_TIMEOUT_MS),
-        ),
-      ]);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error('sync', `Error: ${msg}`);
-    } finally {
-      refreshRunning = false;
-    }
-    return { ran: true };
-  };
+    return runSync(storage, config);
+  });
 
   // 动态 cron 管理
   let currentTask: cron.ScheduledTask | null = null;

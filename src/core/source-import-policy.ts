@@ -4,7 +4,7 @@ import { SOURCE_HEALTH, SOURCE_IMPORT_POLICY_STATE, SOURCE_OUTPUT_STATE, SOURCE_
 import { captureSourceBaseline, fingerprint, migrationSourceValues, rememberSourceMigration, withSourceGate } from './source-fallback';
 import { migrationOutputState, type OutputRunTicket } from './aggregate-output';
 import { inspectSourceOnce, isMultiRepoConfig, parseConfigJson } from './fetcher';
-import { planSourceImport } from './source-import';
+import { planSourceImport } from './source-import-legacy';
 import { readImportPolicy, type ImportPolicyState, type PendingIdentity } from './source-import-state';
 import { selectDataSources, sourceLimit } from './source-capacity';
 
