@@ -139,6 +139,13 @@ body::before{
   gap:12px;
 }
 
+.header-brand{
+  display:flex;
+  align-items:baseline;
+  gap:12px;
+  min-width:0;
+}
+
 .header-title{
   min-width:0;
   font-family:var(--sans);
@@ -150,6 +157,17 @@ body::before{
 }
 
 .header-title span{color:var(--green)}
+
+.header-version{
+  flex-shrink:0;
+  font-family:var(--sans);
+  font-size:1rem;
+  font-weight:700;
+  letter-spacing:-0.02em;
+  color:var(--text-bright);
+  line-height:1.2;
+  white-space:nowrap;
+}
 
 .header-nav{
   display:flex;
@@ -633,18 +651,6 @@ body::before{
   font-size:0.75rem;
   color:var(--amber);
   line-height:1.6;
-}
-
-/* Footer */
-.footer{
-  margin-top:36px;
-  padding-top:20px;
-  border-top:1px solid var(--border);
-  font-family:var(--mono);
-  font-size:0.65rem;
-  color:var(--text-dim);
-  text-align:center;
-  letter-spacing:0.05em;
 }
 
 /* Loading skeleton */

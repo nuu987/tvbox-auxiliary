@@ -1,6 +1,6 @@
 import { sharedStyles } from './shared-styles';
 import { sharedUi } from './shared-ui';
-import { footerHtml } from './shared-footer';
+import { headerVersionHtml } from './shared-header';
 
 export const dashboardHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -312,7 +312,6 @@ ${sharedStyles}
   border-color:var(--green);
 }
 
-.footer{margin-top:48px;padding-top:24px}
 </style>
 <script>(function(){var t=localStorage.getItem('theme')||'dark';document.documentElement.setAttribute('data-theme',t)})()</script>
 </head>
@@ -333,7 +332,10 @@ ${sharedStyles}
 <div class="container" id="mainContent" style="display:none">
   <header class="header">
     <div class="header-top">
-      <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+      <div class="header-brand">
+        <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+        ${headerVersionHtml}
+      </div>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
     </div>
     <nav class="header-nav">
@@ -461,7 +463,6 @@ ${sharedStyles}
     </div>
   </div>
 
-  ${footerHtml}
 </div>
 
 <script>

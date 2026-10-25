@@ -1,6 +1,6 @@
 import { sharedStyles } from './shared-styles';
 import { sharedUi } from './shared-ui';
-import { footerHtml } from './shared-footer';
+import { headerVersionHtml } from './shared-header';
 
 export const configEditorHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -289,7 +289,6 @@ ${sharedStyles}
 }
 .btn[disabled]{opacity:0.3;cursor:not-allowed;pointer-events:none}
 
-.footer{margin-top:48px;padding-top:24px}
 
 /* Regex section */
 .regex-toggle-bar{display:flex;align-items:center;gap:8px;padding:17px 0;cursor:pointer;user-select:none;font-size:0.75rem;font-weight:600;color:var(--text)}
@@ -373,7 +372,10 @@ ${sharedStyles}
 <div class="container" id="mainContent" style="display:none">
   <header class="header">
     <div class="header-top">
-      <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+      <div class="header-brand">
+        <h1 class="header-title">TVBox <span>Auxiliary</span></h1>
+        ${headerVersionHtml}
+      </div>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
     </div>
     <nav class="header-nav">
@@ -435,7 +437,6 @@ ${sharedStyles}
     <div class="loading-msg" id="loadingLives">加载中...</div>
   </div>
 
-  ${footerHtml}
 </div>
 
 <div class="batch-bar" id="batchBar" style="display:none">
