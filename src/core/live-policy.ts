@@ -36,7 +36,13 @@ export function applyStoredLivePolicy(config: TVBoxConfig, policy: LivePolicy): 
 }
 
 /** Compose the latest manual list exactly once, without changing the stored base. */
-export function projectLiveJson(raw: string, policy: LivePolicy, transformBase?: (base: string) => string, baseUrl = ''): string {
+export function projectLiveJson(
+  raw: string,
+  policy: LivePolicy,
+  transformBase?: (base: string) => string,
+  baseUrl = '',
+  transformConfig?: (config: TVBoxConfig) => TVBoxConfig,
+): string {
   const config: unknown = JSON.parse(raw);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid config object');
   // Public lives are the only field projected here; leave all other TVBox fields intact.
@@ -44,7 +50,11 @@ export function projectLiveJson(raw: string, policy: LivePolicy, transformBase?:
   if (!Array.isArray(lives)) throw new Error('Invalid config lives');
   // Filter collisions before host replacement; compose literal manual URLs afterwards.
   const entries = [...interfaceLives({ ...config, lives }, policy), ...supportedLives(policy.manualLives)];
-  const base = { ...config, lives: [] };
-  const resolved = transformBase ? JSON.parse(transformBase(JSON.stringify(base))) : base;
-  return JSON.stringify({ ...resolved, lives: entries.map(entry => projectLiveAddress(entry, policy.cacheState, baseUrl)) });
+  const base = { ...(config as TVBoxConfig), lives: [] };
+  const resolved = transformBase ? JSON.parse(transformBase(JSON.stringify(base))) as TVBoxConfig : base;
+  const projected: TVBoxConfig = {
+    ...resolved,
+    lives: entries.map(entry => projectLiveAddress(entry, policy.cacheState, baseUrl)),
+  };
+  return JSON.stringify(transformConfig ? transformConfig(projected) : projected);
 }

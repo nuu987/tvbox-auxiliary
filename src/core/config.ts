@@ -27,6 +27,7 @@ export const INLINE_PREFIX = 'inline_config_';
 
 // 名称定制配置
 export const NAME_TRANSFORM = 'name_transform';
+export const SITE_NAME_EMOJI_REMOVAL = 'site_name_emoji_removal';
 
 // 源健康状态
 export const SOURCE_HEALTH = 'source_health';

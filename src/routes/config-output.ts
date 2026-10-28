@@ -3,8 +3,9 @@
 import { Hono } from 'hono';
 import { readAggregateOutputs } from '../core/aggregate-output';
 import { getRequestBaseUrl, applyBaseUrlPlaceholder, assertHostAllowed } from '../core/base-url';
-import { SMART_JAR_URL_ENABLED } from '../core/config';
+import { SITE_NAME_EMOJI_REMOVAL, SMART_JAR_URL_ENABLED } from '../core/config';
 import { projectLiveJson } from '../core/live-policy';
+import { removeEmojiFromSiteNames } from '../core/cleaner';
 import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
@@ -55,10 +56,17 @@ export function createConfigOutputRouter(deps: ConfigOutputRouteDeps): Hono {
       }
     }
 
+    const emojiRemovalEnabled = await storage.get(SITE_NAME_EMOJI_REMOVAL) === 'true';
     let body: string;
     try {
       // Insert declared URLs after host substitution so their literal values stay intact.
-      body = projectLiveJson(cached, outputs.livePolicy, base => applyBaseUrlPlaceholder(base, actualBase, fallback), actualBase);
+      body = projectLiveJson(
+        cached,
+        outputs.livePolicy,
+        base => applyBaseUrlPlaceholder(base, actualBase, fallback),
+        actualBase,
+        emojiRemovalEnabled ? removeEmojiFromSiteNames : undefined,
+      );
     } catch {
       return c.json({ error: 'Config parse error' }, 500);
     }

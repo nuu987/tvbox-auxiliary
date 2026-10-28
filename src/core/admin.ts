@@ -83,7 +83,7 @@ ${sharedStyles}
 
 
 /* Complete operation diagnostics; no ellipsis or fixed-height clipping. */
-.source-operation-result{white-space:pre-wrap;overflow-wrap:anywhere;overflow:visible;min-width:0;margin:12px 0 16px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text-dim);font-family:var(--mono);font-size:0.75rem;line-height:1.6}
+.source-operation-result{white-space:pre-wrap;overflow-wrap:anywhere;overflow:visible;min-width:0;margin:12px 0 0;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text-dim);font-family:var(--mono);font-size:0.75rem;line-height:1.6}
 .source-operation-result:empty{display:none}
 .source-operation-result.error{color:var(--red);background:var(--red-dim);border-color:var(--red-dim)}
 .source-operation-result.success{color:var(--green);background:var(--green-dim);border-color:var(--green-dim)}
@@ -94,7 +94,7 @@ ${sharedStyles}
   .compact-source-form .name-input{width:100%}
   .compact-source-form .btn{grid-column:2;justify-self:end}
 }
-#panelSources .source-import-toggle{width:100%;border:0;background:transparent;text-align:left;padding:17px 0;margin-top:8px;font-size:0.75rem;font-weight:600;letter-spacing:normal;color:var(--text)}
+#panelSources .source-import-toggle{width:100%;border:0;background:transparent;text-align:left;padding:17px 0;font-size:0.75rem;font-weight:600;letter-spacing:normal;color:var(--text)}
 #panelSources .source-import-toggle:hover{color:var(--text-bright)}
 #panelSources .source-import-toggle:focus-visible{outline:2px solid var(--green);outline-offset:2px;border-radius:4px}
 .source-import-panel{margin-top:0;margin-bottom:12px}
@@ -171,7 +171,6 @@ ${sharedStyles}
   color:var(--text-dim);
 }
 :is(#sourceList, #liveList) .source-info{overflow:visible}
-.source-capacity-hint{margin-bottom:12px;color:var(--text-dim);font-family:var(--mono);font-size:0.7rem;line-height:1.8;overflow-wrap:anywhere}
 :is(#sourceList, #liveList) :is(.source-name, .source-url, .source-status, .source-reason, .source-cache-time){
   white-space:normal;
   overflow:visible;
@@ -241,6 +240,7 @@ ${sharedStyles}
         <button class="btn" id="addBtn" onclick="addSource()" disabled>添加</button>
       </div>
       <div id="addResult" class="source-operation-result" role="status" aria-live="polite"></div>
+      <div id="sourceCapacityHint" class="source-operation-result error" role="status" aria-live="polite" hidden></div>
       <!-- Import (collapsible) -->
       <button type="button" class="collapsible-toggle source-import-toggle" aria-expanded="false" aria-controls="sourceImportPanel" onclick="toggleCollapsible(this);this.setAttribute('aria-expanded',this.classList.contains('open'))">高级添加</button>
       <div class="collapsible-body source-import-panel" id="sourceImportPanel">
@@ -260,7 +260,6 @@ ${sharedStyles}
         <span class="count" id="sourceCount">0</span>
       </div>
       <p class="source-list-description">注意，聚合过多的接口会导致 Tvbox 启动缓慢与加载崩溃，一般不建议添加超过 3 个接口</p>
-      <div id="sourceCapacityHint" class="source-capacity-hint" hidden></div>
       <div class="source-list" id="sourceList">
         <div class="empty">Loading sources...</div>
       </div>
@@ -368,10 +367,10 @@ ${sharedStyles}
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
           <input type="checkbox" id="smartJarUrlCheck" onchange="saveSmartJarUrl()">
-          <span>智能响应静态资源地址</span>
+          <span>智能响应代理地址</span>
         </label>
       </div>
-      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">使用请求体头部中的主机信息为该客户端动态生成静态资源地址，注意潜在的安全风险，默认不支持非局域网访问（请设置环境变量：DMZ=0）</div>
+      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">使用请求体头部中的主机信息为客户端动态生成代理地址，注意潜在的安全风险，默认不支持非局域网访问（需设置环境变量 DMZ=0）</div>
 
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -380,6 +379,15 @@ ${sharedStyles}
         </label>
       </div>
       <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">启用后忽略接口提供的直播源并锁定配置编辑，手动添加的不受影响</div>
+
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="siteNameEmojiRemovalCheck" onchange="saveSiteNameEmojiRemoval()">
+          <span>移除点播站点名称中的特殊符号</span>
+        </label>
+      </div>
+      <div style="margin-top:6px;font-size:0.8rem;color:var(--text-secondary)">配置编辑页面将始终显示原始名称</div>
+
     </div>
 
     <div class="section">
@@ -480,8 +488,7 @@ function updateSourceCapacityControls() {
   document.querySelectorAll('#sourceList [data-source-delete]').forEach(button => { button.disabled = sourceOperationBusy; });
   const hint = $('sourceCapacityHint');
   hint.hidden = !full;
-  hint.textContent = full ? '接口数量已达到上限（' + sourceLimitValue + '），请删除至上限以下后再添加。'
-    + (sourceTotal > sourceLimitValue ? ' 本轮仅聚合列表前 ' + sourceLimitValue + ' 条；旧结果在新聚合成功前保持。' : '') : '';
+  hint.textContent = full ? '接口数量已满（' + sourceLimitValue + '），删除任意现有接口后可继续添加新接口。' : '';
 }
 function sourceCapacityFeedback(data) {
   const capacity = data.capacity;
@@ -521,6 +528,7 @@ async function loadAll() {
   loadSyncSchedule();
   loadSmartJarUrl();
   loadLiveDisabled();
+  loadSiteNameEmojiRemoval();
   loadEdgeProxies();
   loadSearchQuota();
 }
@@ -1006,6 +1014,26 @@ async function saveLiveDisabled() {
     updateLiveTabState(disabled);
   } else {
     check.checked = !disabled;
+  }
+}
+
+// --- Site name emoji removal ---
+async function loadSiteNameEmojiRemoval() {
+  try {
+    const res = await auth.authFetch('/admin/site-name-emoji-removal');
+    if (res.ok) {
+      const data = await res.json();
+      $('siteNameEmojiRemovalCheck').checked = data.enabled === true;
+    }
+  } catch {}
+}
+
+async function saveSiteNameEmojiRemoval() {
+  const check = $('siteNameEmojiRemovalCheck');
+  if (check.disabled) return;
+  const enabled = check.checked;
+  if (!await saveSetting(check, '/admin/site-name-emoji-removal', { enabled })) {
+    check.checked = !enabled;
   }
 }
 

@@ -8,6 +8,8 @@ import { logger } from '../core/logger';
 import type { Storage } from '../storage/interface';
 import type { AppConfig } from '../core/types';
 import { projectLiveJson } from '../core/live-policy';
+import { SITE_NAME_EMOJI_REMOVAL } from '../core/config';
+import { removeEmojiFromSiteNames } from '../core/cleaner';
 
 export interface ExportConfigRouteDeps {
   storage: Storage;
@@ -48,8 +50,17 @@ export function createExportConfigRouter(deps: ExportConfigRouteDeps): Hono {
     });
 
     // Original resource URLs stay unchanged; manual lives reflect current declarations.
+    const emojiRemovalEnabled = await storage.get(SITE_NAME_EMOJI_REMOVAL) === 'true';
     let body: string;
-    try { body = projectLiveJson(cached, outputs.livePolicy); }
+    try {
+      body = projectLiveJson(
+        cached,
+        outputs.livePolicy,
+        undefined,
+        '',
+        emojiRemovalEnabled ? removeEmojiFromSiteNames : undefined,
+      );
+    }
     catch { return c.json({ error: 'Config parse error' }, 500); }
     return c.body(body, 200, {
       'Content-Type': 'application/json; charset=utf-8',

@@ -10,6 +10,7 @@ import {
   DEFAULT_SYNC_SCHEDULE,
   SMART_JAR_URL_ENABLED,
   LIVE_DISABLED,
+  SITE_NAME_EMOJI_REMOVAL,
   EDGE_PROXIES,
 } from '../core/config';
 import { patchMergedConfig } from '../core/blacklist';
@@ -55,6 +56,27 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Hono {
 
     await storage.put(NAME_TRANSFORM, JSON.stringify(transform));
     return c.json({ success: true });
+  });
+
+  // ─── 点播站点名称 Emoji 移除开关 ──────────────────────
+  router.get('/admin/site-name-emoji-removal', async (c) => {
+    const raw = await storage.get(SITE_NAME_EMOJI_REMOVAL);
+    return c.json({ enabled: raw === 'true' });
+  });
+
+  router.put('/admin/site-name-emoji-removal', async (c) => {
+    let body: { enabled?: boolean };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    if (typeof body.enabled !== 'boolean') {
+      return c.json({ error: 'enabled must be a boolean' }, 400);
+    }
+
+    await storage.put(SITE_NAME_EMOJI_REMOVAL, String(body.enabled));
+    return c.json({ success: true, enabled: body.enabled });
   });
 
   // ─── 同步频率 API ──────────────────────────────────

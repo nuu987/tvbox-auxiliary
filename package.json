@@ -1,6 +1,6 @@
 {
     "name": "tvbox-auxiliary",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "private": true,
     "scripts": {
         "build:node": "node scripts/build.js",
@@ -10,6 +10,7 @@
     "dependencies": {
         "@hono/node-server": "^1.13.0",
         "dotenv": "^16.4.0",
+        "emoji-regex": "11.0.0",
         "hono": "^4.7.0",
         "node-cron": "^3.0.3"
     },
